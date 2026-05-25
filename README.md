@@ -52,6 +52,9 @@ jy
 18. 查看文件日志
 19. 清空文件日志
 20. 更新程序
+21. 查看 AI量化数据统计
+22. 查看 AI量化数据
+23. 清空 AI量化数据
 0. 退出
 ```
 
@@ -86,6 +89,9 @@ jy
 - `QUANT_ORDER_USDC`: AI量化每次计划下单金额，默认 `5`。
 - `QUANT_MIN_EDGE`: AI量化最小优势，默认 `0.04` 表示预测概率至少比买入价高 4 分。
 - `QUANT_MIN_SECONDS_LEFT`: 距离 5分钟市场结束至少剩余多少秒才允许下单，默认 `45`。
+- `QUANT_RECORD_SIGNALS`: 默认 `1`，AI量化运行时记录结构化信号数据。
+- `QUANT_SIGNAL_FILE`: 默认 `data/quant_signals.jsonl`，一行一个 JSON 记录，方便 24 小时后复盘。
+- `QUANT_SIGNAL_INTERVAL_SEC`: 默认 `30`，同类信号最短记录间隔。
 - `LOG_TO_FILE`: 默认 `1`，机器人运行时同时写入文件日志，方便 AI 复盘。
 - `LOG_FILE`: 默认 `logs/polymarket-copy.log`。
 - `TARGET_USERNAME` / `TARGET_WALLET`: 目标账号。
@@ -187,6 +193,52 @@ jy app-logs tail
 ```bash
 jy app-logs clear
 ```
+
+查看 AI量化结构化数据统计：
+
+```bash
+jy quant-data summary
+```
+
+查看 AI量化数据末尾记录：
+
+```bash
+jy quant-data tail
+```
+
+清空 AI量化数据：
+
+```bash
+jy quant-data clear
+```
+
+## 第一阶段：24小时模拟数据
+
+第一阶段不真实下单，只跑 `BOT_MODE=quant` + `DRY_RUN=1`，机器人会把每轮 AI量化判断写入：
+
+```text
+/opt/polymarket-copy/data/quant_signals.jsonl
+```
+
+推荐开始前执行：
+
+```bash
+jy set-bot-mode quant
+jy set-dry-run 1
+jy set-quant-config --record-signals 1 --signal-interval-sec 30
+jy quant-data clear
+jy app-logs clear
+jy service restart
+```
+
+跑 24 小时后查看：
+
+```bash
+jy quant-data summary
+jy quant-data tail --lines 5
+```
+
+每条记录包含市场、剩余秒数、OKX BTC 行情、Up/Down 概率、盘口 ask、edge、模拟选择方向和跳过原因。
 
 ## VPS 部署结果
 

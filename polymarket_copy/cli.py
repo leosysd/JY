@@ -4,11 +4,13 @@ import argparse
 import contextlib
 import getpass
 import io
+import json
 import os
 import shlex
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -154,6 +156,9 @@ def init_config(config_path: Path) -> None:
         "QUANT_COOLDOWN_SEC": existing.get("QUANT_COOLDOWN_SEC", "60"),
         "QUANT_LOG_INTERVAL_SEC": existing.get("QUANT_LOG_INTERVAL_SEC", "10"),
         "QUANT_STATE_FILE": existing.get("QUANT_STATE_FILE", "quant_state.json"),
+        "QUANT_RECORD_SIGNALS": existing.get("QUANT_RECORD_SIGNALS", "1"),
+        "QUANT_SIGNAL_FILE": existing.get("QUANT_SIGNAL_FILE", "data/quant_signals.jsonl"),
+        "QUANT_SIGNAL_INTERVAL_SEC": existing.get("QUANT_SIGNAL_INTERVAL_SEC", "30"),
         "LOG_TO_FILE": existing.get("LOG_TO_FILE", "1"),
         "LOG_FILE": existing.get("LOG_FILE", "logs/polymarket-copy.log"),
     }
@@ -176,6 +181,11 @@ def print_config_summary(config_path: Path, require_private_key: Optional[bool] 
         "AI量化: "
         f"{config.quant_symbol}, order_usdc={config.quant_order_usdc}, "
         f"min_edge={config.quant_min_edge}, min_seconds_left={config.quant_min_seconds_left}"
+    )
+    print(
+        "AI量化数据: "
+        f"{'开启' if config.quant_record_signals else '关闭'} / "
+        f"{config.quant_signal_file} / interval={config.quant_signal_interval_sec}s"
     )
     print(f"文件日志: {'开启' if config.log_to_file else '关闭'} / {config.log_file}")
     print(f"轮询间隔: {config.poll_sec}s")
@@ -656,6 +666,9 @@ def update_quant_config(config_path: Path) -> None:
         "QUANT_COOLDOWN_SEC": prompt_text("量化下单冷却秒数 QUANT_COOLDOWN_SEC", existing.get("QUANT_COOLDOWN_SEC", "60")),
         "QUANT_LOG_INTERVAL_SEC": prompt_text("量化日志间隔秒数 QUANT_LOG_INTERVAL_SEC", existing.get("QUANT_LOG_INTERVAL_SEC", "10")),
         "QUANT_STATE_FILE": prompt_text("量化状态文件 QUANT_STATE_FILE", existing.get("QUANT_STATE_FILE", "quant_state.json")),
+        "QUANT_RECORD_SIGNALS": prompt_text("记录量化结构化数据 QUANT_RECORD_SIGNALS，1=开启", existing.get("QUANT_RECORD_SIGNALS", "1")),
+        "QUANT_SIGNAL_FILE": prompt_text("量化数据文件 QUANT_SIGNAL_FILE", existing.get("QUANT_SIGNAL_FILE", "data/quant_signals.jsonl")),
+        "QUANT_SIGNAL_INTERVAL_SEC": prompt_text("同类信号记录间隔秒数 QUANT_SIGNAL_INTERVAL_SEC", existing.get("QUANT_SIGNAL_INTERVAL_SEC", "30")),
     }
     for key, value in values.items():
         set_env_value(config_path, key, value)
@@ -709,6 +722,102 @@ def clear_file_log(config_path: Path) -> None:
     log_file.parent.mkdir(parents=True, exist_ok=True)
     log_file.write_text("", encoding="utf-8")
     print(f"[OK] 已清空文件日志: {log_file}")
+
+
+def configured_quant_signal_file(config_path: Path) -> Path:
+    return load_config(config_path).quant_signal_file
+
+
+def tail_quant_data(config_path: Path, lines: int = 20) -> None:
+    data_file = configured_quant_signal_file(config_path)
+    print(f"[DATA] AI量化数据: {data_file}")
+    if not data_file.exists():
+        print("[INFO] AI量化数据还不存在，启动 quant + DRY_RUN 后会自动创建。")
+        return
+    content = data_file.read_text(encoding="utf-8", errors="replace").splitlines()
+    for line in content[-lines:]:
+        print(line)
+
+
+def clear_quant_data(config_path: Path) -> None:
+    data_file = configured_quant_signal_file(config_path)
+    data_file.parent.mkdir(parents=True, exist_ok=True)
+    data_file.write_text("", encoding="utf-8")
+    print(f"[OK] 已清空 AI量化数据: {data_file}")
+
+
+def summarize_quant_data(config_path: Path) -> None:
+    data_file = configured_quant_signal_file(config_path)
+    print(f"[DATA] AI量化数据: {data_file}")
+    if not data_file.exists():
+        print("[INFO] AI量化数据还不存在。")
+        return
+
+    action_counts: Counter[str] = Counter()
+    reason_counts: Counter[str] = Counter()
+    outcome_counts: Counter[str] = Counter()
+    market_slugs: set[str] = set()
+    first_ts = ""
+    last_ts = ""
+    latest: Optional[Dict[str, object]] = None
+    invalid_lines = 0
+
+    for line in data_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            invalid_lines += 1
+            continue
+        if not isinstance(record, dict):
+            invalid_lines += 1
+            continue
+        latest = record
+        ts = str(record.get("ts") or "")
+        if ts and not first_ts:
+            first_ts = ts
+        if ts:
+            last_ts = ts
+        action_counts[str(record.get("action") or "unknown")] += 1
+        reason_counts[str(record.get("reason") or "unknown")] += 1
+        market = record.get("market")
+        if isinstance(market, dict) and market.get("slug"):
+            market_slugs.add(str(market["slug"]))
+        selected = record.get("selected")
+        if isinstance(selected, dict) and selected.get("outcome"):
+            outcome_counts[str(selected["outcome"])] += 1
+
+    total = sum(action_counts.values())
+    print(f"总记录: {total}")
+    print(f"市场数: {len(market_slugs)}")
+    if first_ts or last_ts:
+        print(f"时间范围: {first_ts or '<unknown>'} -> {last_ts or '<unknown>'}")
+    if invalid_lines:
+        print(f"无效行: {invalid_lines}")
+    print("动作统计:")
+    for action, count in action_counts.most_common():
+        print(f"  {action}: {count}")
+    print("原因统计:")
+    for reason, count in reason_counts.most_common(10):
+        print(f"  {reason}: {count}")
+    if outcome_counts:
+        print("选择方向:")
+        for outcome, count in outcome_counts.most_common():
+            print(f"  {outcome}: {count}")
+    if latest:
+        market = latest.get("market") if isinstance(latest.get("market"), dict) else {}
+        selected = latest.get("selected") if isinstance(latest.get("selected"), dict) else {}
+        print("最新记录:")
+        print(f"  ts={latest.get('ts')} action={latest.get('action')} reason={latest.get('reason')}")
+        if isinstance(market, dict):
+            print(f"  market={market.get('slug')} seconds_left={market.get('seconds_left')}")
+        if isinstance(selected, dict) and selected:
+            print(
+                "  selected="
+                f"{selected.get('outcome')} edge={selected.get('edge')} "
+                f"ask={selected.get('best_ask')} limit={selected.get('limit_price')}"
+            )
 
 
 def update_target(config_path: Path) -> None:
@@ -836,6 +945,9 @@ def local_interactive_menu(config_path: Path = Path(".env")) -> None:
         print("18. 查看文件日志")
         print("19. 清空文件日志")
         print("20. 更新程序")
+        print("21. 查看 AI量化数据统计")
+        print("22. 查看 AI量化数据")
+        print("23. 清空 AI量化数据")
         print("0. 退出")
         choice = input("请选择: ").strip()
         try:
@@ -894,6 +1006,12 @@ def local_interactive_menu(config_path: Path = Path(".env")) -> None:
                 update_program()
                 print("[INFO] 请重新运行 jy。")
                 return
+            elif choice == "21":
+                summarize_quant_data(config_path)
+            elif choice == "22":
+                tail_quant_data(config_path)
+            elif choice == "23":
+                clear_quant_data(config_path)
             elif choice == "0":
                 return
             else:
@@ -967,6 +1085,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_quant.add_argument("--min-seconds-left")
     p_quant.add_argument("--cooldown-sec")
     p_quant.add_argument("--log-interval-sec")
+    p_quant.add_argument("--record-signals", choices=["0", "1"])
+    p_quant.add_argument("--signal-file")
+    p_quant.add_argument("--signal-interval-sec")
     p_quant.add_argument("--restart", action="store_true", help="设置后立即重启服务")
 
     p_quant_once = sub.add_parser("quant-once", help="AI量化单次试算，不真实下单")
@@ -977,6 +1098,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_app_logs.add_argument("--config", default=".env")
     p_app_logs.add_argument("--lines", type=int, default=100)
     p_app_logs.add_argument("--no-follow", action="store_true", help="tail 时只打印末尾日志，不持续跟随")
+
+    p_quant_data = sub.add_parser("quant-data", help="查看或清空 AI量化结构化数据")
+    p_quant_data.add_argument("action", choices=["summary", "tail", "clear", "path"])
+    p_quant_data.add_argument("--config", default=".env")
+    p_quant_data.add_argument("--lines", type=int, default=20)
 
     p_install = sub.add_parser("install", help="从 GitHub 安装到 VPS，便于以后远程更新")
     p_install.add_argument("--host", required=True)
@@ -1075,6 +1201,9 @@ def main(argv: Optional[List[str]] = None) -> None:
                 args.min_seconds_left,
                 args.cooldown_sec,
                 args.log_interval_sec,
+                args.record_signals,
+                args.signal_file,
+                args.signal_interval_sec,
             ]
         ):
             update_quant_config(config_path)
@@ -1095,6 +1224,21 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "QUANT_LOG_INTERVAL_SEC",
                 args.log_interval_sec or existing.get("QUANT_LOG_INTERVAL_SEC", "10"),
             )
+            set_env_value(
+                config_path,
+                "QUANT_RECORD_SIGNALS",
+                args.record_signals or existing.get("QUANT_RECORD_SIGNALS", "1"),
+            )
+            set_env_value(
+                config_path,
+                "QUANT_SIGNAL_FILE",
+                args.signal_file or existing.get("QUANT_SIGNAL_FILE", "data/quant_signals.jsonl"),
+            )
+            set_env_value(
+                config_path,
+                "QUANT_SIGNAL_INTERVAL_SEC",
+                args.signal_interval_sec or existing.get("QUANT_SIGNAL_INTERVAL_SEC", "30"),
+            )
             print("[OK] AI量化参数已更新")
         if args.restart:
             local_service_action("restart")
@@ -1108,6 +1252,16 @@ def main(argv: Optional[List[str]] = None) -> None:
             clear_file_log(config_path)
         elif args.action == "path":
             print(configured_log_file(config_path))
+    elif args.command == "quant-data":
+        config_path = Path(args.config)
+        if args.action == "summary":
+            summarize_quant_data(config_path)
+        elif args.action == "tail":
+            tail_quant_data(config_path, lines=args.lines)
+        elif args.action == "clear":
+            clear_quant_data(config_path)
+        elif args.action == "path":
+            print(configured_quant_signal_file(config_path))
     elif args.command == "install":
         install_from_git(
             host=args.host,

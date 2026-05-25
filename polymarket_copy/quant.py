@@ -65,6 +65,30 @@ class QuantDecision:
     reason: str
 
 
+class QuantSignalRecorder:
+    def __init__(self, config: CopyBotConfig) -> None:
+        self.enabled = config.quant_record_signals
+        self.path = config.quant_signal_file
+        self.interval_sec = config.quant_signal_interval_sec
+        self.last_record_ts: Dict[str, float] = {}
+
+    def write(self, record: Dict[str, Any], force: bool = False) -> None:
+        if not self.enabled:
+            return
+        market = record.get("market")
+        slug = market.get("slug") if isinstance(market, dict) else ""
+        action = str(record.get("action", "unknown"))
+        reason = str(record.get("reason", ""))
+        key = f"{slug}:{action}:{reason}"
+        now = time.time()
+        if not force and now - self.last_record_ts.get(key, 0) < self.interval_sec:
+            return
+        self.last_record_ts[key] = now
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+
 class QuantStateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -118,6 +142,7 @@ class PolymarketQuantBot:
         self.book_cache = BookCache(self.http, config, self.market_ws)
         self.order_helper = PolymarketCopyBot(config)
         self.state = QuantStateStore(config.quant_state_file)
+        self.signal_recorder = QuantSignalRecorder(config)
         self.last_log_ts = 0.0
 
     def run_forever(self) -> None:
@@ -141,6 +166,8 @@ class PolymarketQuantBot:
             f"min_edge={self.config.quant_min_edge} "
             f"min_seconds_left={self.config.quant_min_seconds_left}"
         )
+        if self.config.quant_record_signals:
+            print(f"[AI QUANT DATA] signals={self.config.quant_signal_file}")
 
         try:
             while True:
@@ -269,22 +296,47 @@ class PolymarketQuantBot:
     def make_decision(self, market: QuantMarket, snapshot: BtcSnapshot) -> Optional[QuantDecision]:
         if self.state.has_market(market.slug):
             self.log_throttled(f"[AI QUANT] {market.slug} 已有决策记录，本窗口不重复下单。")
+            self.record_signal(market, snapshot, "skip", "market_already_decided", [])
             return None
         if not self.state.cooldown_ready(self.config.quant_cooldown_sec):
             self.log_throttled("[AI QUANT] 冷却中，暂不下单。")
+            self.record_signal(market, snapshot, "skip", "cooldown", [])
             return None
         if market.seconds_left < self.config.quant_min_seconds_left:
             self.log_throttled(
                 f"[AI QUANT] {market.title} 剩余 {market.seconds_left}s，低于最小剩余时间，跳过。"
             )
+            self.record_signal(market, snapshot, "skip", "low_seconds_left", [])
             return None
 
         candidates: List[QuantDecision] = []
+        candidate_records: List[Dict[str, Any]] = []
         for outcome, token_id in zip(market.outcomes, market.token_ids):
             probability = snapshot.up_probability if outcome == "Up" else Decimal("1") - snapshot.up_probability
-            book = self.book_cache.get_book(token_id)
+            try:
+                book = self.book_cache.get_book(token_id)
+            except Exception as exc:
+                candidate_records.append(
+                    {
+                        "outcome": outcome,
+                        "token_id": token_id,
+                        "probability": probability.quantize(Decimal("0.0001")),
+                        "valid": False,
+                        "skip_reason": f"book_error:{type(exc).__name__}",
+                    }
+                )
+                continue
             best_ask = best_book_price(book, "BUY")
             if best_ask is None:
+                candidate_records.append(
+                    {
+                        "outcome": outcome,
+                        "token_id": token_id,
+                        "probability": probability.quantize(Decimal("0.0001")),
+                        "valid": False,
+                        "skip_reason": "no_best_ask",
+                    }
+                )
                 continue
             edge = probability - best_ask
             tick_size = decimal_value(book.get("tick_size", "0.01"))
@@ -299,26 +351,41 @@ class PolymarketQuantBot:
                 self.log_throttled(
                     f"[AI QUANT] {outcome} size={size} 小于最小下单 {min_order_size}，跳过。"
                 )
-                continue
-            candidates.append(
-                QuantDecision(
-                    market=market,
-                    outcome=outcome,
-                    token_id=token_id,
-                    probability=probability.quantize(Decimal("0.0001")),
-                    best_ask=best_ask,
-                    edge=edge.quantize(Decimal("0.0001")),
-                    limit_price=limit_price,
-                    size=size,
-                    reason=(
-                        f"p({outcome})={probability.quantize(Decimal('0.0001'))} "
-                        f"> ask={best_ask} + edge={edge.quantize(Decimal('0.0001'))}"
-                    ),
+                candidate_records.append(
+                    {
+                        "outcome": outcome,
+                        "token_id": token_id,
+                        "probability": probability.quantize(Decimal("0.0001")),
+                        "best_ask": best_ask,
+                        "edge": edge.quantize(Decimal("0.0001")),
+                        "limit_price": limit_price,
+                        "size": size,
+                        "min_order_size": min_order_size,
+                        "valid": False,
+                        "skip_reason": "size_below_min_order",
+                    }
                 )
+                continue
+            decision = QuantDecision(
+                market=market,
+                outcome=outcome,
+                token_id=token_id,
+                probability=probability.quantize(Decimal("0.0001")),
+                best_ask=best_ask,
+                edge=edge.quantize(Decimal("0.0001")),
+                limit_price=limit_price,
+                size=size,
+                reason=(
+                    f"p({outcome})={probability.quantize(Decimal('0.0001'))} "
+                    f"> ask={best_ask} + edge={edge.quantize(Decimal('0.0001'))}"
+                ),
             )
+            candidates.append(decision)
+            candidate_records.append(self.decision_payload(decision) | {"valid": True})
 
         if not candidates:
             self.log_throttled("[AI QUANT] 没有可用盘口候选。")
+            self.record_signal(market, snapshot, "skip", "no_valid_candidates", candidate_records)
             return None
 
         best = max(candidates, key=lambda item: item.edge)
@@ -328,13 +395,104 @@ class PolymarketQuantBot:
                 f"{market.title} p_up={snapshot.up_probability} "
                 f"best={best.outcome} edge={best.edge} < min_edge={self.config.quant_min_edge}，跳过。"
             )
+            self.record_signal(
+                market,
+                snapshot,
+                "skip",
+                "edge_below_min",
+                candidate_records,
+                selected=best,
+            )
             return None
+        self.record_signal(
+            market,
+            snapshot,
+            "would_buy" if self.config.dry_run else "live_buy",
+            "edge_passed",
+            candidate_records,
+            selected=best,
+            force=True,
+        )
         return best
+
+    def record_signal(
+        self,
+        market: QuantMarket,
+        snapshot: BtcSnapshot,
+        action: str,
+        reason: str,
+        candidates: List[Dict[str, Any]],
+        selected: Optional[QuantDecision] = None,
+        force: bool = False,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        record: Dict[str, Any] = {
+            "ts": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "unix_ts": int(now.timestamp()),
+            "bot_mode": "quant",
+            "dry_run": self.config.dry_run,
+            "action": action,
+            "reason": reason,
+            "market": {
+                "slug": market.slug,
+                "title": market.title,
+                "start_ts": market.start_ts,
+                "end_ts": market.end_ts,
+                "seconds_left": market.seconds_left,
+                "outcomes": market.outcomes,
+                "token_ids": market.token_ids,
+            },
+            "price": {
+                "source": snapshot.source,
+                "symbol": self.config.quant_symbol,
+                "current": snapshot.current,
+                "start_price": snapshot.start_price,
+                "ret_from_start": snapshot.ret_from_start,
+                "ret_1m": snapshot.ret_1m,
+                "ret_3m": snapshot.ret_3m,
+                "up_probability": snapshot.up_probability,
+            },
+            "config": {
+                "order_usdc": self.config.quant_order_usdc,
+                "min_edge": self.config.quant_min_edge,
+                "min_seconds_left": self.config.quant_min_seconds_left,
+                "max_slippage": self.config.max_slippage,
+            },
+            "candidates": candidates,
+            "selected": self.decision_payload(selected) if selected else None,
+        }
+        self.signal_recorder.write(json_safe(record), force=force)
+
+    def decision_payload(self, decision: Optional[QuantDecision]) -> Dict[str, Any]:
+        if decision is None:
+            return {}
+        return {
+            "outcome": decision.outcome,
+            "token_id": decision.token_id,
+            "probability": decision.probability,
+            "best_ask": decision.best_ask,
+            "edge": decision.edge,
+            "limit_price": decision.limit_price,
+            "size": decision.size,
+            "reason": decision.reason,
+        }
 
     def log_throttled(self, message: str) -> None:
         if time.time() - self.last_log_ts >= self.config.quant_log_interval_sec:
             print(message)
             self.last_log_ts = time.time()
+
+
+def json_safe(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [json_safe(item) for item in value]
+    return value
 
 
 def parse_json_list(value: Any) -> List[Any]:

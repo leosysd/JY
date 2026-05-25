@@ -88,6 +88,9 @@ class CopyBotConfig:
     quant_cooldown_sec: float = 60.0
     quant_log_interval_sec: float = 10.0
     quant_state_file: Path = Path("quant_state.json")
+    quant_record_signals: bool = True
+    quant_signal_file: Path = Path("data/quant_signals.jsonl")
+    quant_signal_interval_sec: float = 30.0
     log_to_file: bool = True
     log_file: Path = Path("logs/polymarket-copy.log")
 
@@ -166,6 +169,9 @@ def load_config(config_path: Optional[Path] = None) -> CopyBotConfig:
         quant_cooldown_sec=float(_env("QUANT_COOLDOWN_SEC", "60")),
         quant_log_interval_sec=float(_env("QUANT_LOG_INTERVAL_SEC", "10")),
         quant_state_file=Path(_env("QUANT_STATE_FILE", "quant_state.json")),
+        quant_record_signals=parse_bool(_env("QUANT_RECORD_SIGNALS", "1"), default=True),
+        quant_signal_file=_path_env("QUANT_SIGNAL_FILE", "data/quant_signals.jsonl", config_path),
+        quant_signal_interval_sec=float(_env("QUANT_SIGNAL_INTERVAL_SEC", "30")),
         log_to_file=parse_bool(_env("LOG_TO_FILE", "1"), default=True),
         log_file=_path_env("LOG_FILE", "logs/polymarket-copy.log", config_path),
     )
@@ -228,6 +234,8 @@ def validate_config(config: CopyBotConfig, require_private_key: bool = False) ->
         errors.append("QUANT_COOLDOWN_SEC 必须大于等于 0")
     if config.quant_log_interval_sec <= 0:
         errors.append("QUANT_LOG_INTERVAL_SEC 必须大于 0")
+    if config.quant_signal_interval_sec <= 0:
+        errors.append("QUANT_SIGNAL_INTERVAL_SEC 必须大于 0")
     return errors, warnings
 
 
@@ -273,6 +281,9 @@ def env_lines(values: Dict[str, str]) -> List[str]:
         "QUANT_COOLDOWN_SEC",
         "QUANT_LOG_INTERVAL_SEC",
         "QUANT_STATE_FILE",
+        "QUANT_RECORD_SIGNALS",
+        "QUANT_SIGNAL_FILE",
+        "QUANT_SIGNAL_INTERVAL_SEC",
         "LOG_TO_FILE",
         "LOG_FILE",
     )
