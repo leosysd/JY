@@ -204,11 +204,18 @@ def validate_config(config: CopyBotConfig, require_private_key: bool = False) ->
         errors.append("PRIVATE_KEY 看起来不是 64 字节十六进制私钥")
     elif config.private_key and not looks_like_private_key(config.private_key):
         warnings.append("PRIVATE_KEY 看起来不是 64 字节十六进制私钥")
+    needs_trade_signing_config = require_private_key or not config.dry_run
     if config.signature_type == 3 and not config.deposit_wallet_address:
-        errors.append("SIGNATURE_TYPE=3 时必须设置 DEPOSIT_WALLET_ADDRESS / FUNDER_ADDRESS")
+        if needs_trade_signing_config:
+            errors.append("SIGNATURE_TYPE=3 时必须设置 DEPOSIT_WALLET_ADDRESS / FUNDER_ADDRESS")
+        else:
+            warnings.append("DRY_RUN=1 且未设置 DEPOSIT_WALLET_ADDRESS；可以模拟监控，但不能真实下单")
     if config.signature_type == 3 and config.deposit_wallet_address:
         if not is_eth_address(config.deposit_wallet_address):
-            errors.append("DEPOSIT_WALLET_ADDRESS / FUNDER_ADDRESS 看起来不是合法 0x 钱包地址")
+            if needs_trade_signing_config:
+                errors.append("DEPOSIT_WALLET_ADDRESS / FUNDER_ADDRESS 看起来不是合法 0x 钱包地址")
+            else:
+                warnings.append("DEPOSIT_WALLET_ADDRESS / FUNDER_ADDRESS 看起来不是合法 0x 钱包地址")
     if config.copy_ratio <= 0:
         errors.append("COPY_RATIO 必须大于 0")
     if config.price_mode not in {"safe", "aggressive"}:

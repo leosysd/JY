@@ -226,10 +226,10 @@ def sh_quote(value: str) -> str:
     return shlex.quote(value)
 
 
-def run_command(argv: List[str], input_text: Optional[str] = None) -> None:
+def run_command(argv: List[str], input_text: Optional[str] = None, check: bool = True) -> None:
     printable = " ".join(shlex.quote(part) for part in argv)
     print(f"[RUN] {printable}")
-    subprocess.run(argv, input=input_text, text=True, check=True)
+    subprocess.run(argv, input=input_text, text=True, check=check)
 
 
 def ssh(target: str, command: str) -> None:
@@ -428,7 +428,7 @@ def remote_action(
     remote_q = sh_quote(remote_dir)
 
     if action == "status":
-        ssh(target, f"{sudo}systemctl status {svc} --no-pager")
+        ssh(target, f"{sudo}systemctl status {svc} --no-pager || true")
     elif action == "logs":
         ssh(target, f"{sudo}journalctl -u {svc} -f -n 100")
     elif action in {"start", "stop", "restart"}:
@@ -506,7 +506,7 @@ def install_local_service(
 
 def local_service_action(action: str, service_name: str = DEFAULT_SERVICE) -> None:
     if action == "status":
-        run_command(command_with_sudo(["systemctl", "status", service_name, "--no-pager"]))
+        run_command(command_with_sudo(["systemctl", "status", service_name, "--no-pager"]), check=False)
     elif action == "logs":
         run_command(command_with_sudo(["journalctl", "-u", service_name, "-f", "-n", "100"]))
     elif action in {"start", "stop", "restart"}:
