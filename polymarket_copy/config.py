@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 DEFAULT_TARGET_USERNAME = "jetfadil"
 DEFAULT_TARGET_WALLET = "0xe0229e10a858860218b6132f4234602c47bd6603"
 DEFAULT_CLOB_API_URL = "https://clob.polymarket.com"
+DEFAULT_MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 
 def parse_bool(value: object, default: bool = False) -> bool:
@@ -59,6 +60,14 @@ class CopyBotConfig:
     backoff_base_sec: float = 0.5
     backoff_max_sec: float = 20.0
     mark_failed_seen: bool = True
+    enable_market_ws: bool = True
+    market_ws_url: str = DEFAULT_MARKET_WS_URL
+    market_ws_bootstrap_assets: int = 100
+    market_ws_max_assets: int = 250
+    market_ws_book_max_age_sec: float = 900.0
+    market_ws_heartbeat_sec: float = 10.0
+    market_ws_reconnect_sec: float = 3.0
+    market_ws_custom_feature_enabled: bool = True
 
     @property
     def funder(self) -> str:
@@ -107,6 +116,17 @@ def load_config(config_path: Optional[Path] = None) -> CopyBotConfig:
         backoff_base_sec=float(_env("BACKOFF_BASE_SEC", "0.5")),
         backoff_max_sec=float(_env("BACKOFF_MAX_SEC", "20")),
         mark_failed_seen=parse_bool(_env("MARK_FAILED_SEEN", "1"), default=True),
+        enable_market_ws=parse_bool(_env("ENABLE_MARKET_WS", "1"), default=True),
+        market_ws_url=_env("MARKET_WS_URL", DEFAULT_MARKET_WS_URL),
+        market_ws_bootstrap_assets=int(_env("MARKET_WS_BOOTSTRAP_ASSETS", "100")),
+        market_ws_max_assets=int(_env("MARKET_WS_MAX_ASSETS", "250")),
+        market_ws_book_max_age_sec=float(_env("MARKET_WS_BOOK_MAX_AGE_SEC", "900")),
+        market_ws_heartbeat_sec=float(_env("MARKET_WS_HEARTBEAT_SEC", "10")),
+        market_ws_reconnect_sec=float(_env("MARKET_WS_RECONNECT_SEC", "3")),
+        market_ws_custom_feature_enabled=parse_bool(
+            _env("MARKET_WS_CUSTOM_FEATURE_ENABLED", "1"),
+            default=True,
+        ),
     )
 
 
@@ -139,6 +159,10 @@ def validate_config(config: CopyBotConfig, require_private_key: bool = False) ->
         errors.append("ACTIVITY_LIMIT 必须大于 0")
     if config.http_max_retries < 1:
         errors.append("HTTP_MAX_RETRIES 至少为 1")
+    if config.market_ws_max_assets < 1:
+        errors.append("MARKET_WS_MAX_ASSETS 至少为 1")
+    if config.market_ws_heartbeat_sec <= 0:
+        errors.append("MARKET_WS_HEARTBEAT_SEC 必须大于 0")
     return errors, warnings
 
 
@@ -163,5 +187,13 @@ def env_lines(values: Dict[str, str]) -> List[str]:
         "BACKOFF_BASE_SEC",
         "BACKOFF_MAX_SEC",
         "MARK_FAILED_SEEN",
+        "ENABLE_MARKET_WS",
+        "MARKET_WS_URL",
+        "MARKET_WS_BOOTSTRAP_ASSETS",
+        "MARKET_WS_MAX_ASSETS",
+        "MARKET_WS_BOOK_MAX_AGE_SEC",
+        "MARKET_WS_HEARTBEAT_SEC",
+        "MARKET_WS_RECONNECT_SEC",
+        "MARKET_WS_CUSTOM_FEATURE_ENABLED",
     )
     return [f"{key}={values.get(key, '')}" for key in ordered_keys]

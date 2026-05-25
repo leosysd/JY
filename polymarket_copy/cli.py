@@ -17,6 +17,7 @@ from dotenv import dotenv_values
 from .bot import PolymarketCopyBot
 from .config import (
     DEFAULT_CLOB_API_URL,
+    DEFAULT_MARKET_WS_URL,
     DEFAULT_TARGET_USERNAME,
     DEFAULT_TARGET_WALLET,
     env_lines,
@@ -101,6 +102,18 @@ def init_config(config_path: Path) -> None:
             "CLOB API 地址 CLOB_API_URL",
             existing.get("CLOB_API_URL", DEFAULT_CLOB_API_URL),
         ),
+        "ENABLE_MARKET_WS": (
+            "1"
+            if prompt_yes_no(
+                "启用 Market WebSocket 盘口缓存吗",
+                existing.get("ENABLE_MARKET_WS", "1") != "0",
+            )
+            else "0"
+        ),
+        "MARKET_WS_URL": prompt_text(
+            "Market WebSocket 地址 MARKET_WS_URL",
+            existing.get("MARKET_WS_URL", DEFAULT_MARKET_WS_URL),
+        ),
         "SIGNATURE_TYPE": prompt_text(
             "签名类型 SIGNATURE_TYPE",
             existing.get("SIGNATURE_TYPE", "3"),
@@ -121,6 +134,12 @@ def init_config(config_path: Path) -> None:
         "BACKOFF_BASE_SEC": existing.get("BACKOFF_BASE_SEC", "0.5"),
         "BACKOFF_MAX_SEC": existing.get("BACKOFF_MAX_SEC", "20"),
         "MARK_FAILED_SEEN": existing.get("MARK_FAILED_SEEN", "1"),
+        "MARKET_WS_BOOTSTRAP_ASSETS": existing.get("MARKET_WS_BOOTSTRAP_ASSETS", "100"),
+        "MARKET_WS_MAX_ASSETS": existing.get("MARKET_WS_MAX_ASSETS", "250"),
+        "MARKET_WS_BOOK_MAX_AGE_SEC": existing.get("MARKET_WS_BOOK_MAX_AGE_SEC", "900"),
+        "MARKET_WS_HEARTBEAT_SEC": existing.get("MARKET_WS_HEARTBEAT_SEC", "10"),
+        "MARKET_WS_RECONNECT_SEC": existing.get("MARKET_WS_RECONNECT_SEC", "3"),
+        "MARKET_WS_CUSTOM_FEATURE_ENABLED": existing.get("MARKET_WS_CUSTOM_FEATURE_ENABLED", "1"),
     }
     write_env(config_path, values)
     print(f"[OK] 已写入 {config_path}")
@@ -136,6 +155,7 @@ def print_config_summary(config_path: Path, require_private_key: Optional[bool] 
     print(f"模式: {config.mode_label}")
     print(f"跟单比例: {config.copy_ratio}")
     print(f"轮询间隔: {config.poll_sec}s")
+    print(f"Market WS: {'开启' if config.enable_market_ws else '关闭'}")
     print(f"私钥: {config.masked_private_key}")
     print(f"Funder/API 地址: {config.deposit_wallet_address or '<empty>'}")
     for warning in warnings:
@@ -618,6 +638,11 @@ def test_api_config(config_path: Path) -> bool:
     try:
         wallet = bot.resolve_target_wallet()
         print(f"[OK] 目标钱包: {wallet}")
+        print(
+            "[OK] Market WebSocket 配置: "
+            f"{'开启' if config.enable_market_ws else '关闭'} "
+            f"{config.market_ws_url if config.enable_market_ws else ''}".strip()
+        )
         activities = bot.fetch_activity(wallet, limit=3)
         print(f"[OK] Data API 可访问，最近 TRADE 数量: {len(activities)}")
         if activities:

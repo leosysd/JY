@@ -4,11 +4,12 @@ import argparse
 import json
 import random
 import re
+import threading
 import time
 from dataclasses import dataclass
 from decimal import Decimal, getcontext
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import requests
 
@@ -121,12 +122,24 @@ class BookCacheEntry:
 
 
 class BookCache:
-    def __init__(self, http: HttpJsonClient, config: CopyBotConfig) -> None:
+    def __init__(
+        self,
+        http: HttpJsonClient,
+        config: CopyBotConfig,
+        ws_cache: Optional["MarketWsBookCache"] = None,
+    ) -> None:
         self.http = http
         self.config = config
+        self.ws_cache = ws_cache
         self.entries: Dict[str, BookCacheEntry] = {}
 
     def get_book(self, token_id: str) -> Dict[str, Any]:
+        if self.ws_cache:
+            self.ws_cache.subscribe_assets([token_id])
+            ws_book = self.ws_cache.get_book(token_id)
+            if ws_book:
+                return ws_book
+
         entry = self.entries.get(token_id)
         if entry and now_ts() - entry.loaded_at <= self.config.book_cache_sec:
             return entry.book
@@ -135,14 +148,197 @@ class BookCache:
             params={"token_id": token_id},
         )
         self.entries[token_id] = BookCacheEntry(loaded_at=now_ts(), book=book)
+        if self.ws_cache:
+            self.ws_cache.remember_book(token_id, book)
         return book
+
+
+class MarketWsBookCache:
+    def __init__(self, config: CopyBotConfig) -> None:
+        self.config = config
+        self.assets: Set[str] = set()
+        self.pending_assets: Set[str] = set()
+        self.books: Dict[str, BookCacheEntry] = {}
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+        self.ws: Any = None
+
+    def start(self, asset_ids: Iterable[str]) -> None:
+        if not self.config.enable_market_ws:
+            print("[WS] Market WebSocket 已关闭，使用 HTTP /book 回退。")
+            return
+        self.subscribe_assets(asset_ids)
+        if self.thread and self.thread.is_alive():
+            return
+        self.thread = threading.Thread(target=self._run, name="market-ws-cache", daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        with self.lock:
+            ws = self.ws
+        if ws:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    def subscribe_assets(self, asset_ids: Iterable[str]) -> None:
+        clean_assets = [str(asset_id) for asset_id in asset_ids if str(asset_id)]
+        if not clean_assets or not self.config.enable_market_ws:
+            return
+        with self.lock:
+            for asset_id in clean_assets:
+                if asset_id in self.assets:
+                    continue
+                if len(self.assets) >= self.config.market_ws_max_assets:
+                    print(f"[WS WARN] 订阅资产数量已达上限 {self.config.market_ws_max_assets}，跳过 {asset_id}")
+                    continue
+                self.assets.add(asset_id)
+                self.pending_assets.add(asset_id)
+
+    def get_book(self, token_id: str) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            entry = self.books.get(token_id)
+        if not entry:
+            return None
+        if now_ts() - entry.loaded_at > self.config.market_ws_book_max_age_sec:
+            return None
+        if "tick_size" not in entry.book or "min_order_size" not in entry.book:
+            return None
+        return dict(entry.book)
+
+    def remember_book(self, token_id: str, book: Dict[str, Any]) -> None:
+        with self.lock:
+            self.books[token_id] = BookCacheEntry(loaded_at=now_ts(), book=dict(book))
+
+    def _run(self) -> None:
+        try:
+            import websocket  # type: ignore
+        except ImportError:
+            print("[WS WARN] 缺少 websocket-client，Market WS 缓存不可用。")
+            return
+
+        while not self.stop_event.is_set():
+            ws = None
+            try:
+                with self.lock:
+                    initial_assets = sorted(self.assets)
+                    self.pending_assets.clear()
+                ws = websocket.create_connection(self.config.market_ws_url, timeout=10)
+                with self.lock:
+                    self.ws = ws
+                if initial_assets:
+                    self._send_subscription(ws, initial_assets, initial=True)
+                    print(f"[WS] 已连接 Market WebSocket，订阅 {len(initial_assets)} 个 asset。")
+                else:
+                    print("[WS] 已连接 Market WebSocket，等待 asset 订阅。")
+
+                next_ping = time.monotonic() + self.config.market_ws_heartbeat_sec
+                ws.settimeout(1)
+                while not self.stop_event.is_set():
+                    if time.monotonic() >= next_ping:
+                        ws.send("PING")
+                        next_ping = time.monotonic() + self.config.market_ws_heartbeat_sec
+
+                    pending = self._take_pending_assets()
+                    if pending:
+                        self._send_subscription(ws, pending, initial=False)
+                        print(f"[WS] 新增订阅 {len(pending)} 个 asset，总计 {len(self.assets)}。")
+
+                    try:
+                        message = ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        continue
+                    if not message:
+                        continue
+                    if message == "PONG":
+                        continue
+                    if message == "PING":
+                        ws.send("PONG")
+                        continue
+                    self._handle_message(str(message))
+            except Exception as exc:
+                if not self.stop_event.is_set():
+                    print(f"[WS WARN] Market WebSocket 断开: {repr(exc)}，稍后重连。")
+                    time.sleep(self.config.market_ws_reconnect_sec)
+            finally:
+                with self.lock:
+                    self.ws = None
+                if ws:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+
+    def _take_pending_assets(self) -> List[str]:
+        with self.lock:
+            pending = sorted(self.pending_assets)
+            self.pending_assets.clear()
+        return pending
+
+    def _send_subscription(self, ws: Any, asset_ids: List[str], initial: bool) -> None:
+        payload: Dict[str, Any] = {
+            "assets_ids": asset_ids,
+            "custom_feature_enabled": self.config.market_ws_custom_feature_enabled,
+        }
+        if initial:
+            payload["type"] = "market"
+        else:
+            payload["operation"] = "subscribe"
+        ws.send(json.dumps(payload))
+
+    def _handle_message(self, message: str) -> None:
+        try:
+            data = json.loads(message)
+        except json.JSONDecodeError:
+            return
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    self._handle_event(item)
+        elif isinstance(data, dict):
+            self._handle_event(data)
+
+    def _handle_event(self, event: Dict[str, Any]) -> None:
+        event_type = event.get("event_type")
+        token_id = str(event.get("asset_id") or event.get("asset") or "")
+        if not token_id:
+            return
+
+        if event_type == "book":
+            book = dict(event)
+            with self.lock:
+                existing = self.books.get(token_id)
+                if existing:
+                    if "min_order_size" not in book and "min_order_size" in existing.book:
+                        book["min_order_size"] = existing.book["min_order_size"]
+                    if "neg_risk" not in book and "neg_risk" in existing.book:
+                        book["neg_risk"] = existing.book["neg_risk"]
+                    if "tick_size" not in book and "tick_size" in existing.book:
+                        book["tick_size"] = existing.book["tick_size"]
+                if "tick_size" not in book:
+                    book["tick_size"] = "0.01"
+                self.books[token_id] = BookCacheEntry(loaded_at=now_ts(), book=book)
+            return
+
+        if event_type == "tick_size_change":
+            with self.lock:
+                entry = self.books.get(token_id)
+                if not entry:
+                    return
+                book = dict(entry.book)
+                book["tick_size"] = str(event.get("new_tick_size") or book.get("tick_size", "0.01"))
+                self.books[token_id] = BookCacheEntry(loaded_at=now_ts(), book=book)
 
 
 class PolymarketCopyBot:
     def __init__(self, config: CopyBotConfig) -> None:
         self.config = config
         self.http = HttpJsonClient(config)
-        self.book_cache = BookCache(self.http, config)
+        self.market_ws = MarketWsBookCache(config)
+        self.book_cache = BookCache(self.http, config, self.market_ws)
         self.store = SeenStore(config.state_file)
         self._order_lib: Optional[Dict[str, Any]] = None
 
@@ -157,7 +353,12 @@ class PolymarketCopyBot:
         print(f"[TARGET] @{self.config.target_username} proxyWallet = {wallet}")
 
         self.store.load()
-        self.bootstrap_seen(wallet)
+        bootstrap_history = self.bootstrap_seen(wallet)
+        initial_assets = collect_asset_ids(bootstrap_history, self.config.market_ws_bootstrap_assets)
+        if not initial_assets:
+            recent_activities = self.fetch_activity(wallet, limit=self.config.activity_limit)
+            initial_assets = collect_asset_ids(recent_activities, self.config.market_ws_bootstrap_assets)
+        self.market_ws.start(initial_assets)
         seen = self.store.seen_set()
 
         client = None
@@ -167,29 +368,33 @@ class PolymarketCopyBot:
             client = self.build_client()
             print("[MODE] DRY_RUN=0，真实下单。")
 
-        while True:
-            try:
-                activities = self.fetch_activity(wallet, limit=self.config.activity_limit)
-                new_trades = self.find_new_trades(activities, seen)
-                for trade in new_trades:
-                    key = trade_key(trade)
-                    try:
-                        self.place_copy_order(client, trade)
-                    except Exception as exc:
-                        print(f"[COPY ERROR] key={key} error={repr(exc)} trade={trade}")
-                        if not self.config.mark_failed_seen:
-                            continue
-                    seen.add(key)
+        try:
+            while True:
+                try:
+                    activities = self.fetch_activity(wallet, limit=self.config.activity_limit)
+                    self.market_ws.subscribe_assets(collect_asset_ids(activities, self.config.market_ws_bootstrap_assets))
+                    new_trades = self.find_new_trades(activities, seen)
+                    for trade in new_trades:
+                        key = trade_key(trade)
+                        try:
+                            self.place_copy_order(client, trade)
+                        except Exception as exc:
+                            print(f"[COPY ERROR] key={key} error={repr(exc)} trade={trade}")
+                            if not self.config.mark_failed_seen:
+                                continue
+                        seen.add(key)
+                        self.store.save(seen)
+                    time.sleep(self.config.poll_sec)
+                except KeyboardInterrupt:
+                    print("退出。")
                     self.store.save(seen)
-                time.sleep(self.config.poll_sec)
-            except KeyboardInterrupt:
-                print("退出。")
-                self.store.save(seen)
-                break
-            except Exception as exc:
-                print(f"[LOOP ERROR] {repr(exc)}")
-                self.store.save(seen)
-                time.sleep(max(self.config.poll_sec, 3))
+                    break
+                except Exception as exc:
+                    print(f"[LOOP ERROR] {repr(exc)}")
+                    self.store.save(seen)
+                    time.sleep(max(self.config.poll_sec, 3))
+        finally:
+            self.market_ws.stop()
 
     def resolve_target_wallet(self) -> str:
         wallet = self.config.target_wallet.strip()
@@ -239,15 +444,16 @@ class PolymarketCopyBot:
             raise RuntimeError(f"activity 返回异常: {data}")
         return data
 
-    def bootstrap_seen(self, wallet: str) -> None:
+    def bootstrap_seen(self, wallet: str) -> List[Dict[str, Any]]:
         seen = self.store.seen_set()
         if seen:
-            return
+            return []
         history = self.fetch_activity(wallet, limit=self.config.bootstrap_limit)
         for trade in history:
             seen.add(trade_key(trade))
         self.store.save(seen)
         print(f"[BOOTSTRAP] 已把启动前 {len(seen)} 条历史 TRADE 标记为 seen，不复制旧单。")
+        return history
 
     def find_new_trades(
         self,
@@ -293,6 +499,7 @@ class PolymarketCopyBot:
             return
 
         token_id = str(trade["asset"])
+        self.market_ws.subscribe_assets([token_id])
         target_size = decimal_value(trade["size"])
         copy_size = target_size * self.config.copy_ratio
         book = self.book_cache.get_book(token_id)
@@ -387,6 +594,20 @@ def trade_key(trade: Dict[str, Any]) -> str:
         str(trade.get("size", "")),
     ]
     return "|".join(parts)
+
+
+def collect_asset_ids(trades: Iterable[Dict[str, Any]], limit: int) -> List[str]:
+    assets: List[str] = []
+    seen: Set[str] = set()
+    for trade in trades:
+        asset = str(trade.get("asset") or "")
+        if not asset or asset in seen:
+            continue
+        seen.add(asset)
+        assets.append(asset)
+        if len(assets) >= limit:
+            break
+    return assets
 
 
 def aggressive_price(side: str, tick_size: Decimal) -> Decimal:

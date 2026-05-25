@@ -7,7 +7,7 @@
 - 低频调用 Polymarket Data API `/activity` 发现目标账号的新成交。
 - 使用 CLOB API 获取订单簿参数并下单。
 - 对 HTTP `429`、`5xx`、网络抖动做自动退避和重试。
-- 对 `/book` 做短缓存，减少重复请求。
+- 对 `/book` 做短缓存，并默认启用 Polymarket Market WebSocket 维护近期 asset 的盘口参数，减少发现成交后的 HTTP 请求。
 - 默认 `DRY_RUN=1`，先只打印不真实下单。
 - VPS 一键安装，安装后直接用 `jy` 打开交互菜单。
 
@@ -72,6 +72,8 @@ jy
 - `POLL_SEC`: 监听间隔。
 - `DRY_RUN`: `1` 只打印，`0` 真实下单。
 - `TARGET_USERNAME` / `TARGET_WALLET`: 目标账号。
+- `ENABLE_MARKET_WS`: 默认 `1`，启用 Market WebSocket 盘口缓存。
+- `MARKET_WS_URL`: 默认 `wss://ws-subscriptions-clob.polymarket.com/ws/market`。
 
 Polymarket CLOB 的 `apiKey / secret / passphrase` 会由 SDK 根据 `PRIVATE_KEY` 自动派生。你一般不需要手动填写 Relayer API Key。
 
@@ -174,4 +176,4 @@ jy service disable-autostart
 
 这一版不做历史补仓、不做定时仓位拉平、不做自动撤单、不做盈亏统计。
 
-目标用户成交发现仍使用 Polymarket Data API 的低频 `/activity` 查询。Polymarket 官方 WebSocket 更适合盘口和自己账户通道；任意目标钱包的纯链上 WebSocket 监听会作为后续高级模式。
+目标用户成交发现仍使用 Polymarket Data API 的低频 `/activity` 查询。Market WebSocket 用于维护已知 asset 的订单簿参数和盘口更新；如果 WS 断线或没有缓存，机器人会自动回退到 HTTP `/book`。任意目标钱包的纯链上 WebSocket 监听会作为后续高级模式。
