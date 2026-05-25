@@ -23,6 +23,13 @@ getcontext().prec = 28
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
+NON_RETRYABLE_ORDER_ERROR_MARKERS = (
+    "not enough balance / allowance",
+    "balance is not enough",
+    "allowance is not enough",
+    "insufficient balance",
+    "insufficient allowance",
+)
 
 
 def decimal_value(value: Any) -> Decimal:
@@ -31,6 +38,11 @@ def decimal_value(value: Any) -> Decimal:
 
 def now_ts() -> float:
     return time.time()
+
+
+def is_non_retryable_order_error(exc: BaseException) -> bool:
+    text = repr(exc).lower()
+    return any(marker in text for marker in NON_RETRYABLE_ORDER_ERROR_MARKERS)
 
 
 class HttpJsonClient:
@@ -391,10 +403,16 @@ class PolymarketCopyBot:
                             self.place_copy_order(client, trade)
                         except Exception as exc:
                             print(f"[COPY ERROR] key={key} error={repr(exc)} trade={trade}")
-                            if not self.config.mark_failed_seen:
+                            if is_non_retryable_order_error(exc):
+                                print(
+                                    "[COPY WARN] 余额/授权不足属于不可自动恢复错误，"
+                                    "本笔强制标记 seen，避免无限重试。"
+                                )
+                            elif not self.config.mark_failed_seen:
                                 print("[COPY RETRY] MARK_FAILED_SEEN=0，本笔不标记 seen，下轮会继续尝试。")
                                 continue
-                            print("[COPY WARN] MARK_FAILED_SEEN=1，本笔失败后仍标记 seen，避免重复下单。")
+                            else:
+                                print("[COPY WARN] MARK_FAILED_SEEN=1，本笔失败后仍标记 seen，避免重复下单。")
                         seen.add(key)
                         self.store.save(seen)
                     time.sleep(self.config.poll_sec)
