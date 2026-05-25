@@ -209,7 +209,6 @@ jy set-price-protection --mode safe --max-slippage 0.02 --max-order-usdc 0 --res
 - `aggressive`：更容易成交，但滑点风险更大，不建议一开始实盘使用。
 - `COPY_RATIO`：跟单比例。
 - `MAX_ORDER_USDC`：单笔最大金额，`0` 表示不限制。
-- 余额/授权不足时，程序会强制把该笔标记为 seen，避免同一笔失败订单无限重试。
 
 ## AI量化模拟
 
