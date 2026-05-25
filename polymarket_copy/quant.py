@@ -153,10 +153,13 @@ class ChainlinkRtdsPriceFeed:
         if start_item is None:
             raise RuntimeError("missing Chainlink start price")
         start_ts, start_price = start_item
-        if abs(start_ts - market_start_ts) > self.config.quant_chainlink_start_tolerance_sec:
+        start_delta = abs(start_ts - market_start_ts)
+        start_tolerance = self.config.quant_chainlink_start_tolerance_sec
+        if start_delta > start_tolerance:
             raise RuntimeError(
                 f"Chainlink start price is too far from market start: "
-                f"start_ts={start_ts} market_start_ts={market_start_ts}"
+                f"start_ts={start_ts} market_start_ts={market_start_ts} "
+                f"delta={start_delta}s tolerance={start_tolerance}s"
             )
 
         one_min_item = nearest_price(prices, current_ts - 60)

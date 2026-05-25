@@ -91,7 +91,9 @@ jy
 - `QUANT_PRICE_SOURCE`: 默认 `chainlink`，通过 Polymarket RTDS 订阅 Chainlink BTC/USD；也可手动改成 `okx` 做参考行情对比。
 - `QUANT_CHAINLINK_SYMBOL`: 默认 `btc/usd`。
 - `QUANT_CHAINLINK_WS_URL`: 默认 `wss://ws-live-data.polymarket.com`。
-- `QUANT_CHAINLINK_MAX_AGE_SEC`: 默认 `180`，超过这个秒数仍无最新 Chainlink 价格才认为行情过旧。
+- `QUANT_CHAINLINK_TIMEOUT_SEC`: 默认 `20`，启动或重连后最多等待 20 秒拿行情。
+- `QUANT_CHAINLINK_MAX_AGE_SEC`: 默认 `240`，超过这个秒数仍无最新 Chainlink 价格才认为行情过旧。
+- `QUANT_CHAINLINK_START_TOLERANCE_SEC`: 默认 `180`，允许 Chainlink 开盘参考价和 Polymarket 5 分钟市场开始时间有一定偏差，避免 RTDS 推送不是整点时整轮跳过。
 - `QUANT_STRATEGY`: `single` 为单边信号模型，`lock` 为 JetFadil 风格锁利模拟模型。
 - `QUANT_SIZE_MODE`: `usdc` 按金额换算份额，`shares` 按固定份额下单。锁利模拟建议 `shares`。
 - `QUANT_ORDER_USDC`: AI量化每次计划下单金额，默认 `5`。
@@ -200,7 +202,7 @@ jy set-bot-mode quant --restart
 修改 AI量化参数：
 
 ```bash
-jy set-quant-config --price-source chainlink --order-usdc 5 --min-edge 0.04 --min-seconds-left 45 --restart
+jy set-quant-config --price-source chainlink --chainlink-timeout-sec 20 --chainlink-max-age-sec 240 --chainlink-start-tolerance-sec 180 --order-usdc 5 --min-edge 0.04 --min-seconds-left 45 --restart
 ```
 
 查看文件日志：
@@ -246,7 +248,7 @@ jy quant-data clear
 ```bash
 jy set-bot-mode quant
 jy set-dry-run 1
-jy set-quant-config --price-source chainlink --record-signals 1 --signal-interval-sec 30
+jy set-quant-config --price-source chainlink --chainlink-timeout-sec 20 --chainlink-max-age-sec 240 --chainlink-start-tolerance-sec 180 --record-signals 1 --signal-interval-sec 30
 jy quant-data clear
 jy app-logs clear
 jy service restart
@@ -270,7 +272,7 @@ jy quant-data tail --lines 5
 ```bash
 jy set-bot-mode quant
 jy set-dry-run 1
-jy set-quant-config --strategy lock --size-mode shares --order-shares 20 --capital-usdc 300 --market-max-usdc 300 --max-trades-per-market 35 --rebuy-cooldown-sec 5 --lock-min-profit 0.50 --price-source chainlink --record-signals 1 --signal-interval-sec 5
+jy set-quant-config --strategy lock --size-mode shares --order-shares 20 --capital-usdc 300 --market-max-usdc 300 --max-trades-per-market 35 --rebuy-cooldown-sec 5 --lock-min-profit 0.50 --price-source chainlink --chainlink-timeout-sec 20 --chainlink-max-age-sec 240 --chainlink-start-tolerance-sec 180 --record-signals 1 --signal-interval-sec 5
 jy quant-data clear
 jy app-logs clear
 jy service restart

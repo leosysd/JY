@@ -22,6 +22,9 @@ from .config import (
     DEFAULT_CLOB_API_URL,
     DEFAULT_MARKET_WS_URL,
     DEFAULT_POLYMARKET_RTDS_WS_URL,
+    DEFAULT_QUANT_CHAINLINK_MAX_AGE_SEC,
+    DEFAULT_QUANT_CHAINLINK_START_TOLERANCE_SEC,
+    DEFAULT_QUANT_CHAINLINK_TIMEOUT_SEC,
     DEFAULT_TARGET_USERNAME,
     DEFAULT_TARGET_WALLET,
     env_lines,
@@ -85,6 +88,8 @@ def write_env(path: Path, values: Dict[str, str]) -> None:
 
 
 def init_config(config_path: Path) -> None:
+    if config_path.exists():
+        migrate_chainlink_defaults(config_path)
     existing = load_existing_env(config_path)
     target_username = prompt_text(
         "目标用户名 TARGET_USERNAME",
@@ -153,9 +158,12 @@ def init_config(config_path: Path) -> None:
         "QUANT_PRICE_SOURCE": existing.get("QUANT_PRICE_SOURCE", "chainlink"),
         "QUANT_CHAINLINK_SYMBOL": existing.get("QUANT_CHAINLINK_SYMBOL", "btc/usd"),
         "QUANT_CHAINLINK_WS_URL": existing.get("QUANT_CHAINLINK_WS_URL", DEFAULT_POLYMARKET_RTDS_WS_URL),
-        "QUANT_CHAINLINK_TIMEOUT_SEC": existing.get("QUANT_CHAINLINK_TIMEOUT_SEC", "12"),
-        "QUANT_CHAINLINK_MAX_AGE_SEC": existing.get("QUANT_CHAINLINK_MAX_AGE_SEC", "180"),
-        "QUANT_CHAINLINK_START_TOLERANCE_SEC": existing.get("QUANT_CHAINLINK_START_TOLERANCE_SEC", "4"),
+        "QUANT_CHAINLINK_TIMEOUT_SEC": existing.get("QUANT_CHAINLINK_TIMEOUT_SEC", DEFAULT_QUANT_CHAINLINK_TIMEOUT_SEC),
+        "QUANT_CHAINLINK_MAX_AGE_SEC": existing.get("QUANT_CHAINLINK_MAX_AGE_SEC", DEFAULT_QUANT_CHAINLINK_MAX_AGE_SEC),
+        "QUANT_CHAINLINK_START_TOLERANCE_SEC": existing.get(
+            "QUANT_CHAINLINK_START_TOLERANCE_SEC",
+            DEFAULT_QUANT_CHAINLINK_START_TOLERANCE_SEC,
+        ),
         "QUANT_STRATEGY": existing.get("QUANT_STRATEGY", "single"),
         "QUANT_SIZE_MODE": existing.get("QUANT_SIZE_MODE", "usdc"),
         "QUANT_ORDER_USDC": existing.get("QUANT_ORDER_USDC", "5"),
@@ -298,6 +306,7 @@ def install_from_git(
 ) -> None:
     if not config_path.exists():
         raise SystemExit(f"配置文件不存在: {config_path}，请先运行 init-config")
+    migrate_chainlink_defaults(config_path)
     if not print_config_summary(config_path):
         raise SystemExit("配置校验失败，请先修正 .env")
 
@@ -335,6 +344,7 @@ def install_from_git(
         "./venv/bin/pip install --upgrade pip && "
         "./venv/bin/pip install -r requirements.txt && "
         "./venv/bin/pip install -e . && "
+        "./venv/bin/python -c \"from pathlib import Path; from polymarket_copy.cli import migrate_chainlink_defaults; migrate_chainlink_defaults(Path('.env'))\" && "
         "chmod 600 .env",
     )
 
@@ -463,6 +473,7 @@ def remote_action(
             "./venv/bin/pip install --upgrade pip && "
             "./venv/bin/pip install -r requirements.txt && "
             "./venv/bin/pip install -e . && "
+            "./venv/bin/python -c \"from pathlib import Path; from polymarket_copy.cli import migrate_chainlink_defaults; migrate_chainlink_defaults(Path('.env'))\" && "
             f"{sudo}systemctl stop {svc}"
         )
         ssh(target, cmd)
@@ -644,6 +655,22 @@ def set_env_value(config_path: Path, key: str, value: str) -> None:
         pass
 
 
+def migrate_chainlink_defaults(config_path: Path) -> None:
+    existing = load_existing_env(config_path)
+    migrations = {
+        "QUANT_CHAINLINK_TIMEOUT_SEC": ("12", DEFAULT_QUANT_CHAINLINK_TIMEOUT_SEC),
+        "QUANT_CHAINLINK_MAX_AGE_SEC": ("180", DEFAULT_QUANT_CHAINLINK_MAX_AGE_SEC),
+        "QUANT_CHAINLINK_START_TOLERANCE_SEC": ("4", DEFAULT_QUANT_CHAINLINK_START_TOLERANCE_SEC),
+    }
+    changed: List[str] = []
+    for key, (legacy_value, new_value) in migrations.items():
+        if existing.get(key) == legacy_value:
+            set_env_value(config_path, key, new_value)
+            changed.append(f"{key}={new_value}")
+    if changed:
+        print("[OK] 已自动升级 Chainlink RTDS 参数: " + ", ".join(changed))
+
+
 def update_copy_ratio(config_path: Path) -> None:
     existing = load_existing_env(config_path)
     value = prompt_text("新的跟单比例 COPY_RATIO", existing.get("COPY_RATIO", "1.0"))
@@ -692,9 +719,18 @@ def update_quant_config(config_path: Path) -> None:
         "QUANT_PRICE_SOURCE": prompt_text("行情源 QUANT_PRICE_SOURCE，chainlink=官方结算源，okx=参考行情", existing.get("QUANT_PRICE_SOURCE", "chainlink")),
         "QUANT_CHAINLINK_SYMBOL": prompt_text("Chainlink 交易对 QUANT_CHAINLINK_SYMBOL", existing.get("QUANT_CHAINLINK_SYMBOL", "btc/usd")),
         "QUANT_CHAINLINK_WS_URL": prompt_text("Polymarket RTDS WebSocket QUANT_CHAINLINK_WS_URL", existing.get("QUANT_CHAINLINK_WS_URL", DEFAULT_POLYMARKET_RTDS_WS_URL)),
-        "QUANT_CHAINLINK_TIMEOUT_SEC": prompt_text("Chainlink 首次等待秒数 QUANT_CHAINLINK_TIMEOUT_SEC", existing.get("QUANT_CHAINLINK_TIMEOUT_SEC", "12")),
-        "QUANT_CHAINLINK_MAX_AGE_SEC": prompt_text("Chainlink 最新价格最大延迟秒数 QUANT_CHAINLINK_MAX_AGE_SEC", existing.get("QUANT_CHAINLINK_MAX_AGE_SEC", "180")),
-        "QUANT_CHAINLINK_START_TOLERANCE_SEC": prompt_text("Chainlink 开盘价容忍秒数 QUANT_CHAINLINK_START_TOLERANCE_SEC", existing.get("QUANT_CHAINLINK_START_TOLERANCE_SEC", "4")),
+        "QUANT_CHAINLINK_TIMEOUT_SEC": prompt_text(
+            "Chainlink 首次等待秒数 QUANT_CHAINLINK_TIMEOUT_SEC",
+            existing.get("QUANT_CHAINLINK_TIMEOUT_SEC", DEFAULT_QUANT_CHAINLINK_TIMEOUT_SEC),
+        ),
+        "QUANT_CHAINLINK_MAX_AGE_SEC": prompt_text(
+            "Chainlink 最新价格最大延迟秒数 QUANT_CHAINLINK_MAX_AGE_SEC",
+            existing.get("QUANT_CHAINLINK_MAX_AGE_SEC", DEFAULT_QUANT_CHAINLINK_MAX_AGE_SEC),
+        ),
+        "QUANT_CHAINLINK_START_TOLERANCE_SEC": prompt_text(
+            "Chainlink 开盘价容忍秒数 QUANT_CHAINLINK_START_TOLERANCE_SEC",
+            existing.get("QUANT_CHAINLINK_START_TOLERANCE_SEC", DEFAULT_QUANT_CHAINLINK_START_TOLERANCE_SEC),
+        ),
         "QUANT_STRATEGY": prompt_text("量化策略 QUANT_STRATEGY，single=单边，lock=锁利模拟", existing.get("QUANT_STRATEGY", "single")),
         "QUANT_SIZE_MODE": prompt_text("下单尺寸模式 QUANT_SIZE_MODE，usdc=金额，shares=份额", existing.get("QUANT_SIZE_MODE", "usdc")),
         "QUANT_ORDER_USDC": prompt_text("每次量化下单金额 QUANT_ORDER_USDC", existing.get("QUANT_ORDER_USDC", "5")),
@@ -892,6 +928,7 @@ def update_program(service_name: str = DEFAULT_SERVICE) -> None:
     run_command(["git", "pull", "--ff-only"])
     run_command([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
     run_command([sys.executable, "-m", "pip", "install", "-e", "."])
+    migrate_chainlink_defaults(install_dir / ".env")
     try:
         local_service_action("stop", service_name)
     except subprocess.CalledProcessError as exc:
@@ -966,6 +1003,7 @@ def test_api_config(config_path: Path) -> bool:
 
 
 def local_interactive_menu(config_path: Path = Path(".env")) -> None:
+    migrate_chainlink_defaults(config_path)
     while True:
         print("")
         print("JY Polymarket Copy CLI")
@@ -1209,6 +1247,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     if not args.command:
         interactive_menu()
         return
+    if getattr(args, "config", None) and args.command != "init-config":
+        migrate_chainlink_defaults(Path(args.config))
 
     if args.command == "menu":
         local_interactive_menu(Path(args.config))
@@ -1297,17 +1337,23 @@ def main(argv: Optional[List[str]] = None) -> None:
             set_env_value(
                 config_path,
                 "QUANT_CHAINLINK_TIMEOUT_SEC",
-                args.chainlink_timeout_sec or existing.get("QUANT_CHAINLINK_TIMEOUT_SEC", "12"),
+                args.chainlink_timeout_sec
+                or existing.get("QUANT_CHAINLINK_TIMEOUT_SEC", DEFAULT_QUANT_CHAINLINK_TIMEOUT_SEC),
             )
             set_env_value(
                 config_path,
                 "QUANT_CHAINLINK_MAX_AGE_SEC",
-                args.chainlink_max_age_sec or existing.get("QUANT_CHAINLINK_MAX_AGE_SEC", "180"),
+                args.chainlink_max_age_sec
+                or existing.get("QUANT_CHAINLINK_MAX_AGE_SEC", DEFAULT_QUANT_CHAINLINK_MAX_AGE_SEC),
             )
             set_env_value(
                 config_path,
                 "QUANT_CHAINLINK_START_TOLERANCE_SEC",
-                args.chainlink_start_tolerance_sec or existing.get("QUANT_CHAINLINK_START_TOLERANCE_SEC", "4"),
+                args.chainlink_start_tolerance_sec
+                or existing.get(
+                    "QUANT_CHAINLINK_START_TOLERANCE_SEC",
+                    DEFAULT_QUANT_CHAINLINK_START_TOLERANCE_SEC,
+                ),
             )
             set_env_value(config_path, "QUANT_STRATEGY", args.strategy or existing.get("QUANT_STRATEGY", "single"))
             set_env_value(config_path, "QUANT_SIZE_MODE", args.size_mode or existing.get("QUANT_SIZE_MODE", "usdc"))

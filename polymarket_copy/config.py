@@ -15,6 +15,9 @@ DEFAULT_TARGET_WALLET = "0xe0229e10a858860218b6132f4234602c47bd6603"
 DEFAULT_CLOB_API_URL = "https://clob.polymarket.com"
 DEFAULT_MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 DEFAULT_POLYMARKET_RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
+DEFAULT_QUANT_CHAINLINK_TIMEOUT_SEC = "20"
+DEFAULT_QUANT_CHAINLINK_MAX_AGE_SEC = "240"
+DEFAULT_QUANT_CHAINLINK_START_TOLERANCE_SEC = "180"
 
 
 def parse_bool(value: object, default: bool = False) -> bool:
@@ -30,6 +33,11 @@ def parse_bool(value: object, default: bool = False) -> bool:
 
 def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
+
+
+def _env_upgraded_default(name: str, default: str, legacy_default: str) -> str:
+    value = _env(name, default)
+    return default if value == legacy_default else value
 
 
 def _path_env(name: str, default: str, config_path: Optional[Path]) -> Path:
@@ -85,9 +93,9 @@ class CopyBotConfig:
     quant_price_source: str = "chainlink"
     quant_chainlink_symbol: str = "btc/usd"
     quant_chainlink_ws_url: str = DEFAULT_POLYMARKET_RTDS_WS_URL
-    quant_chainlink_timeout_sec: float = 12.0
-    quant_chainlink_max_age_sec: float = 180.0
-    quant_chainlink_start_tolerance_sec: float = 4.0
+    quant_chainlink_timeout_sec: float = float(DEFAULT_QUANT_CHAINLINK_TIMEOUT_SEC)
+    quant_chainlink_max_age_sec: float = float(DEFAULT_QUANT_CHAINLINK_MAX_AGE_SEC)
+    quant_chainlink_start_tolerance_sec: float = float(DEFAULT_QUANT_CHAINLINK_START_TOLERANCE_SEC)
     quant_strategy: str = "single"
     quant_size_mode: str = "usdc"
     quant_order_usdc: Decimal = Decimal("5")
@@ -180,9 +188,27 @@ def load_config(config_path: Optional[Path] = None) -> CopyBotConfig:
         quant_price_source=_env("QUANT_PRICE_SOURCE", "chainlink").lower(),
         quant_chainlink_symbol=_env("QUANT_CHAINLINK_SYMBOL", "btc/usd").lower(),
         quant_chainlink_ws_url=_env("QUANT_CHAINLINK_WS_URL", DEFAULT_POLYMARKET_RTDS_WS_URL),
-        quant_chainlink_timeout_sec=float(_env("QUANT_CHAINLINK_TIMEOUT_SEC", "12")),
-        quant_chainlink_max_age_sec=float(_env("QUANT_CHAINLINK_MAX_AGE_SEC", "180")),
-        quant_chainlink_start_tolerance_sec=float(_env("QUANT_CHAINLINK_START_TOLERANCE_SEC", "4")),
+        quant_chainlink_timeout_sec=float(
+            _env_upgraded_default(
+                "QUANT_CHAINLINK_TIMEOUT_SEC",
+                DEFAULT_QUANT_CHAINLINK_TIMEOUT_SEC,
+                "12",
+            )
+        ),
+        quant_chainlink_max_age_sec=float(
+            _env_upgraded_default(
+                "QUANT_CHAINLINK_MAX_AGE_SEC",
+                DEFAULT_QUANT_CHAINLINK_MAX_AGE_SEC,
+                "180",
+            )
+        ),
+        quant_chainlink_start_tolerance_sec=float(
+            _env_upgraded_default(
+                "QUANT_CHAINLINK_START_TOLERANCE_SEC",
+                DEFAULT_QUANT_CHAINLINK_START_TOLERANCE_SEC,
+                "4",
+            )
+        ),
         quant_strategy=_env("QUANT_STRATEGY", "single").lower(),
         quant_size_mode=_env("QUANT_SIZE_MODE", "usdc").lower(),
         quant_order_usdc=Decimal(_env("QUANT_ORDER_USDC", "5")),
