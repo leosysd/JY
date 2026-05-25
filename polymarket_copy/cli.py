@@ -25,6 +25,8 @@ from .config import (
 
 DEFAULT_REMOTE_DIR = "/opt/polymarket-copy"
 DEFAULT_SERVICE = "polymarket-copy"
+DEFAULT_REPO_URL = "https://github.com/leosysd/JY.git"
+DEFAULT_REPO_BRANCH = "main"
 
 
 def project_root() -> Path:
@@ -190,6 +192,81 @@ WantedBy=multi-user.target
 """
 
 
+def install_from_git(
+    host: str,
+    user: str,
+    remote_dir: str,
+    config_path: Path,
+    service_name: str,
+    repo_url: str,
+    branch: str,
+    install_system_deps: bool,
+) -> None:
+    if not config_path.exists():
+        raise SystemExit(f"配置文件不存在: {config_path}，请先运行 init-config")
+    if not print_config_summary(config_path):
+        raise SystemExit("配置校验失败，请先修正 .env")
+
+    target = remote_target(host, user)
+    sudo = sudo_prefix(user)
+    remote_q = sh_quote(remote_dir)
+    repo_q = sh_quote(repo_url)
+    branch_q = sh_quote(branch)
+
+    if install_system_deps:
+        ssh(
+            target,
+            f"{sudo}apt-get update && "
+            f"{sudo}apt-get install -y python3 python3-venv python3-pip git",
+        )
+
+    ssh(
+        target,
+        f"{sudo}mkdir -p {remote_q} && "
+        f"{sudo}chown -R $USER:$USER {remote_q} && "
+        f"if [ -d {remote_q}/.git ]; then "
+        f"cd {remote_q} && git fetch origin {branch_q} && git checkout {branch_q} && git pull --ff-only origin {branch_q}; "
+        f"elif [ -z \"$(ls -A {remote_q} 2>/dev/null)\" ]; then "
+        f"git clone --branch {branch_q} {repo_q} {remote_q}; "
+        f"else "
+        f"echo 'Remote directory exists and is not an empty Git repo: {remote_dir}' >&2; exit 2; "
+        f"fi",
+    )
+
+    scp(config_path, f"{target}:{remote_dir}/.env")
+    ssh(
+        target,
+        f"cd {remote_q} && "
+        "python3 -m venv venv && "
+        "./venv/bin/pip install --upgrade pip && "
+        "./venv/bin/pip install -r requirements.txt && "
+        "./venv/bin/pip install -e . && "
+        "chmod 600 .env",
+    )
+
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".service", delete=False) as fh:
+        fh.write(service_content(remote_dir))
+        local_service = Path(fh.name)
+    try:
+        remote_tmp = f"/tmp/{service_name}.service"
+        scp(local_service, f"{target}:{remote_tmp}")
+        ssh(
+            target,
+            f"{sudo}mv {sh_quote(remote_tmp)} /etc/systemd/system/{sh_quote(service_name)}.service && "
+            f"{sudo}systemctl daemon-reload && "
+            f"{sudo}systemctl enable {sh_quote(service_name)} && "
+            f"{sudo}systemctl restart {sh_quote(service_name)}",
+        )
+    finally:
+        try:
+            local_service.unlink()
+        except OSError:
+            pass
+
+    print("[OK] Git 安装完成")
+    print(f"以后更新: jy-cli remote update --host {host} --user {user}")
+
+
 def deploy_to_vps(
     host: str,
     user: str,
@@ -280,6 +357,22 @@ def remote_action(
         ssh(target, f"{sudo}journalctl -u {svc} -f -n 100")
     elif action in {"start", "stop", "restart"}:
         ssh(target, f"{sudo}systemctl {action} {svc}")
+    elif action == "update":
+        cmd = (
+            f"cd {remote_q} && "
+            "if [ ! -d .git ]; then "
+            "echo 'Remote directory is not a Git install. Reinstall with jy-cli install first.' >&2; "
+            "exit 2; "
+            "fi && "
+            "git pull --ff-only && "
+            "python3 -m venv venv && "
+            "./venv/bin/pip install --upgrade pip && "
+            "./venv/bin/pip install -r requirements.txt && "
+            "./venv/bin/pip install -e . && "
+            f"{sudo}systemctl restart {svc}"
+        )
+        ssh(target, cmd)
+        print("[OK] 远程程序已更新并重启")
     elif action == "dry-run":
         if dry_run_value not in {"0", "1"}:
             raise SystemExit("--value 必须是 0 或 1")
@@ -306,11 +399,13 @@ def interactive_menu() -> None:
         print("1. 初始化/更新本地 .env")
         print("2. 校验本地配置")
         print("3. 本地运行机器人")
-        print("4. 部署到 VPS")
-        print("5. 查看远程服务状态")
-        print("6. 查看远程实时日志")
-        print("7. 重启远程服务")
-        print("8. 切换远程 DRY_RUN")
+        print("4. 从 GitHub 安装到 VPS")
+        print("5. 上传本地代码部署到 VPS")
+        print("6. 更新远程程序")
+        print("7. 查看远程服务状态")
+        print("8. 查看远程实时日志")
+        print("9. 重启远程服务")
+        print("10. 切换远程 DRY_RUN")
         print("0. 退出")
         choice = input("请选择: ").strip()
         try:
@@ -324,20 +419,40 @@ def interactive_menu() -> None:
                 host = prompt_text("VPS IP / Host")
                 user = prompt_text("SSH 用户", "root")
                 remote_dir = prompt_text("远程目录", DEFAULT_REMOTE_DIR)
-                deploy_to_vps(host, user, remote_dir, config_path, DEFAULT_SERVICE, True)
+                repo_url = prompt_text("GitHub 仓库地址", DEFAULT_REPO_URL)
+                branch = prompt_text("Git 分支", DEFAULT_REPO_BRANCH)
+                install_from_git(
+                    host,
+                    user,
+                    remote_dir,
+                    config_path,
+                    DEFAULT_SERVICE,
+                    repo_url,
+                    branch,
+                    True,
+                )
             elif choice == "5":
                 host = prompt_text("VPS IP / Host")
                 user = prompt_text("SSH 用户", "root")
-                remote_action("status", host, user, DEFAULT_REMOTE_DIR, DEFAULT_SERVICE, None)
+                remote_dir = prompt_text("远程目录", DEFAULT_REMOTE_DIR)
+                deploy_to_vps(host, user, remote_dir, config_path, DEFAULT_SERVICE, True)
             elif choice == "6":
                 host = prompt_text("VPS IP / Host")
                 user = prompt_text("SSH 用户", "root")
-                remote_action("logs", host, user, DEFAULT_REMOTE_DIR, DEFAULT_SERVICE, None)
+                remote_action("update", host, user, DEFAULT_REMOTE_DIR, DEFAULT_SERVICE, None)
             elif choice == "7":
                 host = prompt_text("VPS IP / Host")
                 user = prompt_text("SSH 用户", "root")
-                remote_action("restart", host, user, DEFAULT_REMOTE_DIR, DEFAULT_SERVICE, None)
+                remote_action("status", host, user, DEFAULT_REMOTE_DIR, DEFAULT_SERVICE, None)
             elif choice == "8":
+                host = prompt_text("VPS IP / Host")
+                user = prompt_text("SSH 用户", "root")
+                remote_action("logs", host, user, DEFAULT_REMOTE_DIR, DEFAULT_SERVICE, None)
+            elif choice == "9":
+                host = prompt_text("VPS IP / Host")
+                user = prompt_text("SSH 用户", "root")
+                remote_action("restart", host, user, DEFAULT_REMOTE_DIR, DEFAULT_SERVICE, None)
+            elif choice == "10":
                 host = prompt_text("VPS IP / Host")
                 user = prompt_text("SSH 用户", "root")
                 value = prompt_text("DRY_RUN 值，1=只打印，0=真实下单", "1")
@@ -368,6 +483,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_run = sub.add_parser("run", help="本地运行机器人")
     p_run.add_argument("--config", default=".env")
 
+    p_install = sub.add_parser("install", help="从 GitHub 安装到 VPS，便于以后远程更新")
+    p_install.add_argument("--host", required=True)
+    p_install.add_argument("--user", default="root")
+    p_install.add_argument("--remote-dir", default=DEFAULT_REMOTE_DIR)
+    p_install.add_argument("--config", default=".env")
+    p_install.add_argument("--service-name", default=DEFAULT_SERVICE)
+    p_install.add_argument("--repo-url", default=DEFAULT_REPO_URL)
+    p_install.add_argument("--branch", default=DEFAULT_REPO_BRANCH)
+    p_install.add_argument(
+        "--skip-system-deps",
+        action="store_true",
+        help="跳过 apt 安装系统依赖",
+    )
+
     p_deploy = sub.add_parser("deploy", help="部署到 VPS")
     p_deploy.add_argument("--host", required=True)
     p_deploy.add_argument("--user", default="root")
@@ -383,7 +512,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_remote = sub.add_parser("remote", help="管理 VPS 上的 systemd 服务")
     p_remote.add_argument(
         "action",
-        choices=["status", "logs", "start", "stop", "restart", "dry-run"],
+        choices=["status", "logs", "start", "stop", "restart", "update", "dry-run"],
     )
     p_remote.add_argument("--host", required=True)
     p_remote.add_argument("--user", default="root")
@@ -408,6 +537,17 @@ def main(argv: Optional[List[str]] = None) -> None:
         raise SystemExit(0 if ok else 1)
     elif args.command == "run":
         run_bot(Path(args.config))
+    elif args.command == "install":
+        install_from_git(
+            host=args.host,
+            user=args.user,
+            remote_dir=args.remote_dir,
+            config_path=Path(args.config),
+            service_name=args.service_name,
+            repo_url=args.repo_url,
+            branch=args.branch,
+            install_system_deps=not args.skip_system_deps,
+        )
     elif args.command == "deploy":
         deploy_to_vps(
             host=args.host,

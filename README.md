@@ -49,7 +49,15 @@ jy-cli validate
 jy-cli run
 ```
 
-部署到 VPS：
+推荐：从 GitHub 自动安装到 VPS：
+
+```powershell
+jy-cli install --host 你的VPS_IP --user root
+```
+
+这种方式会在 VPS 上保留 Git 仓库，后续可以直接远程更新。
+
+也可以上传当前本地代码部署：
 
 ```powershell
 jy-cli deploy --host 你的VPS_IP --user root
@@ -65,6 +73,12 @@ jy-cli remote status --host 你的VPS_IP --user root
 
 ```powershell
 jy-cli remote logs --host 你的VPS_IP --user root
+```
+
+更新 VPS 上的程序：
+
+```powershell
+jy-cli remote update --host 你的VPS_IP --user root
 ```
 
 切换真实下单：
@@ -108,6 +122,31 @@ systemctl status polymarket-copy
 journalctl -u polymarket-copy -f
 systemctl restart polymarket-copy
 ```
+
+## 推荐安装和更新流程
+
+第一次安装：
+
+```powershell
+jy-cli init-config
+jy-cli validate
+jy-cli install --host 你的VPS_IP --user root
+```
+
+以后我把 GitHub 仓库里的交互页面或机器人逻辑更新后，你只需要：
+
+```powershell
+jy-cli remote update --host 你的VPS_IP --user root
+```
+
+它会在 VPS 上执行：
+
+- `git pull --ff-only`
+- 更新 Python 依赖
+- 重新安装本项目
+- 重启 `polymarket-copy` 服务
+
+`.env`、`seen_*.json`、`venv/` 都不会被 Git 覆盖。
 
 ## 第一版边界
 
