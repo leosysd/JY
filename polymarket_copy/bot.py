@@ -33,6 +33,22 @@ def now_ts() -> float:
     return time.time()
 
 
+def is_non_retryable_http_error(exc: requests.RequestException) -> bool:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return False
+    status = response.status_code
+    return 400 <= status < 500 and status != 429
+
+
+def is_missing_order_book_error(exc: BaseException) -> bool:
+    response = getattr(exc, "response", None)
+    url = getattr(response, "url", "") if response is not None else ""
+    status = getattr(response, "status_code", None) if response is not None else None
+    text = f"{repr(exc)} {url}"
+    return (status == 404 or "404 Client Error" in text) and "/book" in text and "token_id=" in text
+
+
 class HttpJsonClient:
     def __init__(self, config: CopyBotConfig) -> None:
         self.config = config
@@ -61,6 +77,10 @@ class HttpJsonClient:
                 return response.json()
             except requests.RequestException as exc:
                 last_error = exc
+                if is_non_retryable_http_error(exc):
+                    status = exc.response.status_code if exc.response is not None else "unknown"
+                    print(f"[HTTP ERROR] non-retryable status={status} error={repr(exc)}")
+                    raise
                 if attempt == self.config.http_max_retries - 1:
                     break
                 wait_sec = self._backoff_seconds(attempt)
@@ -391,10 +411,13 @@ class PolymarketCopyBot:
                             self.place_copy_order(client, trade)
                         except Exception as exc:
                             print(f"[COPY ERROR] key={key} error={repr(exc)} trade={trade}")
-                            if not self.config.mark_failed_seen:
+                            if is_missing_order_book_error(exc):
+                                print("[COPY WARN] CLOB /book 返回 404，本笔订单簿不可用，已标记 seen，避免旧单无限重试。")
+                            elif not self.config.mark_failed_seen:
                                 print("[COPY RETRY] MARK_FAILED_SEEN=0，本笔不标记 seen，下轮会继续尝试。")
                                 continue
-                            print("[COPY WARN] MARK_FAILED_SEEN=1，本笔失败后仍标记 seen，避免重复下单。")
+                            else:
+                                print("[COPY WARN] MARK_FAILED_SEEN=1，本笔失败后仍标记 seen，避免重复下单。")
                         seen.add(key)
                         self.store.save(seen)
                     time.sleep(self.config.poll_sec)
