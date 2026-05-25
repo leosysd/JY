@@ -42,7 +42,8 @@ jy
 10. 切换 DRY_RUN
 11. 修改跟单比例 COPY_RATIO
 12. 修改目标用户/钱包
-13. 更新程序
+13. 关闭开机自启
+14. 更新程序
 0. 退出
 ```
 
@@ -154,7 +155,13 @@ journalctl -u polymarket-copy -f
 systemctl restart polymarket-copy
 ```
 
-菜单 `13. 更新程序` 或 `jy update` 会执行：
+默认不开机自启。菜单 `13. 关闭开机自启` 或下面命令可关闭已有自启：
+
+```bash
+jy service disable-autostart
+```
+
+菜单 `14. 更新程序` 或 `jy update` 会执行：
 
 - `git pull --ff-only`
 - 更新 Python 依赖

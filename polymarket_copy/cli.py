@@ -423,7 +423,7 @@ def install_local_service(
     try:
         run_command(command_with_sudo(["install", "-m", "644", str(tmp_path), local_service_path(service_name)]))
         run_command(command_with_sudo(["systemctl", "daemon-reload"]))
-        run_command(command_with_sudo(["systemctl", "enable", service_name]))
+        run_command(command_with_sudo(["systemctl", "disable", service_name]))
         if start_now:
             run_command(command_with_sudo(["systemctl", "restart", service_name]))
     finally:
@@ -431,7 +431,7 @@ def install_local_service(
             tmp_path.unlink()
         except OSError:
             pass
-    print(f"[OK] systemd 服务已安装: {service_name}")
+    print(f"[OK] systemd 服务已安装: {service_name}，开机自启已关闭")
 
 
 def local_service_action(action: str, service_name: str = DEFAULT_SERVICE) -> None:
@@ -441,6 +441,9 @@ def local_service_action(action: str, service_name: str = DEFAULT_SERVICE) -> No
         run_command(command_with_sudo(["journalctl", "-u", service_name, "-f", "-n", "100"]))
     elif action in {"start", "stop", "restart"}:
         run_command(command_with_sudo(["systemctl", action, service_name]))
+    elif action == "disable-autostart":
+        run_command(command_with_sudo(["systemctl", "disable", service_name]))
+        print(f"[OK] 已关闭开机自启: {service_name}")
     else:
         raise SystemExit(f"未知本地服务动作: {action}")
 
@@ -618,7 +621,8 @@ def local_interactive_menu(config_path: Path = Path(".env")) -> None:
         print("10. 切换 DRY_RUN")
         print("11. 修改跟单比例 COPY_RATIO")
         print("12. 修改目标用户/钱包")
-        print("13. 更新程序")
+        print("13. 关闭开机自启")
+        print("14. 更新程序")
         print("0. 退出")
         choice = input("请选择: ").strip()
         try:
@@ -654,6 +658,8 @@ def local_interactive_menu(config_path: Path = Path(".env")) -> None:
                 if prompt_yes_no("是否立即重启服务让配置生效", True):
                     local_service_action("restart")
             elif choice == "13":
+                local_service_action("disable-autostart")
+            elif choice == "14":
                 update_program()
             elif choice == "0":
                 return
@@ -692,7 +698,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--config", default=".env")
 
     p_service = sub.add_parser("service", help="管理 VPS 本机 systemd 服务")
-    p_service.add_argument("action", choices=["install", "start", "stop", "restart", "status", "logs"])
+    p_service.add_argument(
+        "action",
+        choices=["install", "start", "stop", "restart", "status", "logs", "disable-autostart"],
+    )
     p_service.add_argument("--service-name", default=DEFAULT_SERVICE)
     p_service.add_argument("--start-now", action="store_true", help="install 后立即启动/重启服务")
 

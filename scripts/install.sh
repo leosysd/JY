@@ -79,7 +79,7 @@ EOF
 $SUDO install -m 644 "$tmp_service" "/etc/systemd/system/${SERVICE_NAME}.service"
 rm -f "$tmp_service"
 $SUDO systemctl daemon-reload
-$SUDO systemctl enable "$SERVICE_NAME"
+$SUDO systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
 
 if [ -f "$INSTALL_DIR/.env" ]; then
   $SUDO chmod 600 "$INSTALL_DIR/.env"
@@ -91,6 +91,7 @@ fi
 
 echo ""
 echo "Install complete."
+echo "Autostart is disabled. Start/stop the service from the jy menu."
 echo "Next step: run"
 echo ""
 echo "  jy"
