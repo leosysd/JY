@@ -41,6 +41,7 @@ def looks_like_private_key(value: str) -> bool:
 
 @dataclass(frozen=True)
 class CopyBotConfig:
+    bot_mode: str = "copy"
     target_username: str = DEFAULT_TARGET_USERNAME
     target_wallet: str = DEFAULT_TARGET_WALLET
     private_key: str = ""
@@ -71,6 +72,15 @@ class CopyBotConfig:
     market_ws_heartbeat_sec: float = 10.0
     market_ws_reconnect_sec: float = 3.0
     market_ws_custom_feature_enabled: bool = True
+    quant_symbol: str = "BTC-USDT"
+    quant_market_slug_prefix: str = "btc-updown-5m"
+    quant_price_source: str = "okx"
+    quant_order_usdc: Decimal = Decimal("5")
+    quant_min_edge: Decimal = Decimal("0.04")
+    quant_min_seconds_left: int = 45
+    quant_cooldown_sec: float = 60.0
+    quant_log_interval_sec: float = 10.0
+    quant_state_file: Path = Path("quant_state.json")
 
     @property
     def funder(self) -> str:
@@ -104,6 +114,7 @@ def load_config(config_path: Optional[Path] = None) -> CopyBotConfig:
         max_slippage = str(Decimal(max_slippage_bps) / Decimal("10000")) if max_slippage_bps else "0.02"
 
     return CopyBotConfig(
+        bot_mode=_env("BOT_MODE", "copy").lower(),
         target_username=target_username,
         target_wallet=_env("TARGET_WALLET", DEFAULT_TARGET_WALLET),
         private_key=_env("PRIVATE_KEY"),
@@ -137,6 +148,15 @@ def load_config(config_path: Optional[Path] = None) -> CopyBotConfig:
             _env("MARKET_WS_CUSTOM_FEATURE_ENABLED", "1"),
             default=True,
         ),
+        quant_symbol=_env("QUANT_SYMBOL", "BTC-USDT"),
+        quant_market_slug_prefix=_env("QUANT_MARKET_SLUG_PREFIX", "btc-updown-5m"),
+        quant_price_source=_env("QUANT_PRICE_SOURCE", "okx").lower(),
+        quant_order_usdc=Decimal(_env("QUANT_ORDER_USDC", "5")),
+        quant_min_edge=Decimal(_env("QUANT_MIN_EDGE", "0.04")),
+        quant_min_seconds_left=int(_env("QUANT_MIN_SECONDS_LEFT", "45")),
+        quant_cooldown_sec=float(_env("QUANT_COOLDOWN_SEC", "60")),
+        quant_log_interval_sec=float(_env("QUANT_LOG_INTERVAL_SEC", "10")),
+        quant_state_file=Path(_env("QUANT_STATE_FILE", "quant_state.json")),
     )
 
 
@@ -144,6 +164,8 @@ def validate_config(config: CopyBotConfig, require_private_key: bool = False) ->
     errors: List[str] = []
     warnings: List[str] = []
 
+    if config.bot_mode not in {"copy", "quant"}:
+        errors.append("BOT_MODE 必须是 copy 或 quant")
     if not config.target_username:
         errors.append("TARGET_USERNAME 不能为空")
     if config.target_wallet and not is_eth_address(config.target_wallet):
@@ -183,11 +205,24 @@ def validate_config(config: CopyBotConfig, require_private_key: bool = False) ->
         errors.append("MARKET_WS_MAX_ASSETS 至少为 1")
     if config.market_ws_heartbeat_sec <= 0:
         errors.append("MARKET_WS_HEARTBEAT_SEC 必须大于 0")
+    if config.quant_price_source not in {"okx"}:
+        errors.append("QUANT_PRICE_SOURCE 第一版只支持 okx")
+    if config.quant_order_usdc <= 0:
+        errors.append("QUANT_ORDER_USDC 必须大于 0")
+    if config.quant_min_edge < 0:
+        errors.append("QUANT_MIN_EDGE 必须大于等于 0")
+    if config.quant_min_seconds_left < 0:
+        errors.append("QUANT_MIN_SECONDS_LEFT 必须大于等于 0")
+    if config.quant_cooldown_sec < 0:
+        errors.append("QUANT_COOLDOWN_SEC 必须大于等于 0")
+    if config.quant_log_interval_sec <= 0:
+        errors.append("QUANT_LOG_INTERVAL_SEC 必须大于 0")
     return errors, warnings
 
 
 def env_lines(values: Dict[str, str]) -> List[str]:
     ordered_keys: Iterable[str] = (
+        "BOT_MODE",
         "TARGET_USERNAME",
         "TARGET_WALLET",
         "PRIVATE_KEY",
@@ -218,5 +253,14 @@ def env_lines(values: Dict[str, str]) -> List[str]:
         "MARKET_WS_HEARTBEAT_SEC",
         "MARKET_WS_RECONNECT_SEC",
         "MARKET_WS_CUSTOM_FEATURE_ENABLED",
+        "QUANT_SYMBOL",
+        "QUANT_MARKET_SLUG_PREFIX",
+        "QUANT_PRICE_SOURCE",
+        "QUANT_ORDER_USDC",
+        "QUANT_MIN_EDGE",
+        "QUANT_MIN_SECONDS_LEFT",
+        "QUANT_COOLDOWN_SEC",
+        "QUANT_LOG_INTERVAL_SEC",
+        "QUANT_STATE_FILE",
     )
     return [f"{key}={values.get(key, '')}" for key in ordered_keys]

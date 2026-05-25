@@ -645,6 +645,15 @@ class PolymarketCopyBot:
         return self._order_lib
 
 
+def run_configured_bot(config: CopyBotConfig) -> None:
+    if config.bot_mode == "quant":
+        from .quant import PolymarketQuantBot
+
+        PolymarketQuantBot(config).run_forever()
+        return
+    PolymarketCopyBot(config).run_forever()
+
+
 def trade_key(trade: Dict[str, Any]) -> str:
     parts = [
         str(trade.get("transactionHash", "")),
@@ -771,8 +780,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
     config = load_config(Path(args.config))
-    bot = PolymarketCopyBot(config)
-    bot.run_forever()
+    run_configured_bot(config)
 
 
 if __name__ == "__main__":

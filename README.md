@@ -9,6 +9,7 @@
 - 对 HTTP `429`、`5xx`、网络抖动做自动退避和重试。
 - 对 `/book` 做短缓存，并默认启用 Polymarket Market WebSocket 维护近期 asset 的盘口参数，减少发现成交后的 HTTP 请求。
 - 默认 `PRICE_MODE=safe`，按目标成交价加最大滑点下单，盘口超过保护价就跳过，避免 0.99/0.01 强制成交造成大滑点。
+- 新增 `BOT_MODE=quant` AI量化模式，第一版支持 BTC 5分钟 Up/Down，使用 OKX 公共行情做动量试算。
 - 默认 `DRY_RUN=1`，先只打印不真实下单。
 - VPS 一键安装，安装后直接用 `jy` 打开交互菜单。
 
@@ -45,7 +46,10 @@ jy
 12. 修改目标用户/钱包
 13. 修改价格保护
 14. 关闭开机自启
-15. 更新程序
+15. 切换策略模式 BOT_MODE
+16. 修改 AI量化参数
+17. AI量化单次试算
+18. 更新程序
 0. 退出
 ```
 
@@ -76,6 +80,10 @@ jy
 - `PRICE_MODE`: 默认 `safe`，使用目标成交价 + 最大滑点；`aggressive` 会恢复 0.99/0.01 强制成交，不建议实盘使用。
 - `MAX_SLIPPAGE`: 默认 `0.02`，表示最多比目标成交价差 2 分。
 - `MAX_ORDER_USDC`: 默认 `0` 不限制；大于 0 时限制单笔跟单最大名义金额。
+- `BOT_MODE`: `copy` 为跟单模式，`quant` 为 AI量化模式。
+- `QUANT_ORDER_USDC`: AI量化每次计划下单金额，默认 `5`。
+- `QUANT_MIN_EDGE`: AI量化最小优势，默认 `0.04` 表示预测概率至少比买入价高 4 分。
+- `QUANT_MIN_SECONDS_LEFT`: 距离 5分钟市场结束至少剩余多少秒才允许下单，默认 `45`。
 - `TARGET_USERNAME` / `TARGET_WALLET`: 目标账号。
 - `ENABLE_MARKET_WS`: 默认 `1`，启用 Market WebSocket 盘口缓存。
 - `MARKET_WS_URL`: 默认 `wss://ws-subscriptions-clob.polymarket.com/ws/market`。
@@ -146,6 +154,24 @@ jy set-dry-run 1 --restart
 jy set-price-protection --mode safe --max-slippage 0.02 --max-order-usdc 0 --restart
 ```
 
+AI量化单次试算，不会真实下单：
+
+```bash
+jy quant-once
+```
+
+切换到 AI量化模式：
+
+```bash
+jy set-bot-mode quant --restart
+```
+
+修改 AI量化参数：
+
+```bash
+jy set-quant-config --order-usdc 5 --min-edge 0.04 --min-seconds-left 45 --restart
+```
+
 ## VPS 部署结果
 
 默认部署到：
@@ -174,7 +200,7 @@ systemctl restart polymarket-copy
 jy service disable-autostart
 ```
 
-菜单 `15. 更新程序` 或 `jy update` 会执行：
+菜单 `18. 更新程序` 或 `jy update` 会执行：
 
 - `git pull --ff-only`
 - 更新 Python 依赖
@@ -185,6 +211,8 @@ jy service disable-autostart
 
 ## 第一版边界
 
-这一版不做历史补仓、不做定时仓位拉平、不做自动撤单、不做盈亏统计。
+这一版不做历史补仓、不做定时仓位拉平、不做自动撤单、不做完整盈亏统计。
+
+AI量化第一版是动量/概率试算，不是收益保证；价格参考源使用 OKX 公共 BTC-USDT 行情，Polymarket 5分钟 BTC 市场实际规则以页面说明的数据源为准。
 
 目标用户成交发现仍使用 Polymarket Data API 的低频 `/activity` 查询。Market WebSocket 用于维护已知 asset 的订单簿参数和盘口更新；如果 WS 断线或没有缓存，机器人会自动回退到 HTTP `/book`。任意目标钱包的纯链上 WebSocket 监听会作为后续高级模式。

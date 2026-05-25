@@ -12,4 +12,5 @@ venv/
 dist/
 build/
 seen_*.json
+quant_state*.json
 *.log

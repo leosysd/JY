@@ -9,12 +9,13 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from dotenv import dotenv_values
 
-from .bot import PolymarketCopyBot
+from .bot import PolymarketCopyBot, run_configured_bot
 from .config import (
     DEFAULT_CLOB_API_URL,
     DEFAULT_MARKET_WS_URL,
@@ -87,6 +88,7 @@ def init_config(config_path: Path) -> None:
         existing.get("TARGET_USERNAME", DEFAULT_TARGET_USERNAME),
     ).lstrip("@")
     values: Dict[str, str] = {
+        "BOT_MODE": prompt_text("运行模式 BOT_MODE，copy=跟单，quant=AI量化", existing.get("BOT_MODE", "copy")).lower(),
         "TARGET_USERNAME": target_username,
         "TARGET_WALLET": prompt_text(
             "目标钱包 TARGET_WALLET",
@@ -143,6 +145,15 @@ def init_config(config_path: Path) -> None:
         "MARKET_WS_HEARTBEAT_SEC": existing.get("MARKET_WS_HEARTBEAT_SEC", "10"),
         "MARKET_WS_RECONNECT_SEC": existing.get("MARKET_WS_RECONNECT_SEC", "3"),
         "MARKET_WS_CUSTOM_FEATURE_ENABLED": existing.get("MARKET_WS_CUSTOM_FEATURE_ENABLED", "1"),
+        "QUANT_SYMBOL": existing.get("QUANT_SYMBOL", "BTC-USDT"),
+        "QUANT_MARKET_SLUG_PREFIX": existing.get("QUANT_MARKET_SLUG_PREFIX", "btc-updown-5m"),
+        "QUANT_PRICE_SOURCE": existing.get("QUANT_PRICE_SOURCE", "okx"),
+        "QUANT_ORDER_USDC": existing.get("QUANT_ORDER_USDC", "5"),
+        "QUANT_MIN_EDGE": existing.get("QUANT_MIN_EDGE", "0.04"),
+        "QUANT_MIN_SECONDS_LEFT": existing.get("QUANT_MIN_SECONDS_LEFT", "45"),
+        "QUANT_COOLDOWN_SEC": existing.get("QUANT_COOLDOWN_SEC", "60"),
+        "QUANT_LOG_INTERVAL_SEC": existing.get("QUANT_LOG_INTERVAL_SEC", "10"),
+        "QUANT_STATE_FILE": existing.get("QUANT_STATE_FILE", "quant_state.json"),
     }
     write_env(config_path, values)
     print(f"[OK] 已写入 {config_path}")
@@ -154,10 +165,16 @@ def print_config_summary(config_path: Path, require_private_key: Optional[bool] 
         require_private_key = not config.dry_run
     errors, warnings = validate_config(config, require_private_key=require_private_key)
     print(f"配置文件: {config_path}")
+    print(f"运行模式: {config.bot_mode}")
     print(f"目标: @{config.target_username} / {config.target_wallet}")
     print(f"模式: {config.mode_label}")
     print(f"跟单比例: {config.copy_ratio}")
     print(f"价格保护: {config.price_mode}, 最大滑点: {config.max_slippage}, 单笔上限: {config.max_order_usdc} USDC")
+    print(
+        "AI量化: "
+        f"{config.quant_symbol}, order_usdc={config.quant_order_usdc}, "
+        f"min_edge={config.quant_min_edge}, min_seconds_left={config.quant_min_seconds_left}"
+    )
     print(f"轮询间隔: {config.poll_sec}s")
     print(f"Market WS: {'开启' if config.enable_market_ws else '关闭'}")
     print(f"私钥: {config.masked_private_key}")
@@ -173,8 +190,7 @@ def print_config_summary(config_path: Path, require_private_key: Optional[bool] 
 
 def run_bot(config_path: Path) -> None:
     config = load_config(config_path)
-    bot = PolymarketCopyBot(config)
-    bot.run_forever()
+    run_configured_bot(config)
 
 
 def remote_target(host: str, user: str) -> str:
@@ -559,6 +575,7 @@ def menu_status_line(config_path: Path, service_name: str = DEFAULT_SERVICE) -> 
         return f"服务: {service_state} | 配置: 读取失败 ({exc})"
     return (
         f"服务: {service_state} | 配置: {config_status_text(errors, warnings)} | "
+        f"策略: {config.bot_mode} | "
         f"模式: {mode_status_text(config.mode_label)} | "
         f"价格: {config.price_mode}/{config.max_slippage} | "
         f"目标: {color_text('@' + config.target_username, ANSI_CYAN)}"
@@ -614,6 +631,56 @@ def update_price_protection(config_path: Path) -> None:
         f"[OK] PRICE_MODE={mode}, MAX_SLIPPAGE={slippage}, "
         f"MAX_ORDER_USDC={max_usdc}"
     )
+
+
+def update_bot_mode(config_path: Path, value: Optional[str] = None) -> None:
+    existing = load_existing_env(config_path)
+    mode = (value or prompt_text("运行模式 BOT_MODE，copy=跟单，quant=AI量化", existing.get("BOT_MODE", "copy"))).lower()
+    if mode not in {"copy", "quant"}:
+        raise SystemExit("BOT_MODE 必须是 copy 或 quant")
+    set_env_value(config_path, "BOT_MODE", mode)
+    print(f"[OK] BOT_MODE={mode}")
+
+
+def update_quant_config(config_path: Path) -> None:
+    existing = load_existing_env(config_path)
+    values = {
+        "QUANT_SYMBOL": prompt_text("量化交易对 QUANT_SYMBOL", existing.get("QUANT_SYMBOL", "BTC-USDT")),
+        "QUANT_PRICE_SOURCE": prompt_text("行情源 QUANT_PRICE_SOURCE，第一版填 okx", existing.get("QUANT_PRICE_SOURCE", "okx")),
+        "QUANT_ORDER_USDC": prompt_text("每次量化下单金额 QUANT_ORDER_USDC", existing.get("QUANT_ORDER_USDC", "5")),
+        "QUANT_MIN_EDGE": prompt_text("最小优势 QUANT_MIN_EDGE，0.04=4分钱", existing.get("QUANT_MIN_EDGE", "0.04")),
+        "QUANT_MIN_SECONDS_LEFT": prompt_text("最少剩余秒数 QUANT_MIN_SECONDS_LEFT", existing.get("QUANT_MIN_SECONDS_LEFT", "45")),
+        "QUANT_COOLDOWN_SEC": prompt_text("量化下单冷却秒数 QUANT_COOLDOWN_SEC", existing.get("QUANT_COOLDOWN_SEC", "60")),
+        "QUANT_LOG_INTERVAL_SEC": prompt_text("量化日志间隔秒数 QUANT_LOG_INTERVAL_SEC", existing.get("QUANT_LOG_INTERVAL_SEC", "10")),
+        "QUANT_STATE_FILE": prompt_text("量化状态文件 QUANT_STATE_FILE", existing.get("QUANT_STATE_FILE", "quant_state.json")),
+    }
+    for key, value in values.items():
+        set_env_value(config_path, key, value)
+    print("[OK] AI量化参数已更新")
+
+
+def quant_once(config_path: Path) -> None:
+    from .quant import PolymarketQuantBot
+
+    fd, tmp_name = tempfile.mkstemp(prefix="jy_quant_once_", suffix=".json")
+    os.close(fd)
+    tmp_state = Path(tmp_name)
+    try:
+        config = replace(
+            load_config(config_path),
+            bot_mode="quant",
+            dry_run=True,
+            quant_state_file=tmp_state,
+        )
+        print("[INFO] AI量化单次试算强制使用 DRY_RUN，不会真实下单。")
+        decision = PolymarketQuantBot(config).run_once(client=None)
+        if decision is None:
+            print("[INFO] 本轮没有量化买入信号。")
+    finally:
+        try:
+            tmp_state.unlink()
+        except OSError:
+            pass
 
 
 def update_target(config_path: Path) -> None:
@@ -735,7 +802,10 @@ def local_interactive_menu(config_path: Path = Path(".env")) -> None:
         print("12. 修改目标用户/钱包")
         print("13. 修改价格保护")
         print("14. 关闭开机自启")
-        print("15. 更新程序")
+        print("15. 切换策略模式 BOT_MODE")
+        print("16. 修改 AI量化参数")
+        print("17. AI量化单次试算")
+        print("18. 更新程序")
         print("0. 退出")
         choice = input("请选择: ").strip()
         try:
@@ -777,6 +847,16 @@ def local_interactive_menu(config_path: Path = Path(".env")) -> None:
             elif choice == "14":
                 local_service_action("disable-autostart")
             elif choice == "15":
+                update_bot_mode(config_path)
+                if prompt_yes_no("是否立即重启服务让配置生效", True):
+                    local_service_action("restart")
+            elif choice == "16":
+                update_quant_config(config_path)
+                if prompt_yes_no("是否立即重启服务让配置生效", True):
+                    local_service_action("restart")
+            elif choice == "17":
+                quant_once(config_path)
+            elif choice == "18":
                 update_program()
                 print("[INFO] 请重新运行 jy。")
                 return
@@ -838,6 +918,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_price.add_argument("--max-slippage")
     p_price.add_argument("--max-order-usdc")
     p_price.add_argument("--restart", action="store_true", help="设置后立即重启服务")
+
+    p_mode = sub.add_parser("set-bot-mode", help="设置 BOT_MODE，copy=跟单，quant=AI量化")
+    p_mode.add_argument("value", choices=["copy", "quant"])
+    p_mode.add_argument("--config", default=".env")
+    p_mode.add_argument("--restart", action="store_true", help="设置后立即重启服务")
+
+    p_quant = sub.add_parser("set-quant-config", help="设置 AI量化参数")
+    p_quant.add_argument("--config", default=".env")
+    p_quant.add_argument("--symbol")
+    p_quant.add_argument("--price-source")
+    p_quant.add_argument("--order-usdc")
+    p_quant.add_argument("--min-edge")
+    p_quant.add_argument("--min-seconds-left")
+    p_quant.add_argument("--cooldown-sec")
+    p_quant.add_argument("--log-interval-sec")
+    p_quant.add_argument("--restart", action="store_true", help="设置后立即重启服务")
+
+    p_quant_once = sub.add_parser("quant-once", help="AI量化单次试算，不真实下单")
+    p_quant_once.add_argument("--config", default=".env")
 
     p_install = sub.add_parser("install", help="从 GitHub 安装到 VPS，便于以后远程更新")
     p_install.add_argument("--host", required=True)
@@ -921,6 +1020,46 @@ def main(argv: Optional[List[str]] = None) -> None:
             print("[OK] 价格保护配置已更新")
         if args.restart:
             local_service_action("restart")
+    elif args.command == "set-bot-mode":
+        update_bot_mode(Path(args.config), args.value)
+        if args.restart:
+            local_service_action("restart")
+    elif args.command == "set-quant-config":
+        config_path = Path(args.config)
+        if not any(
+            [
+                args.symbol,
+                args.price_source,
+                args.order_usdc,
+                args.min_edge,
+                args.min_seconds_left,
+                args.cooldown_sec,
+                args.log_interval_sec,
+            ]
+        ):
+            update_quant_config(config_path)
+        else:
+            existing = load_existing_env(config_path)
+            set_env_value(config_path, "QUANT_SYMBOL", args.symbol or existing.get("QUANT_SYMBOL", "BTC-USDT"))
+            set_env_value(config_path, "QUANT_PRICE_SOURCE", args.price_source or existing.get("QUANT_PRICE_SOURCE", "okx"))
+            set_env_value(config_path, "QUANT_ORDER_USDC", args.order_usdc or existing.get("QUANT_ORDER_USDC", "5"))
+            set_env_value(config_path, "QUANT_MIN_EDGE", args.min_edge or existing.get("QUANT_MIN_EDGE", "0.04"))
+            set_env_value(
+                config_path,
+                "QUANT_MIN_SECONDS_LEFT",
+                args.min_seconds_left or existing.get("QUANT_MIN_SECONDS_LEFT", "45"),
+            )
+            set_env_value(config_path, "QUANT_COOLDOWN_SEC", args.cooldown_sec or existing.get("QUANT_COOLDOWN_SEC", "60"))
+            set_env_value(
+                config_path,
+                "QUANT_LOG_INTERVAL_SEC",
+                args.log_interval_sec or existing.get("QUANT_LOG_INTERVAL_SEC", "10"),
+            )
+            print("[OK] AI量化参数已更新")
+        if args.restart:
+            local_service_action("restart")
+    elif args.command == "quant-once":
+        quant_once(Path(args.config))
     elif args.command == "install":
         install_from_git(
             host=args.host,
