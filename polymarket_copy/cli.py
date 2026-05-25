@@ -445,6 +445,48 @@ def local_service_action(action: str, service_name: str = DEFAULT_SERVICE) -> No
         raise SystemExit(f"未知本地服务动作: {action}")
 
 
+def systemctl_value(action: str, service_name: str = DEFAULT_SERVICE) -> str:
+    try:
+        result = subprocess.run(
+            ["systemctl", action, service_name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return "unknown"
+    combined = f"{result.stdout}\n{result.stderr}".strip()
+    if "System has not been booted with systemd" in combined:
+        return "systemd-unavailable"
+    value = (result.stdout or result.stderr).strip()
+    if not value:
+        return "unknown"
+    return value.splitlines()[0].strip()
+
+
+def service_state_label(service_name: str = DEFAULT_SERVICE) -> str:
+    active = systemctl_value("is-active", service_name)
+    enabled = systemctl_value("is-enabled", service_name)
+    return f"{active} / {enabled}"
+
+
+def menu_status_line(config_path: Path, service_name: str = DEFAULT_SERVICE) -> str:
+    service_state = service_state_label(service_name)
+    if not config_path.exists():
+        return f"服务: {service_state} | 配置: 未创建 .env"
+    try:
+        config = load_config(config_path)
+        errors, warnings = validate_config(config, require_private_key=not config.dry_run)
+    except Exception as exc:
+        return f"服务: {service_state} | 配置: 读取失败 ({exc})"
+    config_state = "OK" if not errors else f"需检查 {len(errors)} 项"
+    warning_state = f"，警告 {len(warnings)} 项" if warnings else ""
+    return (
+        f"服务: {service_state} | 配置: {config_state}{warning_state} | "
+        f"模式: {config.mode_label} | 目标: @{config.target_username}"
+    )
+
+
 def set_env_value(config_path: Path, key: str, value: str) -> None:
     lines: List[str] = []
     found = False
@@ -563,6 +605,7 @@ def local_interactive_menu(config_path: Path = Path(".env")) -> None:
     while True:
         print("")
         print("JY Polymarket Copy CLI")
+        print(menu_status_line(config_path))
         print("1. 初始化/修改交易配置")
         print("2. 查看当前配置")
         print("3. 测试 API/私钥/签名")
