@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 import requests
 
 from .config import CopyBotConfig, load_config, validate_config
+from .logging_utils import setup_file_logging
 
 
 getcontext().prec = 28
@@ -646,6 +647,7 @@ class PolymarketCopyBot:
 
 
 def run_configured_bot(config: CopyBotConfig) -> None:
+    setup_file_logging(config.log_file, enabled=config.log_to_file)
     if config.bot_mode == "quant":
         from .quant import PolymarketQuantBot
 

@@ -154,6 +154,8 @@ def init_config(config_path: Path) -> None:
         "QUANT_COOLDOWN_SEC": existing.get("QUANT_COOLDOWN_SEC", "60"),
         "QUANT_LOG_INTERVAL_SEC": existing.get("QUANT_LOG_INTERVAL_SEC", "10"),
         "QUANT_STATE_FILE": existing.get("QUANT_STATE_FILE", "quant_state.json"),
+        "LOG_TO_FILE": existing.get("LOG_TO_FILE", "1"),
+        "LOG_FILE": existing.get("LOG_FILE", "logs/polymarket-copy.log"),
     }
     write_env(config_path, values)
     print(f"[OK] 已写入 {config_path}")
@@ -175,6 +177,7 @@ def print_config_summary(config_path: Path, require_private_key: Optional[bool] 
         f"{config.quant_symbol}, order_usdc={config.quant_order_usdc}, "
         f"min_edge={config.quant_min_edge}, min_seconds_left={config.quant_min_seconds_left}"
     )
+    print(f"文件日志: {'开启' if config.log_to_file else '关闭'} / {config.log_file}")
     print(f"轮询间隔: {config.poll_sec}s")
     print(f"Market WS: {'开启' if config.enable_market_ws else '关闭'}")
     print(f"私钥: {config.masked_private_key}")
@@ -683,6 +686,31 @@ def quant_once(config_path: Path) -> None:
             pass
 
 
+def configured_log_file(config_path: Path) -> Path:
+    return load_config(config_path).log_file
+
+
+def tail_file_log(config_path: Path, lines: int = 100, follow: bool = True) -> None:
+    log_file = configured_log_file(config_path)
+    print(f"[LOG] 文件日志: {log_file}")
+    if not log_file.exists():
+        print("[INFO] 文件日志还不存在，启动服务后会自动创建。")
+        return
+    if os.name != "nt" and follow:
+        run_command(["tail", "-f", "-n", str(lines), str(log_file)])
+        return
+    content = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
+    for line in content[-lines:]:
+        print(line)
+
+
+def clear_file_log(config_path: Path) -> None:
+    log_file = configured_log_file(config_path)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text("", encoding="utf-8")
+    print(f"[OK] 已清空文件日志: {log_file}")
+
+
 def update_target(config_path: Path) -> None:
     existing = load_existing_env(config_path)
     username = prompt_text("目标用户名 TARGET_USERNAME", existing.get("TARGET_USERNAME", DEFAULT_TARGET_USERNAME)).lstrip("@")
@@ -805,7 +833,9 @@ def local_interactive_menu(config_path: Path = Path(".env")) -> None:
         print("15. 切换策略模式 BOT_MODE")
         print("16. 修改 AI量化参数")
         print("17. AI量化单次试算")
-        print("18. 更新程序")
+        print("18. 查看文件日志")
+        print("19. 清空文件日志")
+        print("20. 更新程序")
         print("0. 退出")
         choice = input("请选择: ").strip()
         try:
@@ -857,6 +887,10 @@ def local_interactive_menu(config_path: Path = Path(".env")) -> None:
             elif choice == "17":
                 quant_once(config_path)
             elif choice == "18":
+                tail_file_log(config_path)
+            elif choice == "19":
+                clear_file_log(config_path)
+            elif choice == "20":
                 update_program()
                 print("[INFO] 请重新运行 jy。")
                 return
@@ -937,6 +971,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_quant_once = sub.add_parser("quant-once", help="AI量化单次试算，不真实下单")
     p_quant_once.add_argument("--config", default=".env")
+
+    p_app_logs = sub.add_parser("app-logs", help="查看或清空应用文件日志")
+    p_app_logs.add_argument("action", choices=["tail", "clear", "path"])
+    p_app_logs.add_argument("--config", default=".env")
+    p_app_logs.add_argument("--lines", type=int, default=100)
+    p_app_logs.add_argument("--no-follow", action="store_true", help="tail 时只打印末尾日志，不持续跟随")
 
     p_install = sub.add_parser("install", help="从 GitHub 安装到 VPS，便于以后远程更新")
     p_install.add_argument("--host", required=True)
@@ -1060,6 +1100,14 @@ def main(argv: Optional[List[str]] = None) -> None:
             local_service_action("restart")
     elif args.command == "quant-once":
         quant_once(Path(args.config))
+    elif args.command == "app-logs":
+        config_path = Path(args.config)
+        if args.action == "tail":
+            tail_file_log(config_path, lines=args.lines, follow=not args.no_follow)
+        elif args.action == "clear":
+            clear_file_log(config_path)
+        elif args.action == "path":
+            print(configured_log_file(config_path))
     elif args.command == "install":
         install_from_git(
             host=args.host,

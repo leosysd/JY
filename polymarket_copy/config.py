@@ -31,6 +31,13 @@ def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
+def _path_env(name: str, default: str, config_path: Optional[Path]) -> Path:
+    value = Path(_env(name, default))
+    if value.is_absolute() or config_path is None:
+        return value
+    return config_path.expanduser().resolve().parent / value
+
+
 def is_eth_address(value: str) -> bool:
     return bool(re.fullmatch(r"0x[a-fA-F0-9]{40}", value.strip()))
 
@@ -81,6 +88,8 @@ class CopyBotConfig:
     quant_cooldown_sec: float = 60.0
     quant_log_interval_sec: float = 10.0
     quant_state_file: Path = Path("quant_state.json")
+    log_to_file: bool = True
+    log_file: Path = Path("logs/polymarket-copy.log")
 
     @property
     def funder(self) -> str:
@@ -157,6 +166,8 @@ def load_config(config_path: Optional[Path] = None) -> CopyBotConfig:
         quant_cooldown_sec=float(_env("QUANT_COOLDOWN_SEC", "60")),
         quant_log_interval_sec=float(_env("QUANT_LOG_INTERVAL_SEC", "10")),
         quant_state_file=Path(_env("QUANT_STATE_FILE", "quant_state.json")),
+        log_to_file=parse_bool(_env("LOG_TO_FILE", "1"), default=True),
+        log_file=_path_env("LOG_FILE", "logs/polymarket-copy.log", config_path),
     )
 
 
@@ -262,5 +273,7 @@ def env_lines(values: Dict[str, str]) -> List[str]:
         "QUANT_COOLDOWN_SEC",
         "QUANT_LOG_INTERVAL_SEC",
         "QUANT_STATE_FILE",
+        "LOG_TO_FILE",
+        "LOG_FILE",
     )
     return [f"{key}={values.get(key, '')}" for key in ordered_keys]

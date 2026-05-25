@@ -49,7 +49,9 @@ jy
 15. 切换策略模式 BOT_MODE
 16. 修改 AI量化参数
 17. AI量化单次试算
-18. 更新程序
+18. 查看文件日志
+19. 清空文件日志
+20. 更新程序
 0. 退出
 ```
 
@@ -84,6 +86,8 @@ jy
 - `QUANT_ORDER_USDC`: AI量化每次计划下单金额，默认 `5`。
 - `QUANT_MIN_EDGE`: AI量化最小优势，默认 `0.04` 表示预测概率至少比买入价高 4 分。
 - `QUANT_MIN_SECONDS_LEFT`: 距离 5分钟市场结束至少剩余多少秒才允许下单，默认 `45`。
+- `LOG_TO_FILE`: 默认 `1`，机器人运行时同时写入文件日志，方便 AI 复盘。
+- `LOG_FILE`: 默认 `logs/polymarket-copy.log`。
 - `TARGET_USERNAME` / `TARGET_WALLET`: 目标账号。
 - `ENABLE_MARKET_WS`: 默认 `1`，启用 Market WebSocket 盘口缓存。
 - `MARKET_WS_URL`: 默认 `wss://ws-subscriptions-clob.polymarket.com/ws/market`。
@@ -172,6 +176,18 @@ jy set-bot-mode quant --restart
 jy set-quant-config --order-usdc 5 --min-edge 0.04 --min-seconds-left 45 --restart
 ```
 
+查看文件日志：
+
+```bash
+jy app-logs tail
+```
+
+清空文件日志：
+
+```bash
+jy app-logs clear
+```
+
 ## VPS 部署结果
 
 默认部署到：
@@ -200,7 +216,7 @@ systemctl restart polymarket-copy
 jy service disable-autostart
 ```
 
-菜单 `18. 更新程序` 或 `jy update` 会执行：
+菜单 `20. 更新程序` 或 `jy update` 会执行：
 
 - `git pull --ff-only`
 - 更新 Python 依赖
@@ -216,3 +232,10 @@ jy service disable-autostart
 AI量化第一版是动量/概率试算，不是收益保证；价格参考源使用 OKX 公共 BTC-USDT 行情，Polymarket 5分钟 BTC 市场实际规则以页面说明的数据源为准。
 
 目标用户成交发现仍使用 Polymarket Data API 的低频 `/activity` 查询。Market WebSocket 用于维护已知 asset 的订单簿参数和盘口更新；如果 WS 断线或没有缓存，机器人会自动回退到 HTTP `/book`。任意目标钱包的纯链上 WebSocket 监听会作为后续高级模式。
+
+## AI量化路线
+
+1. 第一版：单边 AI量化，先记录信号。
+2. 第二版：仓位记录 + 两边成本计算。
+3. 第三版：发现可锁利时自动补另一边。
+4. 第四版：实盘小金额跑。
