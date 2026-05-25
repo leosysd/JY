@@ -88,7 +88,16 @@ class CopyBotConfig:
     quant_chainlink_timeout_sec: float = 12.0
     quant_chainlink_max_age_sec: float = 180.0
     quant_chainlink_start_tolerance_sec: float = 4.0
+    quant_strategy: str = "single"
+    quant_size_mode: str = "usdc"
     quant_order_usdc: Decimal = Decimal("5")
+    quant_order_shares: Decimal = Decimal("20")
+    quant_capital_usdc: Decimal = Decimal("300")
+    quant_market_max_usdc: Decimal = Decimal("300")
+    quant_max_trades_per_market: int = 35
+    quant_rebuy_cooldown_sec: float = 5.0
+    quant_lock_min_profit: Decimal = Decimal("0.50")
+    quant_lock_stop_on_lock: bool = True
     quant_min_edge: Decimal = Decimal("0.04")
     quant_min_seconds_left: int = 45
     quant_cooldown_sec: float = 60.0
@@ -174,7 +183,16 @@ def load_config(config_path: Optional[Path] = None) -> CopyBotConfig:
         quant_chainlink_timeout_sec=float(_env("QUANT_CHAINLINK_TIMEOUT_SEC", "12")),
         quant_chainlink_max_age_sec=float(_env("QUANT_CHAINLINK_MAX_AGE_SEC", "180")),
         quant_chainlink_start_tolerance_sec=float(_env("QUANT_CHAINLINK_START_TOLERANCE_SEC", "4")),
+        quant_strategy=_env("QUANT_STRATEGY", "single").lower(),
+        quant_size_mode=_env("QUANT_SIZE_MODE", "usdc").lower(),
         quant_order_usdc=Decimal(_env("QUANT_ORDER_USDC", "5")),
+        quant_order_shares=Decimal(_env("QUANT_ORDER_SHARES", "20")),
+        quant_capital_usdc=Decimal(_env("QUANT_CAPITAL_USDC", "300")),
+        quant_market_max_usdc=Decimal(_env("QUANT_MARKET_MAX_USDC", "300")),
+        quant_max_trades_per_market=int(_env("QUANT_MAX_TRADES_PER_MARKET", "35")),
+        quant_rebuy_cooldown_sec=float(_env("QUANT_REBUY_COOLDOWN_SEC", "5")),
+        quant_lock_min_profit=Decimal(_env("QUANT_LOCK_MIN_PROFIT", "0.50")),
+        quant_lock_stop_on_lock=parse_bool(_env("QUANT_LOCK_STOP_ON_LOCK", "1"), default=True),
         quant_min_edge=Decimal(_env("QUANT_MIN_EDGE", "0.04")),
         quant_min_seconds_left=int(_env("QUANT_MIN_SECONDS_LEFT", "45")),
         quant_cooldown_sec=float(_env("QUANT_COOLDOWN_SEC", "60")),
@@ -250,8 +268,28 @@ def validate_config(config: CopyBotConfig, require_private_key: bool = False) ->
         errors.append("QUANT_CHAINLINK_MAX_AGE_SEC 必须大于 0")
     if config.quant_chainlink_start_tolerance_sec <= 0:
         errors.append("QUANT_CHAINLINK_START_TOLERANCE_SEC 必须大于 0")
+    if config.quant_strategy not in {"single", "lock"}:
+        errors.append("QUANT_STRATEGY 必须是 single 或 lock")
+    if config.quant_strategy == "lock" and not config.dry_run:
+        errors.append("QUANT_STRATEGY=lock 第一版只允许 DRY_RUN=1，确认模拟稳定后再接实盘")
+    if config.quant_size_mode not in {"usdc", "shares"}:
+        errors.append("QUANT_SIZE_MODE 必须是 usdc 或 shares")
     if config.quant_order_usdc <= 0:
         errors.append("QUANT_ORDER_USDC 必须大于 0")
+    if config.quant_order_shares <= 0:
+        errors.append("QUANT_ORDER_SHARES 必须大于 0")
+    if config.quant_capital_usdc <= 0:
+        errors.append("QUANT_CAPITAL_USDC 必须大于 0")
+    if config.quant_market_max_usdc <= 0:
+        errors.append("QUANT_MARKET_MAX_USDC 必须大于 0")
+    if config.quant_market_max_usdc > config.quant_capital_usdc:
+        warnings.append("QUANT_MARKET_MAX_USDC 大于 QUANT_CAPITAL_USDC，会按总本金上限保护")
+    if config.quant_max_trades_per_market < 1:
+        errors.append("QUANT_MAX_TRADES_PER_MARKET 至少为 1")
+    if config.quant_rebuy_cooldown_sec < 0:
+        errors.append("QUANT_REBUY_COOLDOWN_SEC 必须大于等于 0")
+    if config.quant_lock_min_profit < 0:
+        errors.append("QUANT_LOCK_MIN_PROFIT 必须大于等于 0")
     if config.quant_min_edge < 0:
         errors.append("QUANT_MIN_EDGE 必须大于等于 0")
     if config.quant_min_seconds_left < 0:
@@ -306,7 +344,16 @@ def env_lines(values: Dict[str, str]) -> List[str]:
         "QUANT_CHAINLINK_TIMEOUT_SEC",
         "QUANT_CHAINLINK_MAX_AGE_SEC",
         "QUANT_CHAINLINK_START_TOLERANCE_SEC",
+        "QUANT_STRATEGY",
+        "QUANT_SIZE_MODE",
         "QUANT_ORDER_USDC",
+        "QUANT_ORDER_SHARES",
+        "QUANT_CAPITAL_USDC",
+        "QUANT_MARKET_MAX_USDC",
+        "QUANT_MAX_TRADES_PER_MARKET",
+        "QUANT_REBUY_COOLDOWN_SEC",
+        "QUANT_LOCK_MIN_PROFIT",
+        "QUANT_LOCK_STOP_ON_LOCK",
         "QUANT_MIN_EDGE",
         "QUANT_MIN_SECONDS_LEFT",
         "QUANT_COOLDOWN_SEC",

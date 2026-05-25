@@ -293,7 +293,7 @@ class ChainlinkRtdsPriceFeed:
 class QuantStateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
-        self.state: Dict[str, Any] = {"markets": {}, "last_order_ts": 0}
+        self.state: Dict[str, Any] = {"markets": {}, "lock_markets": {}, "last_order_ts": 0}
 
     def load(self) -> None:
         if not self.path.exists():
@@ -308,6 +308,7 @@ class QuantStateStore:
             print(f"[WARN] quant state JSON 无效，已备份到 {backup}")
 
     def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(
             json.dumps(self.state, indent=2, ensure_ascii=False, sort_keys=True),
             encoding="utf-8",
@@ -333,6 +334,69 @@ class QuantStateStore:
     def cooldown_ready(self, cooldown_sec: float) -> bool:
         last_ts = float(self.state.get("last_order_ts") or 0)
         return time.time() - last_ts >= cooldown_sec
+
+    def lock_market_entry(self, market: QuantMarket) -> Dict[str, Any]:
+        markets = self.state.setdefault("lock_markets", {})
+        entry = markets.setdefault(
+            market.slug,
+            {
+                "title": market.title,
+                "start_ts": market.start_ts,
+                "end_ts": market.end_ts,
+                "locked": False,
+                "trades": [],
+            },
+        )
+        if not isinstance(entry, dict):
+            entry = {
+                "title": market.title,
+                "start_ts": market.start_ts,
+                "end_ts": market.end_ts,
+                "locked": False,
+                "trades": [],
+            }
+            markets[market.slug] = entry
+        entry.setdefault("title", market.title)
+        entry.setdefault("start_ts", market.start_ts)
+        entry.setdefault("end_ts", market.end_ts)
+        entry.setdefault("locked", False)
+        if not isinstance(entry.get("trades"), list):
+            entry["trades"] = []
+        return entry
+
+    def append_lock_trade(
+        self,
+        market: QuantMarket,
+        decision: QuantDecision,
+        mode: str,
+        position_after: Dict[str, Decimal],
+        locked_after: bool,
+        reason: str,
+    ) -> None:
+        entry = self.lock_market_entry(market)
+        now = int(time.time())
+        cost = decision.size * decision.limit_price
+        entry["trades"].append(
+            {
+                "ts": now,
+                "mode": mode,
+                "outcome": decision.outcome,
+                "token_id": decision.token_id,
+                "probability": str(decision.probability),
+                "best_ask": str(decision.best_ask),
+                "edge": str(decision.edge),
+                "limit_price": str(decision.limit_price),
+                "size": str(decision.size),
+                "cost": str(cost.quantize(Decimal("0.0001"))),
+                "reason": reason,
+                "seconds_left": market.seconds_left,
+            }
+        )
+        entry["locked"] = bool(locked_after)
+        entry["last_trade_ts"] = now
+        entry["position"] = lock_position_payload(position_after)
+        self.state["last_order_ts"] = now
+        self.save()
 
 
 class PolymarketQuantBot:
@@ -364,8 +428,13 @@ class PolymarketQuantBot:
         print(
             "[AI QUANT] "
             f"symbol={self.config.quant_symbol} "
+            f"strategy={self.config.quant_strategy} "
             f"source={self.config.quant_price_source} "
+            f"size_mode={self.config.quant_size_mode} "
             f"order_usdc={self.config.quant_order_usdc} "
+            f"order_shares={self.config.quant_order_shares} "
+            f"capital={self.config.quant_capital_usdc} "
+            f"market_cap={self.config.quant_market_max_usdc} "
             f"min_edge={self.config.quant_min_edge} "
             f"min_seconds_left={self.config.quant_min_seconds_left}"
         )
@@ -401,6 +470,9 @@ class PolymarketQuantBot:
         except RuntimeError as exc:
             self.log_throttled(f"[AI QUANT] Chainlink 价格暂不可用，跳过本轮: {exc}")
             return None
+        if self.config.quant_strategy == "lock":
+            return self.make_lock_decision(market, snapshot)
+
         decision = self.make_decision(market, snapshot)
         if decision is None:
             return None
@@ -629,6 +701,346 @@ class PolymarketQuantBot:
         )
         return best
 
+    def make_lock_decision(self, market: QuantMarket, snapshot: BtcSnapshot) -> Optional[QuantDecision]:
+        if not self.config.dry_run:
+            raise RuntimeError("QUANT_STRATEGY=lock 第一版只允许 DRY_RUN=1，暂不接实盘下单")
+        entry = self.state.lock_market_entry(market)
+        position_before = lock_position_from_entry(entry)
+        if self.config.quant_lock_stop_on_lock and bool(entry.get("locked")):
+            self.log_throttled(f"[AI LOCK] {market.slug} 已经锁利，停止本市场。")
+            self.record_lock_signal(
+                market,
+                snapshot,
+                action="skip",
+                reason="market_locked",
+                candidates=[],
+                position_before=position_before,
+                position_after=position_before,
+            )
+            return None
+        if market.seconds_left < self.config.quant_min_seconds_left:
+            self.log_throttled(
+                f"[AI LOCK] {market.title} 剩余 {market.seconds_left}s，低于最小剩余时间，跳过。"
+            )
+            self.record_lock_signal(
+                market,
+                snapshot,
+                action="skip",
+                reason="low_seconds_left",
+                candidates=[],
+                position_before=position_before,
+                position_after=position_before,
+            )
+            return None
+        if position_before["trade_count"] >= Decimal(str(self.config.quant_max_trades_per_market)):
+            self.log_throttled(f"[AI LOCK] {market.slug} 已达到单市场最多笔数，跳过。")
+            self.record_lock_signal(
+                market,
+                snapshot,
+                action="skip",
+                reason="max_trades_reached",
+                candidates=[],
+                position_before=position_before,
+                position_after=position_before,
+            )
+            return None
+        last_trade_ts = float(entry.get("last_trade_ts") or 0)
+        if last_trade_ts and time.time() - last_trade_ts < self.config.quant_rebuy_cooldown_sec:
+            self.record_lock_signal(
+                market,
+                snapshot,
+                action="skip",
+                reason="rebuy_cooldown",
+                candidates=[],
+                position_before=position_before,
+                position_after=position_before,
+            )
+            return None
+
+        candidates, candidate_records = self.build_lock_candidates(market, snapshot, position_before)
+        selected = self.select_lock_candidate(candidates)
+        if selected is None:
+            self.log_throttled(
+                "[AI LOCK] "
+                f"{market.title} 暂无锁利/补单候选，cost={position_before['total_cost']} "
+                f"up_pnl={position_before['up_pnl']} down_pnl={position_before['down_pnl']}。"
+            )
+            self.record_lock_signal(
+                market,
+                snapshot,
+                action="skip",
+                reason="no_lock_candidate",
+                candidates=candidate_records,
+                position_before=position_before,
+                position_after=position_before,
+            )
+            return None
+
+        decision = selected["decision"]
+        position_after = selected["position_after"]
+        locked_after = position_after["worst_pnl"] >= self.config.quant_lock_min_profit
+        reason = str(selected["reason"])
+        print(
+            "[AI LOCK BUY] "
+            f"mode=DRY_RUN market={decision.market.title} outcome={decision.outcome} "
+            f"size={decision.size} price={decision.limit_price} "
+            f"cost={selected['notional']} edge={decision.edge} "
+            f"up_pnl={position_after['up_pnl']} down_pnl={position_after['down_pnl']} "
+            f"total_cost={position_after['total_cost']} trades={position_after['trade_count']} "
+            f"locked={1 if locked_after else 0} reason={reason}"
+        )
+        self.record_lock_signal(
+            market,
+            snapshot,
+            action="lock_would_buy",
+            reason=reason,
+            candidates=candidate_records,
+            selected=decision,
+            selected_meta=lock_candidate_payload(selected),
+            position_before=position_before,
+            position_after=position_after,
+            force=True,
+        )
+        self.state.append_lock_trade(
+            market,
+            decision,
+            mode="dry_run",
+            position_after=position_after,
+            locked_after=locked_after,
+            reason=reason,
+        )
+        return decision
+
+    def build_lock_candidates(
+        self,
+        market: QuantMarket,
+        snapshot: BtcSnapshot,
+        position_before: Dict[str, Decimal],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        candidates: List[Dict[str, Any]] = []
+        candidate_records: List[Dict[str, Any]] = []
+        capital_cap = min(self.config.quant_capital_usdc, self.config.quant_market_max_usdc)
+        for outcome, token_id in zip(market.outcomes, market.token_ids):
+            probability = snapshot.up_probability if outcome == "Up" else Decimal("1") - snapshot.up_probability
+            try:
+                book = self.book_cache.get_book(token_id)
+            except Exception as exc:
+                candidate_records.append(
+                    {
+                        "outcome": outcome,
+                        "token_id": token_id,
+                        "probability": probability.quantize(Decimal("0.0001")),
+                        "valid": False,
+                        "skip_reason": f"book_error:{type(exc).__name__}",
+                    }
+                )
+                continue
+            best_ask = best_book_price(book, "BUY")
+            if best_ask is None:
+                candidate_records.append(
+                    {
+                        "outcome": outcome,
+                        "token_id": token_id,
+                        "probability": probability.quantize(Decimal("0.0001")),
+                        "valid": False,
+                        "skip_reason": "no_best_ask",
+                    }
+                )
+                continue
+            edge = probability - best_ask
+            tick_size = decimal_value(book.get("tick_size", "0.01"))
+            limit_price = protected_limit_price("BUY", best_ask, tick_size, self.config.max_slippage)
+            if self.config.quant_size_mode == "shares":
+                size = self.config.quant_order_shares.quantize(Decimal("0.000001"), rounding=ROUND_FLOOR)
+            else:
+                size = (self.config.quant_order_usdc / limit_price).quantize(
+                    Decimal("0.000001"),
+                    rounding=ROUND_FLOOR,
+                )
+            size = apply_max_order_usdc(size, limit_price, self.config.max_order_usdc)
+            min_order_size = decimal_value(book.get("min_order_size", "1"))
+            if size < min_order_size:
+                candidate_records.append(
+                    {
+                        "outcome": outcome,
+                        "token_id": token_id,
+                        "probability": probability.quantize(Decimal("0.0001")),
+                        "best_ask": best_ask,
+                        "edge": edge.quantize(Decimal("0.0001")),
+                        "limit_price": limit_price,
+                        "size": size,
+                        "min_order_size": min_order_size,
+                        "valid": False,
+                        "skip_reason": "size_below_min_order",
+                    }
+                )
+                continue
+            notional = (size * limit_price).quantize(Decimal("0.0001"))
+            if position_before["total_cost"] + notional > capital_cap:
+                candidate_records.append(
+                    {
+                        "outcome": outcome,
+                        "token_id": token_id,
+                        "probability": probability.quantize(Decimal("0.0001")),
+                        "best_ask": best_ask,
+                        "edge": edge.quantize(Decimal("0.0001")),
+                        "limit_price": limit_price,
+                        "size": size,
+                        "notional": notional,
+                        "capital_cap": capital_cap,
+                        "position_before": lock_position_payload(position_before),
+                        "valid": False,
+                        "skip_reason": "capital_cap_reached",
+                    }
+                )
+                continue
+
+            position_after = lock_position_after_trade(position_before, outcome, size, limit_price)
+            improvement = position_after["worst_pnl"] - position_before["worst_pnl"]
+            would_lock = position_after["worst_pnl"] >= self.config.quant_lock_min_profit
+            decision = QuantDecision(
+                market=market,
+                outcome=outcome,
+                token_id=token_id,
+                probability=probability.quantize(Decimal("0.0001")),
+                best_ask=best_ask,
+                edge=edge.quantize(Decimal("0.0001")),
+                limit_price=limit_price,
+                size=size,
+                reason=(
+                    f"lock_model p({outcome})={probability.quantize(Decimal('0.0001'))} "
+                    f"ask={best_ask} edge={edge.quantize(Decimal('0.0001'))}"
+                ),
+            )
+            reason, score = self.score_lock_candidate(
+                position_before,
+                position_after,
+                decision,
+                would_lock,
+                improvement,
+            )
+            item = {
+                "decision": decision,
+                "reason": reason,
+                "score": score,
+                "notional": notional,
+                "position_after": position_after,
+                "improvement_worst_pnl": improvement,
+                "would_lock": would_lock,
+            }
+            candidates.append(item)
+            candidate_records.append(lock_candidate_payload(item) | {"valid": True})
+        return candidates, candidate_records
+
+    def score_lock_candidate(
+        self,
+        position_before: Dict[str, Decimal],
+        position_after: Dict[str, Decimal],
+        decision: QuantDecision,
+        would_lock: bool,
+        improvement: Decimal,
+    ) -> Tuple[str, Tuple[Decimal, Decimal, Decimal, Decimal]]:
+        if would_lock:
+            return (
+                "lock_profit",
+                (Decimal("4"), position_after["worst_pnl"], improvement, decision.edge),
+            )
+        if improvement > 0:
+            return (
+                "improve_worst_pnl",
+                (Decimal("3"), improvement, decision.edge, decision.probability),
+            )
+        if position_before["trade_count"] == 0:
+            return (
+                "initial_probe",
+                (Decimal("2"), decision.edge, decision.probability, -position_after["total_cost"]),
+            )
+        if decision.edge >= self.config.quant_min_edge:
+            return (
+                "add_same_side_edge",
+                (Decimal("1"), decision.edge, decision.probability, -position_after["total_cost"]),
+            )
+        return (
+            "weak_candidate",
+            (Decimal("0"), decision.edge, improvement, -position_after["total_cost"]),
+        )
+
+    def select_lock_candidate(self, candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        usable = [
+            item
+            for item in candidates
+            if isinstance(item.get("score"), tuple)
+            and item["score"][0] > 0
+        ]
+        if not usable:
+            return None
+        return max(usable, key=lambda item: item["score"])
+
+    def record_lock_signal(
+        self,
+        market: QuantMarket,
+        snapshot: BtcSnapshot,
+        action: str,
+        reason: str,
+        candidates: List[Dict[str, Any]],
+        position_before: Dict[str, Decimal],
+        position_after: Dict[str, Decimal],
+        selected: Optional[QuantDecision] = None,
+        selected_meta: Optional[Dict[str, Any]] = None,
+        force: bool = False,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        record: Dict[str, Any] = {
+            "ts": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "unix_ts": int(now.timestamp()),
+            "bot_mode": "quant",
+            "quant_strategy": "lock",
+            "dry_run": self.config.dry_run,
+            "action": action,
+            "reason": reason,
+            "market": {
+                "slug": market.slug,
+                "title": market.title,
+                "start_ts": market.start_ts,
+                "end_ts": market.end_ts,
+                "seconds_left": market.seconds_left,
+                "outcomes": market.outcomes,
+                "token_ids": market.token_ids,
+            },
+            "price": {
+                "source": snapshot.source,
+                "symbol": self.config.quant_symbol,
+                "current_ts": snapshot.current_ts,
+                "current": snapshot.current,
+                "start_price_ts": snapshot.start_price_ts,
+                "start_price": snapshot.start_price,
+                "ret_from_start": snapshot.ret_from_start,
+                "ret_1m": snapshot.ret_1m,
+                "ret_3m": snapshot.ret_3m,
+                "up_probability": snapshot.up_probability,
+            },
+            "position_before": lock_position_payload(position_before),
+            "position_after": lock_position_payload(position_after),
+            "config": {
+                "size_mode": self.config.quant_size_mode,
+                "order_usdc": self.config.quant_order_usdc,
+                "order_shares": self.config.quant_order_shares,
+                "capital_usdc": self.config.quant_capital_usdc,
+                "market_max_usdc": self.config.quant_market_max_usdc,
+                "max_trades_per_market": self.config.quant_max_trades_per_market,
+                "rebuy_cooldown_sec": self.config.quant_rebuy_cooldown_sec,
+                "lock_min_profit": self.config.quant_lock_min_profit,
+                "lock_stop_on_lock": self.config.quant_lock_stop_on_lock,
+                "min_edge": self.config.quant_min_edge,
+                "min_seconds_left": self.config.quant_min_seconds_left,
+                "max_slippage": self.config.max_slippage,
+            },
+            "candidates": candidates,
+            "selected": self.decision_payload(selected) if selected else None,
+            "selected_meta": selected_meta,
+        }
+        self.signal_recorder.write(json_safe(record), force=force)
+
     def record_signal(
         self,
         market: QuantMarket,
@@ -669,7 +1081,10 @@ class PolymarketQuantBot:
                 "up_probability": snapshot.up_probability,
             },
             "config": {
+                "strategy": self.config.quant_strategy,
+                "size_mode": self.config.quant_size_mode,
                 "order_usdc": self.config.quant_order_usdc,
+                "order_shares": self.config.quant_order_shares,
                 "min_edge": self.config.quant_min_edge,
                 "min_seconds_left": self.config.quant_min_seconds_left,
                 "max_slippage": self.config.max_slippage,
@@ -697,6 +1112,126 @@ class PolymarketQuantBot:
         if time.time() - self.last_log_ts >= self.config.quant_log_interval_sec:
             print(message)
             self.last_log_ts = time.time()
+
+
+def state_decimal(value: Any, default: str = "0") -> Decimal:
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return Decimal(default)
+
+
+def base_lock_position() -> Dict[str, Decimal]:
+    return {
+        "up_size": Decimal("0"),
+        "down_size": Decimal("0"),
+        "up_cost": Decimal("0"),
+        "down_cost": Decimal("0"),
+        "total_cost": Decimal("0"),
+        "up_avg_price": Decimal("0"),
+        "down_avg_price": Decimal("0"),
+        "up_pnl": Decimal("0"),
+        "down_pnl": Decimal("0"),
+        "worst_pnl": Decimal("0"),
+        "best_pnl": Decimal("0"),
+        "trade_count": Decimal("0"),
+    }
+
+
+def recalc_lock_position(position: Dict[str, Decimal]) -> Dict[str, Decimal]:
+    up_size = position["up_size"]
+    down_size = position["down_size"]
+    up_cost = position["up_cost"]
+    down_cost = position["down_cost"]
+    total_cost = up_cost + down_cost
+    position["total_cost"] = total_cost
+    position["up_avg_price"] = up_cost / up_size if up_size > 0 else Decimal("0")
+    position["down_avg_price"] = down_cost / down_size if down_size > 0 else Decimal("0")
+    position["up_pnl"] = up_size - total_cost
+    position["down_pnl"] = down_size - total_cost
+    position["worst_pnl"] = min(position["up_pnl"], position["down_pnl"])
+    position["best_pnl"] = max(position["up_pnl"], position["down_pnl"])
+    return position
+
+
+def lock_position_from_entry(entry: Dict[str, Any]) -> Dict[str, Decimal]:
+    position = base_lock_position()
+    trades = entry.get("trades")
+    valid_count = 0
+    if not isinstance(trades, list):
+        return recalc_lock_position(position)
+    for trade in trades:
+        if not isinstance(trade, dict):
+            continue
+        outcome = str(trade.get("outcome") or "")
+        size = state_decimal(trade.get("size"))
+        price = state_decimal(trade.get("limit_price"))
+        cost = state_decimal(trade.get("cost"))
+        if cost <= 0:
+            cost = size * price
+        if size <= 0 or cost <= 0:
+            continue
+        if outcome == "Up":
+            position["up_size"] += size
+            position["up_cost"] += cost
+        elif outcome == "Down":
+            position["down_size"] += size
+            position["down_cost"] += cost
+        else:
+            continue
+        valid_count += 1
+    position["trade_count"] = Decimal(valid_count)
+    return recalc_lock_position(position)
+
+
+def lock_position_after_trade(
+    position_before: Dict[str, Decimal],
+    outcome: str,
+    size: Decimal,
+    price: Decimal,
+) -> Dict[str, Decimal]:
+    position = {key: Decimal(value) for key, value in position_before.items()}
+    cost = size * price
+    if outcome == "Up":
+        position["up_size"] += size
+        position["up_cost"] += cost
+    else:
+        position["down_size"] += size
+        position["down_cost"] += cost
+    position["trade_count"] += Decimal("1")
+    return recalc_lock_position(position)
+
+
+def lock_position_payload(position: Dict[str, Decimal]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {}
+    for key, value in position.items():
+        if key == "trade_count":
+            payload[key] = int(value)
+        else:
+            payload[key] = str(value.quantize(Decimal("0.0001")))
+    return payload
+
+
+def lock_candidate_payload(item: Dict[str, Any]) -> Dict[str, Any]:
+    decision = item.get("decision")
+    if not isinstance(decision, QuantDecision):
+        return {}
+    score = item.get("score")
+    return {
+        "outcome": decision.outcome,
+        "token_id": decision.token_id,
+        "probability": decision.probability,
+        "best_ask": decision.best_ask,
+        "edge": decision.edge,
+        "limit_price": decision.limit_price,
+        "size": decision.size,
+        "notional": item.get("notional"),
+        "reason": item.get("reason"),
+        "improvement_worst_pnl": item.get("improvement_worst_pnl"),
+        "would_lock": bool(item.get("would_lock")),
+        "score": list(score) if isinstance(score, tuple) else score,
+        "position_after": lock_position_payload(item.get("position_after", base_lock_position())),
+    }
 
 
 def json_safe(value: Any) -> Any:

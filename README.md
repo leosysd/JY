@@ -10,6 +10,7 @@
 - 对 `/book` 做短缓存，并默认启用 Polymarket Market WebSocket 维护近期 asset 的盘口参数，减少发现成交后的 HTTP 请求。
 - 默认 `PRICE_MODE=safe`，按目标成交价加最大滑点下单，盘口超过保护价就跳过，避免 0.99/0.01 强制成交造成大滑点。
 - 新增 `BOT_MODE=quant` AI量化模式，第一版支持 BTC 5分钟 Up/Down，默认使用 Polymarket RTDS 的 Chainlink BTC/USD 结算源做动量试算。
+- 新增 `QUANT_STRATEGY=lock` 锁利模拟：固定 20 份、多次补单/反向单、300 USDC 单市场上限、两边成本和锁利记录。
 - 默认 `DRY_RUN=1`，先只打印不真实下单。
 - VPS 一键安装，安装后直接用 `jy` 打开交互菜单。
 
@@ -90,7 +91,16 @@ jy
 - `QUANT_CHAINLINK_SYMBOL`: 默认 `btc/usd`。
 - `QUANT_CHAINLINK_WS_URL`: 默认 `wss://ws-live-data.polymarket.com`。
 - `QUANT_CHAINLINK_MAX_AGE_SEC`: 默认 `180`，超过这个秒数仍无最新 Chainlink 价格才认为行情过旧。
+- `QUANT_STRATEGY`: `single` 为单边信号模型，`lock` 为 JetFadil 风格锁利模拟模型。
+- `QUANT_SIZE_MODE`: `usdc` 按金额换算份额，`shares` 按固定份额下单。锁利模拟建议 `shares`。
 - `QUANT_ORDER_USDC`: AI量化每次计划下单金额，默认 `5`。
+- `QUANT_ORDER_SHARES`: AI量化每次计划下单份额，默认 `20`，用于模拟 JetFadil 常见 20 份一笔。
+- `QUANT_CAPITAL_USDC`: AI量化模拟本金，默认 `300`。
+- `QUANT_MARKET_MAX_USDC`: 单个 5分钟市场最大模拟成本，默认 `300`。
+- `QUANT_MAX_TRADES_PER_MARKET`: 单市场最多模拟笔数，默认 `35`。
+- `QUANT_REBUY_COOLDOWN_SEC`: 补单/反手最短间隔，默认 `5` 秒。
+- `QUANT_LOCK_MIN_PROFIT`: 两边都盈利多少 USDC 后视为锁利，默认 `0.50`。
+- `QUANT_LOCK_STOP_ON_LOCK`: 默认 `1`，锁利后停止继续模拟该市场。
 - `QUANT_MIN_EDGE`: AI量化最小优势，默认 `0.04` 表示预测概率至少比买入价高 4 分。
 - `QUANT_MIN_SECONDS_LEFT`: 距离 5分钟市场结束至少剩余多少秒才允许下单，默认 `45`。
 - `QUANT_RECORD_SIGNALS`: 默认 `1`，AI量化运行时记录结构化信号数据。
@@ -244,6 +254,36 @@ jy quant-data tail --lines 5
 
 每条记录包含市场、剩余秒数、Chainlink BTC/USD 行情、Up/Down 概率、盘口 ask、edge、模拟选择方向和跳过原因。
 
+## JetFadil 风格锁利模拟
+
+这个模型只做 `DRY_RUN` 模拟，不会真实下单。它参考 JetFadil 近期公开成交的结构：常见为每笔 20 份，单个 5分钟市场内多次买入 Up/Down，两边都可能补单，目标是把最差结果逐步抬高，出现两边都盈利时停止该市场。
+
+启用推荐命令：
+
+```bash
+jy set-bot-mode quant
+jy set-dry-run 1
+jy set-quant-config --strategy lock --size-mode shares --order-shares 20 --capital-usdc 300 --market-max-usdc 300 --max-trades-per-market 35 --rebuy-cooldown-sec 5 --lock-min-profit 0.50 --price-source chainlink --record-signals 1 --signal-interval-sec 5
+jy quant-data clear
+jy app-logs clear
+jy service restart
+```
+
+锁利模型每轮会记录：
+
+- 当前市场、剩余秒数、Chainlink 结算源价格。
+- Up/Down 盘口 ask、概率、edge。
+- 当前模拟仓位：Up 份额/成本、Down 份额/成本、总成本。
+- 如果 Up 赢和如果 Down 赢分别赚亏多少。
+- 候选补单是否能锁利、是否能改善最差亏损、是否只是方向优势补单。
+
+查看效果：
+
+```bash
+jy quant-data summary
+jy quant-data tail --lines 10
+```
+
 ## VPS 部署结果
 
 默认部署到：
@@ -283,7 +323,7 @@ jy service disable-autostart
 
 ## 第一版边界
 
-这一版不做历史补仓、不做定时仓位拉平、不做自动撤单、不做完整盈亏统计。
+这一版真实下单仍不做历史补仓、不做定时仓位拉平、不做自动撤单、不做完整盈亏统计。`QUANT_STRATEGY=lock` 只做模拟仓位、补单、反向单和锁利记录。
 
 AI量化第一版是动量/概率试算，不是收益保证；默认价格源使用 Polymarket RTDS 的 Chainlink BTC/USD，与 Polymarket 5分钟 BTC 市场页面规则里的结算源保持一致。OKX 只作为可选参考行情源。
 
@@ -297,22 +337,22 @@ AI量化第一版是动量/概率试算，不是收益保证；默认价格源�
    - 记录 Chainlink 价格、开盘价、剩余秒数、盘口 ask、edge、模拟方向和跳过原因。
    - 目标是先跑 24 小时，确认信号质量和数据完整性。
 
-2. 第二阶段：仓位记录 + 两边成本计算。
+2. 第二阶段：仓位记录 + 两边成本计算。已在 `QUANT_STRATEGY=lock` 模拟模型中加入。
    - 按市场记录我们自己的 Up/Down 持仓、均价、成本、已模拟成交。
    - 计算如果 Up 赢的净收益、如果 Down 赢的净收益。
    - 先只模拟，不真实下单。
 
-3. 第三阶段：补单模块。
+3. 第三阶段：补单模块。已在 `QUANT_STRATEGY=lock` 模拟模型中加入。
    - 同方向价格更好、edge 仍然达标时，允许小额补单。
    - 设置单市场最大成本、最大补单次数、最晚补单剩余秒数。
    - 避免因为连续补单把风险放大。
 
-4. 第四阶段：反向单模块。
+4. 第四阶段：反向单模块。已在 `QUANT_STRATEGY=lock` 模拟模型中加入。
    - 当另一边价格足够低时，允许买入反边降低单边风险。
    - 反向单数量由当前两边成本和目标风险决定，不盲目对冲。
    - 用模拟数据观察是否接近 JetFadil 的补单/反手结构。
 
-5. 第五阶段：锁利模块。
+5. 第五阶段：锁利模块。已在 `QUANT_STRATEGY=lock` 模拟模型中加入。
    - 同时计算 Up 赢和 Down 赢时的净收益。
    - 如果两边结果都大于设定利润阈值，就停止交易这个市场。
    - 如果只能降低亏损但不能锁利，则按风险参数决定是否继续。

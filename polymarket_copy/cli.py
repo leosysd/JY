@@ -156,7 +156,16 @@ def init_config(config_path: Path) -> None:
         "QUANT_CHAINLINK_TIMEOUT_SEC": existing.get("QUANT_CHAINLINK_TIMEOUT_SEC", "12"),
         "QUANT_CHAINLINK_MAX_AGE_SEC": existing.get("QUANT_CHAINLINK_MAX_AGE_SEC", "180"),
         "QUANT_CHAINLINK_START_TOLERANCE_SEC": existing.get("QUANT_CHAINLINK_START_TOLERANCE_SEC", "4"),
+        "QUANT_STRATEGY": existing.get("QUANT_STRATEGY", "single"),
+        "QUANT_SIZE_MODE": existing.get("QUANT_SIZE_MODE", "usdc"),
         "QUANT_ORDER_USDC": existing.get("QUANT_ORDER_USDC", "5"),
+        "QUANT_ORDER_SHARES": existing.get("QUANT_ORDER_SHARES", "20"),
+        "QUANT_CAPITAL_USDC": existing.get("QUANT_CAPITAL_USDC", "300"),
+        "QUANT_MARKET_MAX_USDC": existing.get("QUANT_MARKET_MAX_USDC", "300"),
+        "QUANT_MAX_TRADES_PER_MARKET": existing.get("QUANT_MAX_TRADES_PER_MARKET", "35"),
+        "QUANT_REBUY_COOLDOWN_SEC": existing.get("QUANT_REBUY_COOLDOWN_SEC", "5"),
+        "QUANT_LOCK_MIN_PROFIT": existing.get("QUANT_LOCK_MIN_PROFIT", "0.50"),
+        "QUANT_LOCK_STOP_ON_LOCK": existing.get("QUANT_LOCK_STOP_ON_LOCK", "1"),
         "QUANT_MIN_EDGE": existing.get("QUANT_MIN_EDGE", "0.04"),
         "QUANT_MIN_SECONDS_LEFT": existing.get("QUANT_MIN_SECONDS_LEFT", "45"),
         "QUANT_COOLDOWN_SEC": existing.get("QUANT_COOLDOWN_SEC", "60"),
@@ -185,9 +194,18 @@ def print_config_summary(config_path: Path, require_private_key: Optional[bool] 
     print(f"价格保护: {config.price_mode}, 最大滑点: {config.max_slippage}, 单笔上限: {config.max_order_usdc} USDC")
     print(
         "AI量化: "
-        f"{config.quant_symbol}, source={config.quant_price_source}, "
-        f"order_usdc={config.quant_order_usdc}, "
+        f"{config.quant_symbol}, strategy={config.quant_strategy}, source={config.quant_price_source}, "
+        f"size_mode={config.quant_size_mode}, order_usdc={config.quant_order_usdc}, "
+        f"order_shares={config.quant_order_shares}, "
         f"min_edge={config.quant_min_edge}, min_seconds_left={config.quant_min_seconds_left}"
+    )
+    print(
+        "AI锁利模拟: "
+        f"capital={config.quant_capital_usdc} USDC, "
+        f"market_cap={config.quant_market_max_usdc} USDC, "
+        f"max_trades={config.quant_max_trades_per_market}, "
+        f"rebuy_cooldown={config.quant_rebuy_cooldown_sec}s, "
+        f"lock_profit={config.quant_lock_min_profit}"
     )
     if config.quant_price_source == "chainlink":
         print(
@@ -677,7 +695,16 @@ def update_quant_config(config_path: Path) -> None:
         "QUANT_CHAINLINK_TIMEOUT_SEC": prompt_text("Chainlink 首次等待秒数 QUANT_CHAINLINK_TIMEOUT_SEC", existing.get("QUANT_CHAINLINK_TIMEOUT_SEC", "12")),
         "QUANT_CHAINLINK_MAX_AGE_SEC": prompt_text("Chainlink 最新价格最大延迟秒数 QUANT_CHAINLINK_MAX_AGE_SEC", existing.get("QUANT_CHAINLINK_MAX_AGE_SEC", "180")),
         "QUANT_CHAINLINK_START_TOLERANCE_SEC": prompt_text("Chainlink 开盘价容忍秒数 QUANT_CHAINLINK_START_TOLERANCE_SEC", existing.get("QUANT_CHAINLINK_START_TOLERANCE_SEC", "4")),
+        "QUANT_STRATEGY": prompt_text("量化策略 QUANT_STRATEGY，single=单边，lock=锁利模拟", existing.get("QUANT_STRATEGY", "single")),
+        "QUANT_SIZE_MODE": prompt_text("下单尺寸模式 QUANT_SIZE_MODE，usdc=金额，shares=份额", existing.get("QUANT_SIZE_MODE", "usdc")),
         "QUANT_ORDER_USDC": prompt_text("每次量化下单金额 QUANT_ORDER_USDC", existing.get("QUANT_ORDER_USDC", "5")),
+        "QUANT_ORDER_SHARES": prompt_text("每次量化下单份额 QUANT_ORDER_SHARES", existing.get("QUANT_ORDER_SHARES", "20")),
+        "QUANT_CAPITAL_USDC": prompt_text("量化模拟本金 QUANT_CAPITAL_USDC", existing.get("QUANT_CAPITAL_USDC", "300")),
+        "QUANT_MARKET_MAX_USDC": prompt_text("单市场最大模拟成本 QUANT_MARKET_MAX_USDC", existing.get("QUANT_MARKET_MAX_USDC", "300")),
+        "QUANT_MAX_TRADES_PER_MARKET": prompt_text("单市场最多模拟笔数 QUANT_MAX_TRADES_PER_MARKET", existing.get("QUANT_MAX_TRADES_PER_MARKET", "35")),
+        "QUANT_REBUY_COOLDOWN_SEC": prompt_text("补单/反手冷却秒数 QUANT_REBUY_COOLDOWN_SEC", existing.get("QUANT_REBUY_COOLDOWN_SEC", "5")),
+        "QUANT_LOCK_MIN_PROFIT": prompt_text("锁利最低利润 QUANT_LOCK_MIN_PROFIT", existing.get("QUANT_LOCK_MIN_PROFIT", "0.50")),
+        "QUANT_LOCK_STOP_ON_LOCK": prompt_text("锁利后停止本市场 QUANT_LOCK_STOP_ON_LOCK，1=停止", existing.get("QUANT_LOCK_STOP_ON_LOCK", "1")),
         "QUANT_MIN_EDGE": prompt_text("最小优势 QUANT_MIN_EDGE，0.04=4分钱", existing.get("QUANT_MIN_EDGE", "0.04")),
         "QUANT_MIN_SECONDS_LEFT": prompt_text("最少剩余秒数 QUANT_MIN_SECONDS_LEFT", existing.get("QUANT_MIN_SECONDS_LEFT", "45")),
         "QUANT_COOLDOWN_SEC": prompt_text("量化下单冷却秒数 QUANT_COOLDOWN_SEC", existing.get("QUANT_COOLDOWN_SEC", "60")),
@@ -1102,7 +1129,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_quant.add_argument("--chainlink-timeout-sec")
     p_quant.add_argument("--chainlink-max-age-sec")
     p_quant.add_argument("--chainlink-start-tolerance-sec")
+    p_quant.add_argument("--strategy", choices=["single", "lock"])
+    p_quant.add_argument("--size-mode", choices=["usdc", "shares"])
     p_quant.add_argument("--order-usdc")
+    p_quant.add_argument("--order-shares")
+    p_quant.add_argument("--capital-usdc")
+    p_quant.add_argument("--market-max-usdc")
+    p_quant.add_argument("--max-trades-per-market")
+    p_quant.add_argument("--rebuy-cooldown-sec")
+    p_quant.add_argument("--lock-min-profit")
+    p_quant.add_argument("--lock-stop-on-lock", choices=["0", "1"])
     p_quant.add_argument("--min-edge")
     p_quant.add_argument("--min-seconds-left")
     p_quant.add_argument("--cooldown-sec")
@@ -1223,7 +1259,16 @@ def main(argv: Optional[List[str]] = None) -> None:
                 args.chainlink_timeout_sec,
                 args.chainlink_max_age_sec,
                 args.chainlink_start_tolerance_sec,
+                args.strategy,
+                args.size_mode,
                 args.order_usdc,
+                args.order_shares,
+                args.capital_usdc,
+                args.market_max_usdc,
+                args.max_trades_per_market,
+                args.rebuy_cooldown_sec,
+                args.lock_min_profit,
+                args.lock_stop_on_lock,
                 args.min_edge,
                 args.min_seconds_left,
                 args.cooldown_sec,
@@ -1263,7 +1308,36 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "QUANT_CHAINLINK_START_TOLERANCE_SEC",
                 args.chainlink_start_tolerance_sec or existing.get("QUANT_CHAINLINK_START_TOLERANCE_SEC", "4"),
             )
+            set_env_value(config_path, "QUANT_STRATEGY", args.strategy or existing.get("QUANT_STRATEGY", "single"))
+            set_env_value(config_path, "QUANT_SIZE_MODE", args.size_mode or existing.get("QUANT_SIZE_MODE", "usdc"))
             set_env_value(config_path, "QUANT_ORDER_USDC", args.order_usdc or existing.get("QUANT_ORDER_USDC", "5"))
+            set_env_value(config_path, "QUANT_ORDER_SHARES", args.order_shares or existing.get("QUANT_ORDER_SHARES", "20"))
+            set_env_value(config_path, "QUANT_CAPITAL_USDC", args.capital_usdc or existing.get("QUANT_CAPITAL_USDC", "300"))
+            set_env_value(
+                config_path,
+                "QUANT_MARKET_MAX_USDC",
+                args.market_max_usdc or existing.get("QUANT_MARKET_MAX_USDC", "300"),
+            )
+            set_env_value(
+                config_path,
+                "QUANT_MAX_TRADES_PER_MARKET",
+                args.max_trades_per_market or existing.get("QUANT_MAX_TRADES_PER_MARKET", "35"),
+            )
+            set_env_value(
+                config_path,
+                "QUANT_REBUY_COOLDOWN_SEC",
+                args.rebuy_cooldown_sec or existing.get("QUANT_REBUY_COOLDOWN_SEC", "5"),
+            )
+            set_env_value(
+                config_path,
+                "QUANT_LOCK_MIN_PROFIT",
+                args.lock_min_profit or existing.get("QUANT_LOCK_MIN_PROFIT", "0.50"),
+            )
+            set_env_value(
+                config_path,
+                "QUANT_LOCK_STOP_ON_LOCK",
+                args.lock_stop_on_lock or existing.get("QUANT_LOCK_STOP_ON_LOCK", "1"),
+            )
             set_env_value(config_path, "QUANT_MIN_EDGE", args.min_edge or existing.get("QUANT_MIN_EDGE", "0.04"))
             set_env_value(
                 config_path,
