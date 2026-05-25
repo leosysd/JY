@@ -1,0 +1,412 @@
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import re
+import time
+from dataclasses import dataclass
+from decimal import Decimal, getcontext
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+import requests
+
+from .config import CopyBotConfig, load_config, validate_config
+
+
+getcontext().prec = 28
+
+GAMMA_API = "https://gamma-api.polymarket.com"
+DATA_API = "https://data-api.polymarket.com"
+
+
+def decimal_value(value: Any) -> Decimal:
+    return Decimal(str(value))
+
+
+def now_ts() -> float:
+    return time.time()
+
+
+class HttpJsonClient:
+    def __init__(self, config: CopyBotConfig) -> None:
+        self.config = config
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "jy-polymarket-copy/0.1"})
+
+    def get_json(self, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        last_error: Optional[BaseException] = None
+        for attempt in range(self.config.http_max_retries):
+            try:
+                response = self.session.get(
+                    url,
+                    params=params,
+                    timeout=self.config.http_timeout_sec,
+                )
+                if response.status_code in {429, 500, 502, 503, 504}:
+                    wait_sec = self._wait_seconds(response, attempt)
+                    print(
+                        f"[HTTP RETRY] status={response.status_code} "
+                        f"attempt={attempt + 1}/{self.config.http_max_retries} "
+                        f"sleep={wait_sec:.2f}s url={url}"
+                    )
+                    time.sleep(wait_sec)
+                    continue
+                response.raise_for_status()
+                return response.json()
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt == self.config.http_max_retries - 1:
+                    break
+                wait_sec = self._backoff_seconds(attempt)
+                print(
+                    f"[HTTP ERROR] attempt={attempt + 1}/{self.config.http_max_retries} "
+                    f"sleep={wait_sec:.2f}s error={repr(exc)}"
+                )
+                time.sleep(wait_sec)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"HTTP request failed after retries: {url}")
+
+    def _wait_seconds(self, response: requests.Response, attempt: int) -> float:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return min(float(retry_after), self.config.backoff_max_sec)
+            except ValueError:
+                pass
+        return self._backoff_seconds(attempt)
+
+    def _backoff_seconds(self, attempt: int) -> float:
+        base = self.config.backoff_base_sec * (2 ** attempt)
+        jitter = random.uniform(0, self.config.backoff_base_sec)
+        return min(base + jitter, self.config.backoff_max_sec)
+
+
+class SeenStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.state: Dict[str, Any] = {"seen": []}
+
+    def load(self) -> None:
+        if not self.path.exists():
+            self.state = {"seen": []}
+            return
+        try:
+            self.state = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(self.state.get("seen"), list):
+                self.state["seen"] = []
+        except json.JSONDecodeError:
+            backup = self.path.with_suffix(self.path.suffix + ".bad")
+            self.path.replace(backup)
+            print(f"[WARN] state 文件 JSON 无效，已备份到 {backup}")
+            self.state = {"seen": []}
+
+    def seen_set(self) -> Set[str]:
+        return set(str(item) for item in self.state.get("seen", []))
+
+    def save(self, seen: Set[str]) -> None:
+        self.state["seen"] = list(seen)[-10000:]
+        self.path.write_text(
+            json.dumps(self.state, indent=2, sort_keys=True, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+
+@dataclass
+class BookCacheEntry:
+    loaded_at: float
+    book: Dict[str, Any]
+
+
+class BookCache:
+    def __init__(self, http: HttpJsonClient, config: CopyBotConfig) -> None:
+        self.http = http
+        self.config = config
+        self.entries: Dict[str, BookCacheEntry] = {}
+
+    def get_book(self, token_id: str) -> Dict[str, Any]:
+        entry = self.entries.get(token_id)
+        if entry and now_ts() - entry.loaded_at <= self.config.book_cache_sec:
+            return entry.book
+        book = self.http.get_json(
+            f"{self.config.clob_api_url}/book",
+            params={"token_id": token_id},
+        )
+        self.entries[token_id] = BookCacheEntry(loaded_at=now_ts(), book=book)
+        return book
+
+
+class PolymarketCopyBot:
+    def __init__(self, config: CopyBotConfig) -> None:
+        self.config = config
+        self.http = HttpJsonClient(config)
+        self.book_cache = BookCache(self.http, config)
+        self.store = SeenStore(config.state_file)
+        self._order_lib: Optional[Dict[str, Any]] = None
+
+    def run_forever(self) -> None:
+        errors, warnings = validate_config(self.config, require_private_key=not self.config.dry_run)
+        for warning in warnings:
+            print(f"[CONFIG WARN] {warning}")
+        if errors:
+            raise RuntimeError("; ".join(errors))
+
+        wallet = self.resolve_target_wallet()
+        print(f"[TARGET] @{self.config.target_username} proxyWallet = {wallet}")
+
+        self.store.load()
+        self.bootstrap_seen(wallet)
+        seen = self.store.seen_set()
+
+        client = None
+        if self.config.dry_run:
+            print("[MODE] DRY_RUN=1，只打印，不真实下单。真实跟单改 DRY_RUN=0。")
+        else:
+            client = self.build_client()
+            print("[MODE] DRY_RUN=0，真实下单。")
+
+        while True:
+            try:
+                activities = self.fetch_activity(wallet, limit=self.config.activity_limit)
+                new_trades = self.find_new_trades(activities, seen)
+                for trade in new_trades:
+                    key = trade_key(trade)
+                    try:
+                        self.place_copy_order(client, trade)
+                    except Exception as exc:
+                        print(f"[COPY ERROR] key={key} error={repr(exc)} trade={trade}")
+                        if not self.config.mark_failed_seen:
+                            continue
+                    seen.add(key)
+                    self.store.save(seen)
+                time.sleep(self.config.poll_sec)
+            except KeyboardInterrupt:
+                print("退出。")
+                self.store.save(seen)
+                break
+            except Exception as exc:
+                print(f"[LOOP ERROR] {repr(exc)}")
+                self.store.save(seen)
+                time.sleep(max(self.config.poll_sec, 3))
+
+    def resolve_target_wallet(self) -> str:
+        wallet = self.config.target_wallet.strip()
+        if wallet and re.fullmatch(r"0x[a-fA-F0-9]{40}", wallet):
+            return wallet
+
+        data = self.http.get_json(
+            f"{GAMMA_API}/public-search",
+            params={
+                "q": self.config.target_username,
+                "search_profiles": "true",
+                "limit_per_type": 10,
+            },
+        )
+        profiles = data.get("profiles") or []
+        for profile in profiles:
+            name = str(profile.get("name") or "").lower()
+            pseudonym = str(profile.get("pseudonym") or "").lower()
+            found_wallet = profile.get("proxyWallet")
+            if found_wallet and (
+                name == self.config.target_username.lower()
+                or pseudonym == self.config.target_username.lower()
+            ):
+                return str(found_wallet)
+        for profile in profiles:
+            found_wallet = profile.get("proxyWallet")
+            if found_wallet:
+                print(
+                    f"[WARN] 未精确匹配 @{self.config.target_username}，"
+                    f"使用搜索到的地址: {found_wallet}"
+                )
+                return str(found_wallet)
+        raise RuntimeError(f"找不到 @{self.config.target_username} 的 proxyWallet")
+
+    def fetch_activity(self, wallet: str, limit: int) -> List[Dict[str, Any]]:
+        data = self.http.get_json(
+            f"{DATA_API}/activity",
+            params={
+                "user": wallet,
+                "type": "TRADE",
+                "limit": limit,
+                "sortBy": "TIMESTAMP",
+                "sortDirection": "DESC",
+            },
+        )
+        if not isinstance(data, list):
+            raise RuntimeError(f"activity 返回异常: {data}")
+        return data
+
+    def bootstrap_seen(self, wallet: str) -> None:
+        seen = self.store.seen_set()
+        if seen:
+            return
+        history = self.fetch_activity(wallet, limit=self.config.bootstrap_limit)
+        for trade in history:
+            seen.add(trade_key(trade))
+        self.store.save(seen)
+        print(f"[BOOTSTRAP] 已把启动前 {len(seen)} 条历史 TRADE 标记为 seen，不复制旧单。")
+
+    def find_new_trades(
+        self,
+        activities: List[Dict[str, Any]],
+        seen: Set[str],
+    ) -> List[Dict[str, Any]]:
+        new_trades: List[Dict[str, Any]] = []
+        for trade in reversed(activities):
+            key = trade_key(trade)
+            if key not in seen:
+                new_trades.append(trade)
+        return new_trades
+
+    def build_client(self) -> Any:
+        order_lib = self._load_order_lib()
+        if not self.config.private_key:
+            raise RuntimeError("PRIVATE_KEY 未设置")
+        if self.config.signature_type == 3 and not self.config.funder:
+            raise RuntimeError("SIGNATURE_TYPE=3 时必须设置 DEPOSIT_WALLET_ADDRESS")
+
+        clob_client = order_lib["ClobClient"]
+        temp_client = clob_client(
+            self.config.clob_api_url,
+            key=self.config.private_key,
+            chain_id=self.config.chain_id,
+        )
+        api_creds = temp_client.create_or_derive_api_key()
+        kwargs: Dict[str, Any] = {
+            "host": self.config.clob_api_url,
+            "key": self.config.private_key,
+            "chain_id": self.config.chain_id,
+            "creds": api_creds,
+            "signature_type": self.config.signature_type,
+        }
+        if self.config.funder:
+            kwargs["funder"] = self.config.funder
+        return clob_client(**kwargs)
+
+    def place_copy_order(self, client: Any, trade: Dict[str, Any]) -> None:
+        side_raw = str(trade.get("side", "")).upper()
+        if side_raw not in {"BUY", "SELL"}:
+            print(f"[SKIP] 未知 side: {side_raw}")
+            return
+
+        token_id = str(trade["asset"])
+        target_size = decimal_value(trade["size"])
+        copy_size = target_size * self.config.copy_ratio
+        book = self.book_cache.get_book(token_id)
+        tick_size = decimal_value(book.get("tick_size", "0.01"))
+        min_order_size = decimal_value(book.get("min_order_size", "1"))
+        neg_risk = bool(book.get("neg_risk", False))
+
+        if copy_size < min_order_size:
+            print(
+                "[SKIP] 低于最小下单 size: "
+                f"copy_size={copy_size}, min_order_size={min_order_size}, "
+                f"title={trade.get('title')}"
+            )
+            return
+
+        price = aggressive_price(side_raw, tick_size)
+        print(
+            f"[COPY {side_raw}] "
+            f"title={trade.get('title')} | "
+            f"outcome={trade.get('outcome')} | "
+            f"asset={token_id} | "
+            f"target_size={target_size} | "
+            f"copy_size={copy_size} | "
+            f"target_price={trade.get('price')} | "
+            f"copy_limit_price={price}"
+        )
+
+        if self.config.dry_run:
+            return
+        self._post_order(client, token_id, price, copy_size, side_raw, tick_size, neg_risk)
+
+    def _post_order(
+        self,
+        client: Any,
+        token_id: str,
+        price: Decimal,
+        copy_size: Decimal,
+        side_raw: str,
+        tick_size: Decimal,
+        neg_risk: bool,
+    ) -> None:
+        order_lib = self._load_order_lib()
+        side = order_lib["BUY"] if side_raw == "BUY" else order_lib["SELL"]
+        response = client.create_and_post_order(
+            order_lib["OrderArgs"](
+                token_id=token_id,
+                price=float(price),
+                size=float(copy_size),
+                side=side,
+            ),
+            options=order_lib["PartialCreateOrderOptions"](
+                tick_size=str(tick_size),
+                neg_risk=neg_risk,
+            ),
+            order_type=order_lib["OrderType"].GTC,
+        )
+        print(f"[ORDER RESP] {response}")
+
+    def _load_order_lib(self) -> Dict[str, Any]:
+        if self._order_lib is not None:
+            return self._order_lib
+        try:
+            from py_clob_client_v2 import (  # type: ignore
+                ClobClient,
+                OrderArgs,
+                OrderType,
+                PartialCreateOrderOptions,
+            )
+            from py_clob_client_v2.order_builder.constants import BUY, SELL  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "缺少 py-clob-client-v2，请先运行 pip install -r requirements.txt"
+            ) from exc
+        self._order_lib = {
+            "ClobClient": ClobClient,
+            "OrderArgs": OrderArgs,
+            "OrderType": OrderType,
+            "PartialCreateOrderOptions": PartialCreateOrderOptions,
+            "BUY": BUY,
+            "SELL": SELL,
+        }
+        return self._order_lib
+
+
+def trade_key(trade: Dict[str, Any]) -> str:
+    parts = [
+        str(trade.get("transactionHash", "")),
+        str(trade.get("timestamp", "")),
+        str(trade.get("asset", "")),
+        str(trade.get("side", "")),
+        str(trade.get("price", "")),
+        str(trade.get("size", "")),
+    ]
+    return "|".join(parts)
+
+
+def aggressive_price(side: str, tick_size: Decimal) -> Decimal:
+    if side == "BUY":
+        return Decimal("1") - tick_size
+    return tick_size
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the Polymarket realtime copy bot.")
+    parser.add_argument("--config", default=".env", help="Path to .env config file.")
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    args = parse_args(argv)
+    config = load_config(Path(args.config))
+    bot = PolymarketCopyBot(config)
+    bot.run_forever()
+
+
+if __name__ == "__main__":
+    main()
