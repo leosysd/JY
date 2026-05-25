@@ -86,7 +86,7 @@ class CopyBotConfig:
     quant_chainlink_symbol: str = "btc/usd"
     quant_chainlink_ws_url: str = DEFAULT_POLYMARKET_RTDS_WS_URL
     quant_chainlink_timeout_sec: float = 12.0
-    quant_chainlink_max_age_sec: float = 30.0
+    quant_chainlink_max_age_sec: float = 180.0
     quant_chainlink_start_tolerance_sec: float = 4.0
     quant_order_usdc: Decimal = Decimal("5")
     quant_min_edge: Decimal = Decimal("0.04")
@@ -172,7 +172,7 @@ def load_config(config_path: Optional[Path] = None) -> CopyBotConfig:
         quant_chainlink_symbol=_env("QUANT_CHAINLINK_SYMBOL", "btc/usd").lower(),
         quant_chainlink_ws_url=_env("QUANT_CHAINLINK_WS_URL", DEFAULT_POLYMARKET_RTDS_WS_URL),
         quant_chainlink_timeout_sec=float(_env("QUANT_CHAINLINK_TIMEOUT_SEC", "12")),
-        quant_chainlink_max_age_sec=float(_env("QUANT_CHAINLINK_MAX_AGE_SEC", "30")),
+        quant_chainlink_max_age_sec=float(_env("QUANT_CHAINLINK_MAX_AGE_SEC", "180")),
         quant_chainlink_start_tolerance_sec=float(_env("QUANT_CHAINLINK_START_TOLERANCE_SEC", "4")),
         quant_order_usdc=Decimal(_env("QUANT_ORDER_USDC", "5")),
         quant_min_edge=Decimal(_env("QUANT_MIN_EDGE", "0.04")),

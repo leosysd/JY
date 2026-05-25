@@ -89,7 +89,7 @@ jy
 - `QUANT_PRICE_SOURCE`: 默认 `chainlink`，通过 Polymarket RTDS 订阅 Chainlink BTC/USD；也可手动改成 `okx` 做参考行情对比。
 - `QUANT_CHAINLINK_SYMBOL`: 默认 `btc/usd`。
 - `QUANT_CHAINLINK_WS_URL`: 默认 `wss://ws-live-data.polymarket.com`。
-- `QUANT_CHAINLINK_MAX_AGE_SEC`: 默认 `30`，超过这个秒数仍无最新 Chainlink 价格才认为行情过旧。
+- `QUANT_CHAINLINK_MAX_AGE_SEC`: 默认 `180`，超过这个秒数仍无最新 Chainlink 价格才认为行情过旧。
 - `QUANT_ORDER_USDC`: AI量化每次计划下单金额，默认 `5`。
 - `QUANT_MIN_EDGE`: AI量化最小优势，默认 `0.04` 表示预测概率至少比买入价高 4 分。
 - `QUANT_MIN_SECONDS_LEFT`: 距离 5分钟市场结束至少剩余多少秒才允许下单，默认 `45`。

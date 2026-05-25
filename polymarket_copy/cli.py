@@ -154,7 +154,7 @@ def init_config(config_path: Path) -> None:
         "QUANT_CHAINLINK_SYMBOL": existing.get("QUANT_CHAINLINK_SYMBOL", "btc/usd"),
         "QUANT_CHAINLINK_WS_URL": existing.get("QUANT_CHAINLINK_WS_URL", DEFAULT_POLYMARKET_RTDS_WS_URL),
         "QUANT_CHAINLINK_TIMEOUT_SEC": existing.get("QUANT_CHAINLINK_TIMEOUT_SEC", "12"),
-        "QUANT_CHAINLINK_MAX_AGE_SEC": existing.get("QUANT_CHAINLINK_MAX_AGE_SEC", "30"),
+        "QUANT_CHAINLINK_MAX_AGE_SEC": existing.get("QUANT_CHAINLINK_MAX_AGE_SEC", "180"),
         "QUANT_CHAINLINK_START_TOLERANCE_SEC": existing.get("QUANT_CHAINLINK_START_TOLERANCE_SEC", "4"),
         "QUANT_ORDER_USDC": existing.get("QUANT_ORDER_USDC", "5"),
         "QUANT_MIN_EDGE": existing.get("QUANT_MIN_EDGE", "0.04"),
@@ -675,7 +675,7 @@ def update_quant_config(config_path: Path) -> None:
         "QUANT_CHAINLINK_SYMBOL": prompt_text("Chainlink 交易对 QUANT_CHAINLINK_SYMBOL", existing.get("QUANT_CHAINLINK_SYMBOL", "btc/usd")),
         "QUANT_CHAINLINK_WS_URL": prompt_text("Polymarket RTDS WebSocket QUANT_CHAINLINK_WS_URL", existing.get("QUANT_CHAINLINK_WS_URL", DEFAULT_POLYMARKET_RTDS_WS_URL)),
         "QUANT_CHAINLINK_TIMEOUT_SEC": prompt_text("Chainlink 首次等待秒数 QUANT_CHAINLINK_TIMEOUT_SEC", existing.get("QUANT_CHAINLINK_TIMEOUT_SEC", "12")),
-        "QUANT_CHAINLINK_MAX_AGE_SEC": prompt_text("Chainlink 最新价格最大延迟秒数 QUANT_CHAINLINK_MAX_AGE_SEC", existing.get("QUANT_CHAINLINK_MAX_AGE_SEC", "30")),
+        "QUANT_CHAINLINK_MAX_AGE_SEC": prompt_text("Chainlink 最新价格最大延迟秒数 QUANT_CHAINLINK_MAX_AGE_SEC", existing.get("QUANT_CHAINLINK_MAX_AGE_SEC", "180")),
         "QUANT_CHAINLINK_START_TOLERANCE_SEC": prompt_text("Chainlink 开盘价容忍秒数 QUANT_CHAINLINK_START_TOLERANCE_SEC", existing.get("QUANT_CHAINLINK_START_TOLERANCE_SEC", "4")),
         "QUANT_ORDER_USDC": prompt_text("每次量化下单金额 QUANT_ORDER_USDC", existing.get("QUANT_ORDER_USDC", "5")),
         "QUANT_MIN_EDGE": prompt_text("最小优势 QUANT_MIN_EDGE，0.04=4分钱", existing.get("QUANT_MIN_EDGE", "0.04")),
@@ -1256,7 +1256,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             set_env_value(
                 config_path,
                 "QUANT_CHAINLINK_MAX_AGE_SEC",
-                args.chainlink_max_age_sec or existing.get("QUANT_CHAINLINK_MAX_AGE_SEC", "30"),
+                args.chainlink_max_age_sec or existing.get("QUANT_CHAINLINK_MAX_AGE_SEC", "180"),
             )
             set_env_value(
                 config_path,

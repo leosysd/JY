@@ -101,6 +101,7 @@ class ChainlinkRtdsPriceFeed:
         self.thread: Optional[threading.Thread] = None
         self.ws: Any = None
         self.last_error = ""
+        self.last_refresh_request_ts = 0.0
 
     def start(self) -> None:
         if self.thread and self.thread.is_alive():
@@ -129,6 +130,8 @@ class ChainlinkRtdsPriceFeed:
                 return self.snapshot(market_start_ts)
             except RuntimeError as exc:
                 last_problem = str(exc)
+                if "stale" in last_problem or "no Chainlink prices" in last_problem:
+                    self.request_refresh()
                 time.sleep(0.25)
         if self.last_error:
             last_problem = f"{last_problem}; last_ws_error={self.last_error}" if last_problem else self.last_error
@@ -220,6 +223,18 @@ class ChainlinkRtdsPriceFeed:
                         ws.close()
                     except Exception:
                         pass
+
+    def request_refresh(self) -> None:
+        now = time.monotonic()
+        if now - self.last_refresh_request_ts < 3:
+            return
+        self.last_refresh_request_ts = now
+        ws = self.ws
+        if ws:
+            try:
+                ws.close()
+            except Exception:
+                pass
 
     def _subscribe(self, ws: Any) -> None:
         subscription = {
