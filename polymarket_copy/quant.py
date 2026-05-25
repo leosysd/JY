@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -29,7 +30,9 @@ OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/history-candles"
 @dataclass(frozen=True)
 class BtcSnapshot:
     source: str
+    current_ts: int
     current: Decimal
+    start_price_ts: int
     start_price: Decimal
     ret_from_start: Decimal
     ret_1m: Decimal
@@ -89,6 +92,189 @@ class QuantSignalRecorder:
             fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+class ChainlinkRtdsPriceFeed:
+    def __init__(self, config: CopyBotConfig) -> None:
+        self.config = config
+        self.prices: List[Tuple[int, Decimal]] = []
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+        self.ws: Any = None
+        self.last_error = ""
+
+    def start(self) -> None:
+        if self.thread and self.thread.is_alive():
+            return
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._run, name="chainlink-rtds", daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        ws = self.ws
+        if ws:
+            try:
+                ws.close()
+            except Exception:
+                pass
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=2)
+
+    def wait_snapshot(self, market_start_ts: int) -> BtcSnapshot:
+        self.start()
+        deadline = time.monotonic() + self.config.quant_chainlink_timeout_sec
+        last_problem = ""
+        while time.monotonic() < deadline:
+            try:
+                return self.snapshot(market_start_ts)
+            except RuntimeError as exc:
+                last_problem = str(exc)
+                time.sleep(0.25)
+        if self.last_error:
+            last_problem = f"{last_problem}; last_ws_error={self.last_error}" if last_problem else self.last_error
+        raise RuntimeError(f"Chainlink RTDS price unavailable: {last_problem}")
+
+    def snapshot(self, market_start_ts: int) -> BtcSnapshot:
+        now = int(time.time())
+        with self.lock:
+            prices = list(self.prices)
+        if not prices:
+            raise RuntimeError("no Chainlink prices received yet")
+
+        current_ts, current = prices[-1]
+        if now - current_ts > self.config.quant_chainlink_max_age_sec:
+            raise RuntimeError(f"latest Chainlink price is stale: age={now - current_ts}s")
+
+        start_item = nearest_price(prices, market_start_ts)
+        if start_item is None:
+            raise RuntimeError("missing Chainlink start price")
+        start_ts, start_price = start_item
+        if abs(start_ts - market_start_ts) > self.config.quant_chainlink_start_tolerance_sec:
+            raise RuntimeError(
+                f"Chainlink start price is too far from market start: "
+                f"start_ts={start_ts} market_start_ts={market_start_ts}"
+            )
+
+        one_min_item = nearest_price(prices, current_ts - 60)
+        three_min_item = nearest_price(prices, current_ts - 180)
+        one_min_price = one_min_item[1] if one_min_item else start_price
+        three_min_price = three_min_item[1] if three_min_item else start_price
+        ret_from_start = decimal_return(current, start_price)
+        ret_1m = decimal_return(current, one_min_price)
+        ret_3m = decimal_return(current, three_min_price)
+        up_probability = estimate_up_probability(ret_from_start, ret_1m, ret_3m)
+        return BtcSnapshot(
+            source="polymarket_rtds_chainlink",
+            current_ts=current_ts,
+            current=current,
+            start_price_ts=start_ts,
+            start_price=start_price,
+            ret_from_start=ret_from_start,
+            ret_1m=ret_1m,
+            ret_3m=ret_3m,
+            up_probability=up_probability,
+        )
+
+    def _run(self) -> None:
+        try:
+            import websocket  # type: ignore
+        except ImportError:
+            self.last_error = "missing websocket-client"
+            print("[CHAINLINK WARN] 缺少 websocket-client，Chainlink RTDS 不可用。")
+            return
+
+        while not self.stop_event.is_set():
+            ws = None
+            try:
+                ws = websocket.create_connection(self.config.quant_chainlink_ws_url, timeout=10)
+                self.ws = ws
+                self._subscribe(ws)
+                print(f"[CHAINLINK] 已连接 Polymarket RTDS，订阅 {self.config.quant_chainlink_symbol}。")
+                ws.settimeout(1)
+                next_ping = time.monotonic() + 5
+                while not self.stop_event.is_set():
+                    if time.monotonic() >= next_ping:
+                        ws.send("PING")
+                        next_ping = time.monotonic() + 5
+                    try:
+                        message = ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        continue
+                    if not message:
+                        continue
+                    if message == "PONG":
+                        continue
+                    if message == "PING":
+                        ws.send("PONG")
+                        continue
+                    self._handle_message(str(message))
+            except Exception as exc:
+                self.last_error = repr(exc)
+                if not self.stop_event.is_set():
+                    print(f"[CHAINLINK WARN] RTDS 断开: {repr(exc)}，稍后重连。")
+                    time.sleep(max(1.0, self.config.market_ws_reconnect_sec))
+            finally:
+                self.ws = None
+                if ws:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+
+    def _subscribe(self, ws: Any) -> None:
+        subscription = {
+            "action": "subscribe",
+            "subscriptions": [
+                {
+                    "topic": "crypto_prices_chainlink",
+                    "type": "*",
+                    "filters": json.dumps({"symbol": self.config.quant_chainlink_symbol}),
+                }
+            ],
+        }
+        ws.send(json.dumps(subscription))
+
+    def _handle_message(self, message: str) -> None:
+        try:
+            data = json.loads(message)
+        except json.JSONDecodeError:
+            return
+        payload = data.get("payload") if isinstance(data, dict) else None
+        if not isinstance(payload, dict):
+            return
+        rows = payload.get("data")
+        if rows is None and ("timestamp" in payload and ("value" in payload or "price" in payload)):
+            rows = [payload]
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not isinstance(rows, list):
+            return
+        parsed: List[Tuple[int, Decimal]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            timestamp = row.get("timestamp") or row.get("ts")
+            value = row.get("value") or row.get("price")
+            if timestamp is None or value is None:
+                continue
+            try:
+                raw_ts = Decimal(str(timestamp))
+                ts = int(raw_ts / Decimal("1000")) if raw_ts > Decimal("10000000000") else int(raw_ts)
+                price = decimal_value(value)
+            except Exception:
+                continue
+            parsed.append((ts, price))
+        if parsed:
+            self._add_prices(parsed)
+
+    def _add_prices(self, parsed: List[Tuple[int, Decimal]]) -> None:
+        with self.lock:
+            merged = {ts: price for ts, price in self.prices}
+            merged.update(parsed)
+            cutoff = int(time.time()) - 900
+            self.prices = sorted((ts, price) for ts, price in merged.items() if ts >= cutoff)
+
+
 class QuantStateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -143,6 +329,7 @@ class PolymarketQuantBot:
         self.order_helper = PolymarketCopyBot(config)
         self.state = QuantStateStore(config.quant_state_file)
         self.signal_recorder = QuantSignalRecorder(config)
+        self.chainlink_feed = ChainlinkRtdsPriceFeed(config)
         self.last_log_ts = 0.0
 
     def run_forever(self) -> None:
@@ -162,12 +349,15 @@ class PolymarketQuantBot:
         print(
             "[AI QUANT] "
             f"symbol={self.config.quant_symbol} "
+            f"source={self.config.quant_price_source} "
             f"order_usdc={self.config.quant_order_usdc} "
             f"min_edge={self.config.quant_min_edge} "
             f"min_seconds_left={self.config.quant_min_seconds_left}"
         )
         if self.config.quant_record_signals:
             print(f"[AI QUANT DATA] signals={self.config.quant_signal_file}")
+        if self.config.quant_price_source == "chainlink":
+            self.chainlink_feed.start()
 
         try:
             while True:
@@ -182,6 +372,7 @@ class PolymarketQuantBot:
                     time.sleep(max(self.config.poll_sec, 3))
         finally:
             self.market_ws.stop()
+            self.chainlink_feed.stop()
 
     def run_once(self, client: Any = None) -> Optional[QuantDecision]:
         market = self.find_current_market()
@@ -190,7 +381,11 @@ class PolymarketQuantBot:
             return None
 
         self.market_ws.start(market.token_ids)
-        snapshot = self.fetch_btc_snapshot(market.start_ts)
+        try:
+            snapshot = self.fetch_btc_snapshot(market.start_ts)
+        except RuntimeError as exc:
+            self.log_throttled(f"[AI QUANT] Chainlink 价格暂不可用，跳过本轮: {exc}")
+            return None
         decision = self.make_decision(market, snapshot)
         if decision is None:
             return None
@@ -265,8 +460,10 @@ class PolymarketQuantBot:
         )
 
     def fetch_btc_snapshot(self, market_start_ts: int) -> BtcSnapshot:
+        if self.config.quant_price_source == "chainlink":
+            return self.chainlink_feed.wait_snapshot(market_start_ts)
         if self.config.quant_price_source != "okx":
-            raise RuntimeError("第一版 AI 量化只支持 QUANT_PRICE_SOURCE=okx")
+            raise RuntimeError("AI量化行情源只支持 QUANT_PRICE_SOURCE=chainlink 或 okx")
 
         data = self.http.get_json(
             OKX_CANDLES_URL,
@@ -285,7 +482,9 @@ class PolymarketQuantBot:
         up_probability = estimate_up_probability(ret_from_start, ret_1m, ret_3m)
         return BtcSnapshot(
             source="okx",
+            current_ts=int(candles[-1]["ts"]),
             current=current,
+            start_price_ts=int(nearest_candle_ts(candles, market_start_ts)),
             start_price=start_price,
             ret_from_start=ret_from_start,
             ret_1m=ret_1m,
@@ -445,7 +644,9 @@ class PolymarketQuantBot:
             "price": {
                 "source": snapshot.source,
                 "symbol": self.config.quant_symbol,
+                "current_ts": snapshot.current_ts,
                 "current": snapshot.current,
+                "start_price_ts": snapshot.start_price_ts,
                 "start_price": snapshot.start_price,
                 "ret_from_start": snapshot.ret_from_start,
                 "ret_1m": snapshot.ret_1m,
@@ -529,6 +730,17 @@ def parse_okx_candles(rows: List[Any]) -> List[Dict[str, Decimal]]:
 def nearest_candle_open(candles: List[Dict[str, Decimal]], target_ts: int) -> Decimal:
     nearest = min(candles, key=lambda candle: abs(int(candle["ts"]) - target_ts))
     return nearest["open"]
+
+
+def nearest_candle_ts(candles: List[Dict[str, Decimal]], target_ts: int) -> int:
+    nearest = min(candles, key=lambda candle: abs(int(candle["ts"]) - target_ts))
+    return int(nearest["ts"])
+
+
+def nearest_price(prices: List[Tuple[int, Decimal]], target_ts: int) -> Optional[Tuple[int, Decimal]]:
+    if not prices:
+        return None
+    return min(prices, key=lambda item: abs(item[0] - target_ts))
 
 
 def decimal_return(current: Decimal, previous: Decimal) -> Decimal:

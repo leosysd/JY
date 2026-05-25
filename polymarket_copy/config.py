@@ -14,6 +14,7 @@ DEFAULT_TARGET_USERNAME = "jetfadil"
 DEFAULT_TARGET_WALLET = "0xe0229e10a858860218b6132f4234602c47bd6603"
 DEFAULT_CLOB_API_URL = "https://clob.polymarket.com"
 DEFAULT_MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+DEFAULT_POLYMARKET_RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
 
 
 def parse_bool(value: object, default: bool = False) -> bool:
@@ -81,7 +82,12 @@ class CopyBotConfig:
     market_ws_custom_feature_enabled: bool = True
     quant_symbol: str = "BTC-USDT"
     quant_market_slug_prefix: str = "btc-updown-5m"
-    quant_price_source: str = "okx"
+    quant_price_source: str = "chainlink"
+    quant_chainlink_symbol: str = "btc/usd"
+    quant_chainlink_ws_url: str = DEFAULT_POLYMARKET_RTDS_WS_URL
+    quant_chainlink_timeout_sec: float = 12.0
+    quant_chainlink_max_age_sec: float = 30.0
+    quant_chainlink_start_tolerance_sec: float = 4.0
     quant_order_usdc: Decimal = Decimal("5")
     quant_min_edge: Decimal = Decimal("0.04")
     quant_min_seconds_left: int = 45
@@ -162,7 +168,12 @@ def load_config(config_path: Optional[Path] = None) -> CopyBotConfig:
         ),
         quant_symbol=_env("QUANT_SYMBOL", "BTC-USDT"),
         quant_market_slug_prefix=_env("QUANT_MARKET_SLUG_PREFIX", "btc-updown-5m"),
-        quant_price_source=_env("QUANT_PRICE_SOURCE", "okx").lower(),
+        quant_price_source=_env("QUANT_PRICE_SOURCE", "chainlink").lower(),
+        quant_chainlink_symbol=_env("QUANT_CHAINLINK_SYMBOL", "btc/usd").lower(),
+        quant_chainlink_ws_url=_env("QUANT_CHAINLINK_WS_URL", DEFAULT_POLYMARKET_RTDS_WS_URL),
+        quant_chainlink_timeout_sec=float(_env("QUANT_CHAINLINK_TIMEOUT_SEC", "12")),
+        quant_chainlink_max_age_sec=float(_env("QUANT_CHAINLINK_MAX_AGE_SEC", "30")),
+        quant_chainlink_start_tolerance_sec=float(_env("QUANT_CHAINLINK_START_TOLERANCE_SEC", "4")),
         quant_order_usdc=Decimal(_env("QUANT_ORDER_USDC", "5")),
         quant_min_edge=Decimal(_env("QUANT_MIN_EDGE", "0.04")),
         quant_min_seconds_left=int(_env("QUANT_MIN_SECONDS_LEFT", "45")),
@@ -222,8 +233,16 @@ def validate_config(config: CopyBotConfig, require_private_key: bool = False) ->
         errors.append("MARKET_WS_MAX_ASSETS 至少为 1")
     if config.market_ws_heartbeat_sec <= 0:
         errors.append("MARKET_WS_HEARTBEAT_SEC 必须大于 0")
-    if config.quant_price_source not in {"okx"}:
-        errors.append("QUANT_PRICE_SOURCE 第一版只支持 okx")
+    if config.quant_price_source not in {"chainlink", "okx"}:
+        errors.append("QUANT_PRICE_SOURCE 必须是 chainlink 或 okx")
+    if config.quant_price_source == "chainlink" and config.quant_chainlink_symbol != "btc/usd":
+        warnings.append("当前 AI量化第一版只验证过 Chainlink btc/usd")
+    if config.quant_chainlink_timeout_sec <= 0:
+        errors.append("QUANT_CHAINLINK_TIMEOUT_SEC 必须大于 0")
+    if config.quant_chainlink_max_age_sec <= 0:
+        errors.append("QUANT_CHAINLINK_MAX_AGE_SEC 必须大于 0")
+    if config.quant_chainlink_start_tolerance_sec <= 0:
+        errors.append("QUANT_CHAINLINK_START_TOLERANCE_SEC 必须大于 0")
     if config.quant_order_usdc <= 0:
         errors.append("QUANT_ORDER_USDC 必须大于 0")
     if config.quant_min_edge < 0:
@@ -275,6 +294,11 @@ def env_lines(values: Dict[str, str]) -> List[str]:
         "QUANT_SYMBOL",
         "QUANT_MARKET_SLUG_PREFIX",
         "QUANT_PRICE_SOURCE",
+        "QUANT_CHAINLINK_SYMBOL",
+        "QUANT_CHAINLINK_WS_URL",
+        "QUANT_CHAINLINK_TIMEOUT_SEC",
+        "QUANT_CHAINLINK_MAX_AGE_SEC",
+        "QUANT_CHAINLINK_START_TOLERANCE_SEC",
         "QUANT_ORDER_USDC",
         "QUANT_MIN_EDGE",
         "QUANT_MIN_SECONDS_LEFT",

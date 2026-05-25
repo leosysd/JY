@@ -9,7 +9,7 @@
 - 对 HTTP `429`、`5xx`、网络抖动做自动退避和重试。
 - 对 `/book` 做短缓存，并默认启用 Polymarket Market WebSocket 维护近期 asset 的盘口参数，减少发现成交后的 HTTP 请求。
 - 默认 `PRICE_MODE=safe`，按目标成交价加最大滑点下单，盘口超过保护价就跳过，避免 0.99/0.01 强制成交造成大滑点。
-- 新增 `BOT_MODE=quant` AI量化模式，第一版支持 BTC 5分钟 Up/Down，使用 OKX 公共行情做动量试算。
+- 新增 `BOT_MODE=quant` AI量化模式，第一版支持 BTC 5分钟 Up/Down，默认使用 Polymarket RTDS 的 Chainlink BTC/USD 结算源做动量试算。
 - 默认 `DRY_RUN=1`，先只打印不真实下单。
 - VPS 一键安装，安装后直接用 `jy` 打开交互菜单。
 
@@ -86,6 +86,10 @@ jy
 - `MAX_SLIPPAGE`: 默认 `0.02`，表示最多比目标成交价差 2 分。
 - `MAX_ORDER_USDC`: 默认 `0` 不限制；大于 0 时限制单笔跟单最大名义金额。
 - `BOT_MODE`: `copy` 为跟单模式，`quant` 为 AI量化模式。
+- `QUANT_PRICE_SOURCE`: 默认 `chainlink`，通过 Polymarket RTDS 订阅 Chainlink BTC/USD；也可手动改成 `okx` 做参考行情对比。
+- `QUANT_CHAINLINK_SYMBOL`: 默认 `btc/usd`。
+- `QUANT_CHAINLINK_WS_URL`: 默认 `wss://ws-live-data.polymarket.com`。
+- `QUANT_CHAINLINK_MAX_AGE_SEC`: 默认 `30`，超过这个秒数仍无最新 Chainlink 价格才认为行情过旧。
 - `QUANT_ORDER_USDC`: AI量化每次计划下单金额，默认 `5`。
 - `QUANT_MIN_EDGE`: AI量化最小优势，默认 `0.04` 表示预测概率至少比买入价高 4 分。
 - `QUANT_MIN_SECONDS_LEFT`: 距离 5分钟市场结束至少剩余多少秒才允许下单，默认 `45`。
@@ -179,7 +183,7 @@ jy set-bot-mode quant --restart
 修改 AI量化参数：
 
 ```bash
-jy set-quant-config --order-usdc 5 --min-edge 0.04 --min-seconds-left 45 --restart
+jy set-quant-config --price-source chainlink --order-usdc 5 --min-edge 0.04 --min-seconds-left 45 --restart
 ```
 
 查看文件日志：
@@ -225,7 +229,7 @@ jy quant-data clear
 ```bash
 jy set-bot-mode quant
 jy set-dry-run 1
-jy set-quant-config --record-signals 1 --signal-interval-sec 30
+jy set-quant-config --price-source chainlink --record-signals 1 --signal-interval-sec 30
 jy quant-data clear
 jy app-logs clear
 jy service restart
@@ -238,7 +242,7 @@ jy quant-data summary
 jy quant-data tail --lines 5
 ```
 
-每条记录包含市场、剩余秒数、OKX BTC 行情、Up/Down 概率、盘口 ask、edge、模拟选择方向和跳过原因。
+每条记录包含市场、剩余秒数、Chainlink BTC/USD 行情、Up/Down 概率、盘口 ask、edge、模拟选择方向和跳过原因。
 
 ## VPS 部署结果
 
@@ -281,7 +285,7 @@ jy service disable-autostart
 
 这一版不做历史补仓、不做定时仓位拉平、不做自动撤单、不做完整盈亏统计。
 
-AI量化第一版是动量/概率试算，不是收益保证；价格参考源使用 OKX 公共 BTC-USDT 行情，Polymarket 5分钟 BTC 市场实际规则以页面说明的数据源为准。
+AI量化第一版是动量/概率试算，不是收益保证；默认价格源使用 Polymarket RTDS 的 Chainlink BTC/USD，与 Polymarket 5分钟 BTC 市场页面规则里的结算源保持一致。OKX 只作为可选参考行情源。
 
 目标用户成交发现仍使用 Polymarket Data API 的低频 `/activity` 查询。Market WebSocket 用于维护已知 asset 的订单簿参数和盘口更新；如果 WS 断线或没有缓存，机器人会自动回退到 HTTP `/book`。任意目标钱包的纯链上 WebSocket 监听会作为后续高级模式。
 

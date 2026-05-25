@@ -21,6 +21,7 @@ from .bot import PolymarketCopyBot, run_configured_bot
 from .config import (
     DEFAULT_CLOB_API_URL,
     DEFAULT_MARKET_WS_URL,
+    DEFAULT_POLYMARKET_RTDS_WS_URL,
     DEFAULT_TARGET_USERNAME,
     DEFAULT_TARGET_WALLET,
     env_lines,
@@ -149,7 +150,12 @@ def init_config(config_path: Path) -> None:
         "MARKET_WS_CUSTOM_FEATURE_ENABLED": existing.get("MARKET_WS_CUSTOM_FEATURE_ENABLED", "1"),
         "QUANT_SYMBOL": existing.get("QUANT_SYMBOL", "BTC-USDT"),
         "QUANT_MARKET_SLUG_PREFIX": existing.get("QUANT_MARKET_SLUG_PREFIX", "btc-updown-5m"),
-        "QUANT_PRICE_SOURCE": existing.get("QUANT_PRICE_SOURCE", "okx"),
+        "QUANT_PRICE_SOURCE": existing.get("QUANT_PRICE_SOURCE", "chainlink"),
+        "QUANT_CHAINLINK_SYMBOL": existing.get("QUANT_CHAINLINK_SYMBOL", "btc/usd"),
+        "QUANT_CHAINLINK_WS_URL": existing.get("QUANT_CHAINLINK_WS_URL", DEFAULT_POLYMARKET_RTDS_WS_URL),
+        "QUANT_CHAINLINK_TIMEOUT_SEC": existing.get("QUANT_CHAINLINK_TIMEOUT_SEC", "12"),
+        "QUANT_CHAINLINK_MAX_AGE_SEC": existing.get("QUANT_CHAINLINK_MAX_AGE_SEC", "30"),
+        "QUANT_CHAINLINK_START_TOLERANCE_SEC": existing.get("QUANT_CHAINLINK_START_TOLERANCE_SEC", "4"),
         "QUANT_ORDER_USDC": existing.get("QUANT_ORDER_USDC", "5"),
         "QUANT_MIN_EDGE": existing.get("QUANT_MIN_EDGE", "0.04"),
         "QUANT_MIN_SECONDS_LEFT": existing.get("QUANT_MIN_SECONDS_LEFT", "45"),
@@ -179,9 +185,15 @@ def print_config_summary(config_path: Path, require_private_key: Optional[bool] 
     print(f"价格保护: {config.price_mode}, 最大滑点: {config.max_slippage}, 单笔上限: {config.max_order_usdc} USDC")
     print(
         "AI量化: "
-        f"{config.quant_symbol}, order_usdc={config.quant_order_usdc}, "
+        f"{config.quant_symbol}, source={config.quant_price_source}, "
+        f"order_usdc={config.quant_order_usdc}, "
         f"min_edge={config.quant_min_edge}, min_seconds_left={config.quant_min_seconds_left}"
     )
+    if config.quant_price_source == "chainlink":
+        print(
+            "Chainlink RTDS: "
+            f"{config.quant_chainlink_symbol} / {config.quant_chainlink_ws_url}"
+        )
     print(
         "AI量化数据: "
         f"{'开启' if config.quant_record_signals else '关闭'} / "
@@ -659,7 +671,12 @@ def update_quant_config(config_path: Path) -> None:
     existing = load_existing_env(config_path)
     values = {
         "QUANT_SYMBOL": prompt_text("量化交易对 QUANT_SYMBOL", existing.get("QUANT_SYMBOL", "BTC-USDT")),
-        "QUANT_PRICE_SOURCE": prompt_text("行情源 QUANT_PRICE_SOURCE，第一版填 okx", existing.get("QUANT_PRICE_SOURCE", "okx")),
+        "QUANT_PRICE_SOURCE": prompt_text("行情源 QUANT_PRICE_SOURCE，chainlink=官方结算源，okx=参考行情", existing.get("QUANT_PRICE_SOURCE", "chainlink")),
+        "QUANT_CHAINLINK_SYMBOL": prompt_text("Chainlink 交易对 QUANT_CHAINLINK_SYMBOL", existing.get("QUANT_CHAINLINK_SYMBOL", "btc/usd")),
+        "QUANT_CHAINLINK_WS_URL": prompt_text("Polymarket RTDS WebSocket QUANT_CHAINLINK_WS_URL", existing.get("QUANT_CHAINLINK_WS_URL", DEFAULT_POLYMARKET_RTDS_WS_URL)),
+        "QUANT_CHAINLINK_TIMEOUT_SEC": prompt_text("Chainlink 首次等待秒数 QUANT_CHAINLINK_TIMEOUT_SEC", existing.get("QUANT_CHAINLINK_TIMEOUT_SEC", "12")),
+        "QUANT_CHAINLINK_MAX_AGE_SEC": prompt_text("Chainlink 最新价格最大延迟秒数 QUANT_CHAINLINK_MAX_AGE_SEC", existing.get("QUANT_CHAINLINK_MAX_AGE_SEC", "30")),
+        "QUANT_CHAINLINK_START_TOLERANCE_SEC": prompt_text("Chainlink 开盘价容忍秒数 QUANT_CHAINLINK_START_TOLERANCE_SEC", existing.get("QUANT_CHAINLINK_START_TOLERANCE_SEC", "4")),
         "QUANT_ORDER_USDC": prompt_text("每次量化下单金额 QUANT_ORDER_USDC", existing.get("QUANT_ORDER_USDC", "5")),
         "QUANT_MIN_EDGE": prompt_text("最小优势 QUANT_MIN_EDGE，0.04=4分钱", existing.get("QUANT_MIN_EDGE", "0.04")),
         "QUANT_MIN_SECONDS_LEFT": prompt_text("最少剩余秒数 QUANT_MIN_SECONDS_LEFT", existing.get("QUANT_MIN_SECONDS_LEFT", "45")),
@@ -1080,6 +1097,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_quant.add_argument("--config", default=".env")
     p_quant.add_argument("--symbol")
     p_quant.add_argument("--price-source")
+    p_quant.add_argument("--chainlink-symbol")
+    p_quant.add_argument("--chainlink-ws-url")
+    p_quant.add_argument("--chainlink-timeout-sec")
+    p_quant.add_argument("--chainlink-max-age-sec")
+    p_quant.add_argument("--chainlink-start-tolerance-sec")
     p_quant.add_argument("--order-usdc")
     p_quant.add_argument("--min-edge")
     p_quant.add_argument("--min-seconds-left")
@@ -1196,6 +1218,11 @@ def main(argv: Optional[List[str]] = None) -> None:
             [
                 args.symbol,
                 args.price_source,
+                args.chainlink_symbol,
+                args.chainlink_ws_url,
+                args.chainlink_timeout_sec,
+                args.chainlink_max_age_sec,
+                args.chainlink_start_tolerance_sec,
                 args.order_usdc,
                 args.min_edge,
                 args.min_seconds_left,
@@ -1210,7 +1237,32 @@ def main(argv: Optional[List[str]] = None) -> None:
         else:
             existing = load_existing_env(config_path)
             set_env_value(config_path, "QUANT_SYMBOL", args.symbol or existing.get("QUANT_SYMBOL", "BTC-USDT"))
-            set_env_value(config_path, "QUANT_PRICE_SOURCE", args.price_source or existing.get("QUANT_PRICE_SOURCE", "okx"))
+            set_env_value(config_path, "QUANT_PRICE_SOURCE", args.price_source or existing.get("QUANT_PRICE_SOURCE", "chainlink"))
+            set_env_value(
+                config_path,
+                "QUANT_CHAINLINK_SYMBOL",
+                args.chainlink_symbol or existing.get("QUANT_CHAINLINK_SYMBOL", "btc/usd"),
+            )
+            set_env_value(
+                config_path,
+                "QUANT_CHAINLINK_WS_URL",
+                args.chainlink_ws_url or existing.get("QUANT_CHAINLINK_WS_URL", DEFAULT_POLYMARKET_RTDS_WS_URL),
+            )
+            set_env_value(
+                config_path,
+                "QUANT_CHAINLINK_TIMEOUT_SEC",
+                args.chainlink_timeout_sec or existing.get("QUANT_CHAINLINK_TIMEOUT_SEC", "12"),
+            )
+            set_env_value(
+                config_path,
+                "QUANT_CHAINLINK_MAX_AGE_SEC",
+                args.chainlink_max_age_sec or existing.get("QUANT_CHAINLINK_MAX_AGE_SEC", "30"),
+            )
+            set_env_value(
+                config_path,
+                "QUANT_CHAINLINK_START_TOLERANCE_SEC",
+                args.chainlink_start_tolerance_sec or existing.get("QUANT_CHAINLINK_START_TOLERANCE_SEC", "4"),
+            )
             set_env_value(config_path, "QUANT_ORDER_USDC", args.order_usdc or existing.get("QUANT_ORDER_USDC", "5"))
             set_env_value(config_path, "QUANT_MIN_EDGE", args.min_edge or existing.get("QUANT_MIN_EDGE", "0.04"))
             set_env_value(
