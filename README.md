@@ -161,6 +161,12 @@ jy service logs
 jy update
 ```
 
+更新完成后服务会保持停止状态，需要运行时再手动启动：
+
+```bash
+jy service start
+```
+
 切换真实下单：
 
 ```bash
@@ -319,7 +325,7 @@ jy service disable-autostart
 - `git pull --ff-only`
 - 更新 Python 依赖
 - 重新安装本项目
-- 重启 `polymarket-copy` 服务
+- 停止 `polymarket-copy` 服务
 
 `.env`、`seen_*.json`、`venv/` 都不会被 Git 覆盖。
 

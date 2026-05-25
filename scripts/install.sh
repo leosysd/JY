@@ -25,11 +25,13 @@ $SUDO mkdir -p "$INSTALL_DIR"
 $SUDO chown -R "$(id -un):$(id -gn)" "$INSTALL_DIR"
 
 if [ -d "$INSTALL_DIR/.git" ]; then
+  EXISTING_INSTALL=1
   echo "[3/6] Updating existing Git checkout..."
   git -C "$INSTALL_DIR" fetch origin "$BRANCH"
   git -C "$INSTALL_DIR" checkout "$BRANCH"
   git -C "$INSTALL_DIR" pull --ff-only origin "$BRANCH"
 elif [ -z "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]; then
+  EXISTING_INSTALL=0
   echo "[3/6] Cloning repository..."
   git clone --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
 else
@@ -83,8 +85,13 @@ $SUDO systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
 
 if [ -f "$INSTALL_DIR/.env" ]; then
   $SUDO chmod 600 "$INSTALL_DIR/.env"
-  $SUDO systemctl restart "$SERVICE_NAME"
-  echo "[OK] Service restarted: $SERVICE_NAME"
+  if [ "$EXISTING_INSTALL" = "1" ]; then
+    $SUDO systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+    echo "[OK] Existing install updated. Service stopped: $SERVICE_NAME"
+  else
+    $SUDO systemctl restart "$SERVICE_NAME"
+    echo "[OK] Service restarted: $SERVICE_NAME"
+  fi
 else
   echo "[OK] Service installed but not started because .env does not exist yet."
 fi

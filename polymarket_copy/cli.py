@@ -463,10 +463,10 @@ def remote_action(
             "./venv/bin/pip install --upgrade pip && "
             "./venv/bin/pip install -r requirements.txt && "
             "./venv/bin/pip install -e . && "
-            f"{sudo}systemctl restart {svc}"
+            f"{sudo}systemctl stop {svc}"
         )
         ssh(target, cmd)
-        print("[OK] 远程程序已更新并重启")
+        print("[OK] 远程程序已更新，服务已停止")
     elif action == "dry-run":
         if dry_run_value not in {"0", "1"}:
             raise SystemExit("--value 必须是 0 或 1")
@@ -893,10 +893,11 @@ def update_program(service_name: str = DEFAULT_SERVICE) -> None:
     run_command([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
     run_command([sys.executable, "-m", "pip", "install", "-e", "."])
     try:
-        local_service_action("restart", service_name)
+        local_service_action("stop", service_name)
     except subprocess.CalledProcessError as exc:
-        print(f"[WARN] 程序已更新，但服务重启失败，退出码 {exc.returncode}")
+        print(f"[WARN] 程序已更新，但停止服务失败，退出码 {exc.returncode}")
     print("[OK] 程序更新完成")
+    print("[INFO] 服务已停止，需要运行时请手动选择 5. 启动服务 或执行 jy service start。")
     print("[INFO] 当前菜单进程仍是更新前版本。请退出后重新运行 jy 使用新版菜单。")
 
 
