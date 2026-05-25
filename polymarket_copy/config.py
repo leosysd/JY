@@ -71,7 +71,7 @@ class CopyBotConfig:
     http_max_retries: int = 5
     backoff_base_sec: float = 0.5
     backoff_max_sec: float = 20.0
-    mark_failed_seen: bool = True
+    mark_failed_seen: bool = False
     enable_market_ws: bool = True
     market_ws_url: str = DEFAULT_MARKET_WS_URL
     market_ws_bootstrap_assets: int = 100
@@ -163,7 +163,7 @@ def load_config(config_path: Optional[Path] = None) -> CopyBotConfig:
         http_max_retries=int(_env("HTTP_MAX_RETRIES", "5")),
         backoff_base_sec=float(_env("BACKOFF_BASE_SEC", "0.5")),
         backoff_max_sec=float(_env("BACKOFF_MAX_SEC", "20")),
-        mark_failed_seen=parse_bool(_env("MARK_FAILED_SEEN", "1"), default=True),
+        mark_failed_seen=parse_bool(_env("MARK_FAILED_SEEN", "0"), default=False),
         enable_market_ws=parse_bool(_env("ENABLE_MARKET_WS", "1"), default=True),
         market_ws_url=_env("MARKET_WS_URL", DEFAULT_MARKET_WS_URL),
         market_ws_bootstrap_assets=int(_env("MARKET_WS_BOOTSTRAP_ASSETS", "100")),

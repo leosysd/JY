@@ -392,7 +392,9 @@ class PolymarketCopyBot:
                         except Exception as exc:
                             print(f"[COPY ERROR] key={key} error={repr(exc)} trade={trade}")
                             if not self.config.mark_failed_seen:
+                                print("[COPY RETRY] MARK_FAILED_SEEN=0，本笔不标记 seen，下轮会继续尝试。")
                                 continue
+                            print("[COPY WARN] MARK_FAILED_SEEN=1，本笔失败后仍标记 seen，避免重复下单。")
                         seen.add(key)
                         self.store.save(seen)
                     time.sleep(self.config.poll_sec)

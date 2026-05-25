@@ -86,6 +86,7 @@ jy
 - `PRICE_MODE`: 默认 `safe`，使用目标成交价 + 最大滑点；`aggressive` 会恢复 0.99/0.01 强制成交，不建议实盘使用。
 - `MAX_SLIPPAGE`: 默认 `0.02`，表示最多比目标成交价差 2 分。
 - `MAX_ORDER_USDC`: 默认 `0` 不限制；大于 0 时限制单笔跟单最大名义金额。
+- `MARK_FAILED_SEEN`: 默认 `0`，跟单遇到网络/下单异常时不标记 seen，下轮继续尝试；改成 `1` 会失败后也标记 seen，降低重复下单风险但可能漏跟。
 - `BOT_MODE`: `copy` 为跟单模式，`quant` 为 AI量化模式。
 - `QUANT_PRICE_SOURCE`: 默认 `chainlink`，通过 Polymarket RTDS 订阅 Chainlink BTC/USD；也可手动改成 `okx` 做参考行情对比。
 - `QUANT_CHAINLINK_SYMBOL`: 默认 `btc/usd`。
@@ -101,7 +102,7 @@ jy
 - `QUANT_REBUY_COOLDOWN_SEC`: 补单/反手最短间隔，默认 `5` 秒。
 - `QUANT_LOCK_MIN_PROFIT`: 两边都盈利多少 USDC 后视为锁利，默认 `0.50`。
 - `QUANT_LOCK_STOP_ON_LOCK`: 默认 `1`，锁利后停止继续模拟该市场。
-- `QUANT_MIN_EDGE`: AI量化最小优势，默认 `0.04` 表示预测概率至少比买入价高 4 分。
+- `QUANT_MIN_EDGE`: AI量化最小优势，默认 `0.04`。现在按保护限价 `limit_price` 计算有效 edge，`best_ask` 只做参考记录。
 - `QUANT_MIN_SECONDS_LEFT`: 距离 5分钟市场结束至少剩余多少秒才允许下单，默认 `45`。
 - `QUANT_RECORD_SIGNALS`: 默认 `1`，AI量化运行时记录结构化信号数据。
 - `QUANT_SIGNAL_FILE`: 默认 `data/quant_signals.jsonl`，一行一个 JSON 记录，方便 24 小时后复盘。
@@ -275,6 +276,7 @@ jy service restart
 - Up/Down 盘口 ask、概率、edge。
 - 当前模拟仓位：Up 份额/成本、Down 份额/成本、总成本。
 - 如果 Up 赢和如果 Down 赢分别赚亏多少。
+- 模拟本金账本：已结算市场盈亏、未结算市场占用成本、当前可继续加仓金额。
 - 候选补单是否能锁利、是否能改善最差亏损、是否只是方向优势补单。
 
 查看效果：

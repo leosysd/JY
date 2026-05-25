@@ -141,7 +141,7 @@ def init_config(config_path: Path) -> None:
         "HTTP_MAX_RETRIES": existing.get("HTTP_MAX_RETRIES", "5"),
         "BACKOFF_BASE_SEC": existing.get("BACKOFF_BASE_SEC", "0.5"),
         "BACKOFF_MAX_SEC": existing.get("BACKOFF_MAX_SEC", "20"),
-        "MARK_FAILED_SEEN": existing.get("MARK_FAILED_SEEN", "1"),
+        "MARK_FAILED_SEEN": existing.get("MARK_FAILED_SEEN", "0"),
         "MARKET_WS_BOOTSTRAP_ASSETS": existing.get("MARKET_WS_BOOTSTRAP_ASSETS", "100"),
         "MARKET_WS_MAX_ASSETS": existing.get("MARKET_WS_MAX_ASSETS", "250"),
         "MARKET_WS_BOOK_MAX_AGE_SEC": existing.get("MARKET_WS_BOOK_MAX_AGE_SEC", "900"),
