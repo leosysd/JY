@@ -29,6 +29,11 @@ DEFAULT_REMOTE_DIR = "/opt/polymarket-copy"
 DEFAULT_SERVICE = "polymarket-copy"
 DEFAULT_REPO_URL = "https://github.com/leosysd/JY.git"
 DEFAULT_REPO_BRANCH = "main"
+ANSI_RESET = "\033[0m"
+ANSI_GREEN = "\033[32m"
+ANSI_RED = "\033[31m"
+ANSI_YELLOW = "\033[33m"
+ANSI_CYAN = "\033[36m"
 
 
 def project_root() -> Path:
@@ -448,6 +453,10 @@ def local_service_action(action: str, service_name: str = DEFAULT_SERVICE) -> No
         raise SystemExit(f"未知本地服务动作: {action}")
 
 
+def color_text(text: str, color: str) -> str:
+    return f"{color}{text}{ANSI_RESET}"
+
+
 def systemctl_value(action: str, service_name: str = DEFAULT_SERVICE) -> str:
     try:
         result = subprocess.run(
@@ -467,10 +476,52 @@ def systemctl_value(action: str, service_name: str = DEFAULT_SERVICE) -> str:
     return value.splitlines()[0].strip()
 
 
+def service_status_text(active: str) -> str:
+    if active == "active":
+        return color_text("运行中", ANSI_GREEN)
+    if active == "inactive":
+        return color_text("未启动", ANSI_RED)
+    if active == "failed":
+        return color_text("启动失败", ANSI_RED)
+    if active == "activating":
+        return color_text("启动中", ANSI_YELLOW)
+    if active == "deactivating":
+        return color_text("停止中", ANSI_YELLOW)
+    if active == "systemd-unavailable":
+        return color_text("systemd不可用", ANSI_YELLOW)
+    return color_text(active, ANSI_YELLOW)
+
+
+def autostart_status_text(enabled: str) -> str:
+    if enabled == "enabled":
+        return color_text("开机自启", ANSI_YELLOW)
+    if enabled == "disabled":
+        return color_text("不开机自启", ANSI_GREEN)
+    if enabled == "not-found":
+        return color_text("服务未安装", ANSI_RED)
+    if enabled == "systemd-unavailable":
+        return color_text("systemd不可用", ANSI_YELLOW)
+    return color_text(enabled, ANSI_YELLOW)
+
+
+def mode_status_text(mode_label: str) -> str:
+    if mode_label == "DRY_RUN":
+        return color_text("只打印", ANSI_YELLOW)
+    return color_text("真实下单", ANSI_RED)
+
+
+def config_status_text(errors: List[str], warnings: List[str]) -> str:
+    if errors:
+        return color_text(f"需检查 {len(errors)} 项", ANSI_RED)
+    if warnings:
+        return color_text(f"OK，警告 {len(warnings)} 项", ANSI_YELLOW)
+    return color_text("OK", ANSI_GREEN)
+
+
 def service_state_label(service_name: str = DEFAULT_SERVICE) -> str:
     active = systemctl_value("is-active", service_name)
     enabled = systemctl_value("is-enabled", service_name)
-    return f"{active} / {enabled}"
+    return f"{service_status_text(active)} / {autostart_status_text(enabled)}"
 
 
 def menu_status_line(config_path: Path, service_name: str = DEFAULT_SERVICE) -> str:
@@ -482,11 +533,9 @@ def menu_status_line(config_path: Path, service_name: str = DEFAULT_SERVICE) -> 
         errors, warnings = validate_config(config, require_private_key=not config.dry_run)
     except Exception as exc:
         return f"服务: {service_state} | 配置: 读取失败 ({exc})"
-    config_state = "OK" if not errors else f"需检查 {len(errors)} 项"
-    warning_state = f"，警告 {len(warnings)} 项" if warnings else ""
     return (
-        f"服务: {service_state} | 配置: {config_state}{warning_state} | "
-        f"模式: {config.mode_label} | 目标: @{config.target_username}"
+        f"服务: {service_state} | 配置: {config_status_text(errors, warnings)} | "
+        f"模式: {mode_status_text(config.mode_label)} | 目标: {color_text('@' + config.target_username, ANSI_CYAN)}"
     )
 
 
