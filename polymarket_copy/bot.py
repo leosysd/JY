@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import random
 import re
@@ -488,7 +490,21 @@ class PolymarketCopyBot:
             key=self.config.private_key,
             chain_id=self.config.chain_id,
         )
-        api_creds = temp_client.create_or_derive_api_key()
+        sdk_output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(sdk_output), contextlib.redirect_stderr(sdk_output):
+                api_creds = temp_client.create_or_derive_api_key()
+        except Exception:
+            captured = sdk_output.getvalue().strip()
+            if captured:
+                print(f"[SDK OUTPUT] {captured}")
+            raise
+        captured = sdk_output.getvalue().strip()
+        if captured:
+            if "Could not create api key" in captured or "/auth/api-key" in captured:
+                print("[INFO] SDK auth/api-key 提示已忽略，继续使用可用的 CLOB 凭证。")
+            else:
+                print(f"[SDK OUTPUT] {captured}")
         kwargs: Dict[str, Any] = {
             "host": self.config.clob_api_url,
             "key": self.config.private_key,
