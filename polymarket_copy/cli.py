@@ -34,7 +34,10 @@ def project_root() -> Path:
 
 
 def prompt_text(label: str, default: str = "", secret: bool = False) -> str:
-    suffix = f" [{default}]" if default else ""
+    if secret and default:
+        suffix = " [已设置，回车保留]"
+    else:
+        suffix = f" [{default}]" if default else ""
     prompt = f"{label}{suffix}: "
     if secret:
         value = getpass.getpass(prompt)
@@ -391,21 +394,174 @@ def remote_action(
         raise SystemExit(f"未知远程动作: {action}")
 
 
-def interactive_menu() -> None:
-    config_path = Path(".env")
+def command_with_sudo(argv: List[str]) -> List[str]:
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        return ["sudo", *argv]
+    return argv
+
+
+def local_service_path(service_name: str = DEFAULT_SERVICE) -> str:
+    return f"/etc/systemd/system/{service_name}.service"
+
+
+def local_install_dir() -> Path:
+    return Path.cwd().resolve()
+
+
+def install_local_service(
+    install_dir: Path,
+    service_name: str = DEFAULT_SERVICE,
+    start_now: bool = False,
+) -> None:
+    service = service_content(str(install_dir))
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".service", delete=False) as fh:
+        fh.write(service)
+        tmp_path = Path(fh.name)
+    try:
+        run_command(command_with_sudo(["install", "-m", "644", str(tmp_path), local_service_path(service_name)]))
+        run_command(command_with_sudo(["systemctl", "daemon-reload"]))
+        run_command(command_with_sudo(["systemctl", "enable", service_name]))
+        if start_now:
+            run_command(command_with_sudo(["systemctl", "restart", service_name]))
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+    print(f"[OK] systemd 服务已安装: {service_name}")
+
+
+def local_service_action(action: str, service_name: str = DEFAULT_SERVICE) -> None:
+    if action == "status":
+        run_command(command_with_sudo(["systemctl", "status", service_name, "--no-pager"]))
+    elif action == "logs":
+        run_command(command_with_sudo(["journalctl", "-u", service_name, "-f", "-n", "100"]))
+    elif action in {"start", "stop", "restart"}:
+        run_command(command_with_sudo(["systemctl", action, service_name]))
+    else:
+        raise SystemExit(f"未知本地服务动作: {action}")
+
+
+def set_env_value(config_path: Path, key: str, value: str) -> None:
+    lines: List[str] = []
+    found = False
+    if config_path.exists():
+        lines = config_path.read_text(encoding="utf-8").splitlines()
+    for idx, line in enumerate(lines):
+        if line.startswith(f"{key}="):
+            lines[idx] = f"{key}={value}"
+            found = True
+            break
+    if not found:
+        lines.append(f"{key}={value}")
+    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    try:
+        os.chmod(config_path, 0o600)
+    except OSError:
+        pass
+
+
+def update_copy_ratio(config_path: Path) -> None:
+    existing = load_existing_env(config_path)
+    value = prompt_text("新的跟单比例 COPY_RATIO", existing.get("COPY_RATIO", "1.0"))
+    set_env_value(config_path, "COPY_RATIO", value)
+    print(f"[OK] COPY_RATIO={value}")
+
+
+def update_target(config_path: Path) -> None:
+    existing = load_existing_env(config_path)
+    username = prompt_text("目标用户名 TARGET_USERNAME", existing.get("TARGET_USERNAME", DEFAULT_TARGET_USERNAME)).lstrip("@")
+    wallet = prompt_text("目标钱包 TARGET_WALLET", existing.get("TARGET_WALLET", DEFAULT_TARGET_WALLET))
+    set_env_value(config_path, "TARGET_USERNAME", username)
+    set_env_value(config_path, "TARGET_WALLET", wallet)
+    if not existing.get("STATE_FILE"):
+        set_env_value(config_path, "STATE_FILE", f"seen_{username}.json")
+    print("[OK] 目标账号已更新")
+
+
+def update_dry_run(config_path: Path, value: Optional[str] = None) -> None:
+    if value not in {"0", "1"}:
+        value = prompt_text("DRY_RUN 值，1=只打印，0=真实下单", "1")
+    if value not in {"0", "1"}:
+        raise SystemExit("DRY_RUN 必须是 0 或 1")
+    set_env_value(config_path, "DRY_RUN", value)
+    mode = "只打印" if value == "1" else "真实下单"
+    print(f"[OK] DRY_RUN={value}，当前模式: {mode}")
+
+
+def update_program(service_name: str = DEFAULT_SERVICE) -> None:
+    install_dir = local_install_dir()
+    if not (install_dir / ".git").exists():
+        raise SystemExit("当前目录不是 Git 安装目录，无法自动更新。请在 /opt/polymarket-copy 运行 jy。")
+    run_command(["git", "pull", "--ff-only"])
+    run_command([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+    run_command([sys.executable, "-m", "pip", "install", "-e", "."])
+    try:
+        local_service_action("restart", service_name)
+    except subprocess.CalledProcessError as exc:
+        print(f"[WARN] 程序已更新，但服务重启失败，退出码 {exc.returncode}")
+    print("[OK] 程序更新完成")
+
+
+def test_api_config(config_path: Path) -> bool:
+    if not config_path.exists():
+        print(f"[ERROR] 配置文件不存在: {config_path}")
+        return False
+    config = load_config(config_path)
+    errors, warnings = validate_config(config, require_private_key=not config.dry_run)
+    for warning in warnings:
+        print(f"[WARN] {warning}")
+    if errors:
+        for error in errors:
+            print(f"[ERROR] {error}")
+        return False
+
+    bot = PolymarketCopyBot(config)
+    try:
+        wallet = bot.resolve_target_wallet()
+        print(f"[OK] 目标钱包: {wallet}")
+        activities = bot.fetch_activity(wallet, limit=3)
+        print(f"[OK] Data API 可访问，最近 TRADE 数量: {len(activities)}")
+        if activities:
+            token_id = str(activities[0].get("asset", ""))
+            if token_id:
+                book = bot.book_cache.get_book(token_id)
+                print(
+                    "[OK] CLOB /book 可访问，"
+                    f"tick_size={book.get('tick_size')} min_order_size={book.get('min_order_size')}"
+                )
+        if config.private_key:
+            try:
+                bot.build_client()
+                print("[OK] CLOB API 凭证可自动派生，签名客户端初始化成功")
+            except Exception as exc:
+                print(f"[ERROR] CLOB 签名/认证测试失败: {exc}")
+                return False
+        else:
+            print("[WARN] PRIVATE_KEY 未设置，只能监控或 DRY_RUN，不能自动下单")
+    except Exception as exc:
+        print(f"[ERROR] API 测试失败: {exc}")
+        return False
+    return True
+
+
+def local_interactive_menu(config_path: Path = Path(".env")) -> None:
     while True:
         print("")
         print("JY Polymarket Copy CLI")
-        print("1. 初始化/更新本地 .env")
-        print("2. 校验本地配置")
-        print("3. 本地运行机器人")
-        print("4. 从 GitHub 安装到 VPS")
-        print("5. 上传本地代码部署到 VPS")
-        print("6. 更新远程程序")
-        print("7. 查看远程服务状态")
-        print("8. 查看远程实时日志")
-        print("9. 重启远程服务")
-        print("10. 切换远程 DRY_RUN")
+        print("1. 初始化/修改交易配置")
+        print("2. 查看当前配置")
+        print("3. 测试 API/私钥/签名")
+        print("4. 安装/刷新 systemd 服务")
+        print("5. 启动服务")
+        print("6. 停止服务")
+        print("7. 重启服务")
+        print("8. 查看服务状态")
+        print("9. 查看实时日志")
+        print("10. 切换 DRY_RUN")
+        print("11. 修改跟单比例 COPY_RATIO")
+        print("12. 修改目标用户/钱包")
+        print("13. 更新程序")
         print("0. 退出")
         choice = input("请选择: ").strip()
         try:
@@ -414,49 +570,34 @@ def interactive_menu() -> None:
             elif choice == "2":
                 print_config_summary(config_path)
             elif choice == "3":
-                run_bot(config_path)
+                test_api_config(config_path)
             elif choice == "4":
-                host = prompt_text("VPS IP / Host")
-                user = prompt_text("SSH 用户", "root")
-                remote_dir = prompt_text("远程目录", DEFAULT_REMOTE_DIR)
-                repo_url = prompt_text("GitHub 仓库地址", DEFAULT_REPO_URL)
-                branch = prompt_text("Git 分支", DEFAULT_REPO_BRANCH)
-                install_from_git(
-                    host,
-                    user,
-                    remote_dir,
-                    config_path,
-                    DEFAULT_SERVICE,
-                    repo_url,
-                    branch,
-                    True,
-                )
+                ok = print_config_summary(config_path)
+                install_local_service(local_install_dir(), start_now=ok)
             elif choice == "5":
-                host = prompt_text("VPS IP / Host")
-                user = prompt_text("SSH 用户", "root")
-                remote_dir = prompt_text("远程目录", DEFAULT_REMOTE_DIR)
-                deploy_to_vps(host, user, remote_dir, config_path, DEFAULT_SERVICE, True)
+                local_service_action("start")
             elif choice == "6":
-                host = prompt_text("VPS IP / Host")
-                user = prompt_text("SSH 用户", "root")
-                remote_action("update", host, user, DEFAULT_REMOTE_DIR, DEFAULT_SERVICE, None)
+                local_service_action("stop")
             elif choice == "7":
-                host = prompt_text("VPS IP / Host")
-                user = prompt_text("SSH 用户", "root")
-                remote_action("status", host, user, DEFAULT_REMOTE_DIR, DEFAULT_SERVICE, None)
+                local_service_action("restart")
             elif choice == "8":
-                host = prompt_text("VPS IP / Host")
-                user = prompt_text("SSH 用户", "root")
-                remote_action("logs", host, user, DEFAULT_REMOTE_DIR, DEFAULT_SERVICE, None)
+                local_service_action("status")
             elif choice == "9":
-                host = prompt_text("VPS IP / Host")
-                user = prompt_text("SSH 用户", "root")
-                remote_action("restart", host, user, DEFAULT_REMOTE_DIR, DEFAULT_SERVICE, None)
+                local_service_action("logs")
             elif choice == "10":
-                host = prompt_text("VPS IP / Host")
-                user = prompt_text("SSH 用户", "root")
-                value = prompt_text("DRY_RUN 值，1=只打印，0=真实下单", "1")
-                remote_action("dry-run", host, user, DEFAULT_REMOTE_DIR, DEFAULT_SERVICE, value)
+                update_dry_run(config_path)
+                if prompt_yes_no("是否立即重启服务让配置生效", True):
+                    local_service_action("restart")
+            elif choice == "11":
+                update_copy_ratio(config_path)
+                if prompt_yes_no("是否立即重启服务让配置生效", True):
+                    local_service_action("restart")
+            elif choice == "12":
+                update_target(config_path)
+                if prompt_yes_no("是否立即重启服务让配置生效", True):
+                    local_service_action("restart")
+            elif choice == "13":
+                update_program()
             elif choice == "0":
                 return
             else:
@@ -470,9 +611,16 @@ def interactive_menu() -> None:
             print(f"[ERROR] {exc}")
 
 
+def interactive_menu() -> None:
+    local_interactive_menu()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Interactive CLI for Polymarket copy bot.")
     sub = parser.add_subparsers(dest="command")
+
+    p_menu = sub.add_parser("menu", help="打开 VPS 本地交互菜单")
+    p_menu.add_argument("--config", default=".env")
 
     p_init = sub.add_parser("init-config", help="交互式生成 .env")
     p_init.add_argument("--config", default=".env")
@@ -480,8 +628,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_validate = sub.add_parser("validate", help="校验配置")
     p_validate.add_argument("--config", default=".env")
 
+    p_test = sub.add_parser("test", help="测试 API、私钥和签名客户端")
+    p_test.add_argument("--config", default=".env")
+
     p_run = sub.add_parser("run", help="本地运行机器人")
     p_run.add_argument("--config", default=".env")
+
+    p_service = sub.add_parser("service", help="管理 VPS 本机 systemd 服务")
+    p_service.add_argument("action", choices=["install", "start", "stop", "restart", "status", "logs"])
+    p_service.add_argument("--service-name", default=DEFAULT_SERVICE)
+    p_service.add_argument("--start-now", action="store_true", help="install 后立即启动/重启服务")
+
+    p_update = sub.add_parser("update", help="在 VPS 本机 git pull 并重启服务")
+    p_update.add_argument("--service-name", default=DEFAULT_SERVICE)
+
+    p_dry = sub.add_parser("set-dry-run", help="设置 DRY_RUN，1=只打印，0=真实下单")
+    p_dry.add_argument("value", choices=["0", "1"])
+    p_dry.add_argument("--config", default=".env")
+    p_dry.add_argument("--restart", action="store_true", help="设置后立即重启服务")
 
     p_install = sub.add_parser("install", help="从 GitHub 安装到 VPS，便于以后远程更新")
     p_install.add_argument("--host", required=True)
@@ -530,13 +694,29 @@ def main(argv: Optional[List[str]] = None) -> None:
         interactive_menu()
         return
 
-    if args.command == "init-config":
+    if args.command == "menu":
+        local_interactive_menu(Path(args.config))
+    elif args.command == "init-config":
         init_config(Path(args.config))
     elif args.command == "validate":
         ok = print_config_summary(Path(args.config))
         raise SystemExit(0 if ok else 1)
+    elif args.command == "test":
+        ok = test_api_config(Path(args.config))
+        raise SystemExit(0 if ok else 1)
     elif args.command == "run":
         run_bot(Path(args.config))
+    elif args.command == "service":
+        if args.action == "install":
+            install_local_service(local_install_dir(), args.service_name, start_now=args.start_now)
+        else:
+            local_service_action(args.action, args.service_name)
+    elif args.command == "update":
+        update_program(args.service_name)
+    elif args.command == "set-dry-run":
+        update_dry_run(Path(args.config), args.value)
+        if args.restart:
+            local_service_action("restart")
     elif args.command == "install":
         install_from_git(
             host=args.host,

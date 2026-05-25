@@ -15,6 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
+jy = "polymarket_copy.cli:main"
 jy-cli = "polymarket_copy.cli:main"
 polymarket-copy-bot = "polymarket_copy.bot:main"
 
