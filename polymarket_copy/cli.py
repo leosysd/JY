@@ -598,6 +598,7 @@ def update_program(service_name: str = DEFAULT_SERVICE) -> None:
     except subprocess.CalledProcessError as exc:
         print(f"[WARN] 程序已更新，但服务重启失败，退出码 {exc.returncode}")
     print("[OK] 程序更新完成")
+    print("[INFO] 当前菜单进程仍是更新前版本。请退出后重新运行 jy 使用新版菜单。")
 
 
 def test_api_config(config_path: Path) -> bool:
@@ -710,6 +711,8 @@ def local_interactive_menu(config_path: Path = Path(".env")) -> None:
                 local_service_action("disable-autostart")
             elif choice == "14":
                 update_program()
+                print("[INFO] 请重新运行 jy。")
+                return
             elif choice == "0":
                 return
             else:
