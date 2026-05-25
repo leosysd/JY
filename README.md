@@ -64,7 +64,7 @@ jy
 菜单 `1. 初始化/修改交易配置` 会设置：
 
 - `PRIVATE_KEY`: 你自己的交易钱包私钥，用来本地签名订单。
-- `DEPOSIT_WALLET_ADDRESS`: 你自己的 Polymarket Deposit Wallet 地址。
+- `DEPOSIT_WALLET_ADDRESS`: 你的 Polymarket funder/API 地址，也就是 CLOB 下单时实际持有资金和仓位的钱包地址。
 - `CLOB_API_URL`: 默认 `https://clob.polymarket.com`。
 - `SIGNATURE_TYPE`: 新 API 用户通常用 `3`。
 - `COPY_RATIO`: 跟单比例。
@@ -73,6 +73,8 @@ jy
 - `TARGET_USERNAME` / `TARGET_WALLET`: 目标账号。
 
 Polymarket CLOB 的 `apiKey / secret / passphrase` 会由 SDK 根据 `PRIVATE_KEY` 自动派生。你一般不需要手动填写 Relayer API Key。
+
+如果 `jy test` 里看到 SDK 打印过 `Could not create api key`，但最后仍显示 `CLOB API 凭证可自动派生`，通常表示 SDK 创建新 key 的尝试返回提示，但已经成功派生或加载了可用凭证。
 
 私钥只保存在 VPS 的：
 

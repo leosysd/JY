@@ -85,7 +85,7 @@ def load_config(config_path: Optional[Path] = None) -> CopyBotConfig:
 
     target_username = _env("TARGET_USERNAME", DEFAULT_TARGET_USERNAME).lstrip("@")
     state_default = f"seen_{target_username}.json"
-    funder = _env("DEPOSIT_WALLET_ADDRESS") or _env("FUNDER")
+    funder = _env("DEPOSIT_WALLET_ADDRESS") or _env("FUNDER_ADDRESS") or _env("FUNDER")
 
     return CopyBotConfig(
         target_username=target_username,
@@ -125,10 +125,10 @@ def validate_config(config: CopyBotConfig, require_private_key: bool = False) ->
     elif config.private_key and not looks_like_private_key(config.private_key):
         warnings.append("PRIVATE_KEY 看起来不是 64 字节十六进制私钥")
     if config.signature_type == 3 and not config.deposit_wallet_address:
-        errors.append("SIGNATURE_TYPE=3 时必须设置 DEPOSIT_WALLET_ADDRESS")
+        errors.append("SIGNATURE_TYPE=3 时必须设置 DEPOSIT_WALLET_ADDRESS / FUNDER_ADDRESS")
     if config.signature_type == 3 and config.deposit_wallet_address:
         if not is_eth_address(config.deposit_wallet_address):
-            errors.append("DEPOSIT_WALLET_ADDRESS 看起来不是合法 0x 钱包地址")
+            errors.append("DEPOSIT_WALLET_ADDRESS / FUNDER_ADDRESS 看起来不是合法 0x 钱包地址")
     if config.copy_ratio <= 0:
         errors.append("COPY_RATIO 必须大于 0")
     if config.poll_sec <= 0:

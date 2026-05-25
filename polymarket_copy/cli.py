@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
+import io
 import os
 import shlex
 import subprocess
@@ -99,7 +101,7 @@ def init_config(config_path: Path) -> None:
             existing.get("SIGNATURE_TYPE", "3"),
         ),
         "DEPOSIT_WALLET_ADDRESS": prompt_text(
-            "你的 Deposit Wallet 地址",
+            "你的 Funder/API 地址 DEPOSIT_WALLET_ADDRESS",
             existing.get("DEPOSIT_WALLET_ADDRESS", ""),
         ),
         "POLL_SEC": prompt_text("轮询间隔秒数 POLL_SEC", existing.get("POLL_SEC", "1")),
@@ -130,7 +132,7 @@ def print_config_summary(config_path: Path, require_private_key: Optional[bool] 
     print(f"跟单比例: {config.copy_ratio}")
     print(f"轮询间隔: {config.poll_sec}s")
     print(f"私钥: {config.masked_private_key}")
-    print(f"Deposit Wallet: {config.deposit_wallet_address or '<empty>'}")
+    print(f"Funder/API 地址: {config.deposit_wallet_address or '<empty>'}")
     for warning in warnings:
         print(f"[WARN] {warning}")
     for error in errors:
@@ -531,10 +533,21 @@ def test_api_config(config_path: Path) -> bool:
                     f"tick_size={book.get('tick_size')} min_order_size={book.get('min_order_size')}"
                 )
         if config.private_key:
+            sdk_output = io.StringIO()
             try:
-                bot.build_client()
+                with contextlib.redirect_stdout(sdk_output), contextlib.redirect_stderr(sdk_output):
+                    bot.build_client()
+                captured = sdk_output.getvalue().strip()
+                if captured:
+                    if "Could not create api key" in captured or "/auth/api-key" in captured:
+                        print("[INFO] SDK 创建新 API key 的尝试有提示，但已成功派生/加载可用凭证。")
+                    else:
+                        print(f"[INFO] SDK 输出: {captured}")
                 print("[OK] CLOB API 凭证可自动派生，签名客户端初始化成功")
             except Exception as exc:
+                captured = sdk_output.getvalue().strip()
+                if captured:
+                    print(f"[INFO] SDK 输出: {captured}")
                 print(f"[ERROR] CLOB 签名/认证测试失败: {exc}")
                 return False
         else:
