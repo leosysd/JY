@@ -8,6 +8,7 @@
 - 使用 CLOB API 获取订单簿参数并下单。
 - 对 HTTP `429`、`5xx`、网络抖动做自动退避和重试。
 - 对 `/book` 做短缓存，并默认启用 Polymarket Market WebSocket 维护近期 asset 的盘口参数，减少发现成交后的 HTTP 请求。
+- 默认 `PRICE_MODE=safe`，按目标成交价加最大滑点下单，盘口超过保护价就跳过，避免 0.99/0.01 强制成交造成大滑点。
 - 默认 `DRY_RUN=1`，先只打印不真实下单。
 - VPS 一键安装，安装后直接用 `jy` 打开交互菜单。
 
@@ -42,8 +43,9 @@ jy
 10. 切换 DRY_RUN
 11. 修改跟单比例 COPY_RATIO
 12. 修改目标用户/钱包
-13. 关闭开机自启
-14. 更新程序
+13. 修改价格保护
+14. 关闭开机自启
+15. 更新程序
 0. 退出
 ```
 
@@ -71,6 +73,9 @@ jy
 - `COPY_RATIO`: 跟单比例。
 - `POLL_SEC`: 监听间隔。
 - `DRY_RUN`: `1` 只打印，`0` 真实下单。
+- `PRICE_MODE`: 默认 `safe`，使用目标成交价 + 最大滑点；`aggressive` 会恢复 0.99/0.01 强制成交，不建议实盘使用。
+- `MAX_SLIPPAGE`: 默认 `0.02`，表示最多比目标成交价差 2 分。
+- `MAX_ORDER_USDC`: 默认 `0` 不限制；大于 0 时限制单笔跟单最大名义金额。
 - `TARGET_USERNAME` / `TARGET_WALLET`: 目标账号。
 - `ENABLE_MARKET_WS`: 默认 `1`，启用 Market WebSocket 盘口缓存。
 - `MARKET_WS_URL`: 默认 `wss://ws-subscriptions-clob.polymarket.com/ws/market`。
@@ -135,6 +140,12 @@ jy set-dry-run 0 --restart
 jy set-dry-run 1 --restart
 ```
 
+设置价格保护：
+
+```bash
+jy set-price-protection --mode safe --max-slippage 0.02 --max-order-usdc 0 --restart
+```
+
 ## VPS 部署结果
 
 默认部署到：
@@ -157,13 +168,13 @@ journalctl -u polymarket-copy -f
 systemctl restart polymarket-copy
 ```
 
-默认不开机自启。菜单 `13. 关闭开机自启` 或下面命令可关闭已有自启：
+默认不开机自启。菜单 `14. 关闭开机自启` 或下面命令可关闭已有自启：
 
 ```bash
 jy service disable-autostart
 ```
 
-菜单 `14. 更新程序` 或 `jy update` 会执行：
+菜单 `15. 更新程序` 或 `jy update` 会执行：
 
 - `git pull --ff-only`
 - 更新 Python 依赖

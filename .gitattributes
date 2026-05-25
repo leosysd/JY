@@ -3,3 +3,5 @@
 *.toml text eol=lf
 *.md text eol=lf
 *.txt text eol=lf
+.gitattributes text eol=lf
+.env.example text eol=lf

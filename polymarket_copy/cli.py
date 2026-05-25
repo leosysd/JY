@@ -124,6 +124,9 @@ def init_config(config_path: Path) -> None:
         ),
         "POLL_SEC": prompt_text("轮询间隔秒数 POLL_SEC", existing.get("POLL_SEC", "1")),
         "COPY_RATIO": prompt_text("跟单比例 COPY_RATIO", existing.get("COPY_RATIO", "1.0")),
+        "PRICE_MODE": prompt_text("价格保护 PRICE_MODE，safe=保护价格，aggressive=强制成交", existing.get("PRICE_MODE", "safe")),
+        "MAX_SLIPPAGE": prompt_text("最大滑点 MAX_SLIPPAGE，0.02=2分钱", existing.get("MAX_SLIPPAGE", "0.02")),
+        "MAX_ORDER_USDC": prompt_text("单笔最大金额 MAX_ORDER_USDC，0=不限制", existing.get("MAX_ORDER_USDC", "0")),
         "DRY_RUN": "1" if prompt_yes_no("先使用 DRY_RUN 只打印不下单吗", True) else "0",
         "STATE_FILE": existing.get("STATE_FILE", f"seen_{target_username}.json"),
         "ACTIVITY_LIMIT": existing.get("ACTIVITY_LIMIT", "100"),
@@ -154,6 +157,7 @@ def print_config_summary(config_path: Path, require_private_key: Optional[bool] 
     print(f"目标: @{config.target_username} / {config.target_wallet}")
     print(f"模式: {config.mode_label}")
     print(f"跟单比例: {config.copy_ratio}")
+    print(f"价格保护: {config.price_mode}, 最大滑点: {config.max_slippage}, 单笔上限: {config.max_order_usdc} USDC")
     print(f"轮询间隔: {config.poll_sec}s")
     print(f"Market WS: {'开启' if config.enable_market_ws else '关闭'}")
     print(f"私钥: {config.masked_private_key}")
@@ -555,7 +559,9 @@ def menu_status_line(config_path: Path, service_name: str = DEFAULT_SERVICE) -> 
         return f"服务: {service_state} | 配置: 读取失败 ({exc})"
     return (
         f"服务: {service_state} | 配置: {config_status_text(errors, warnings)} | "
-        f"模式: {mode_status_text(config.mode_label)} | 目标: {color_text('@' + config.target_username, ANSI_CYAN)}"
+        f"模式: {mode_status_text(config.mode_label)} | "
+        f"价格: {config.price_mode}/{config.max_slippage} | "
+        f"目标: {color_text('@' + config.target_username, ANSI_CYAN)}"
     )
 
 
@@ -583,6 +589,31 @@ def update_copy_ratio(config_path: Path) -> None:
     value = prompt_text("新的跟单比例 COPY_RATIO", existing.get("COPY_RATIO", "1.0"))
     set_env_value(config_path, "COPY_RATIO", value)
     print(f"[OK] COPY_RATIO={value}")
+
+
+def update_price_protection(config_path: Path) -> None:
+    existing = load_existing_env(config_path)
+    mode = prompt_text(
+        "价格模式 PRICE_MODE，safe=保护价格，aggressive=强制成交",
+        existing.get("PRICE_MODE", "safe"),
+    ).lower()
+    if mode not in {"safe", "aggressive"}:
+        raise SystemExit("PRICE_MODE 必须是 safe 或 aggressive")
+    slippage = prompt_text(
+        "最大滑点 MAX_SLIPPAGE，0.02=2分钱",
+        existing.get("MAX_SLIPPAGE", "0.02"),
+    )
+    max_usdc = prompt_text(
+        "单笔最大金额 MAX_ORDER_USDC，0=不限制",
+        existing.get("MAX_ORDER_USDC", "0"),
+    )
+    set_env_value(config_path, "PRICE_MODE", mode)
+    set_env_value(config_path, "MAX_SLIPPAGE", slippage)
+    set_env_value(config_path, "MAX_ORDER_USDC", max_usdc)
+    print(
+        f"[OK] PRICE_MODE={mode}, MAX_SLIPPAGE={slippage}, "
+        f"MAX_ORDER_USDC={max_usdc}"
+    )
 
 
 def update_target(config_path: Path) -> None:
@@ -643,6 +674,12 @@ def test_api_config(config_path: Path) -> bool:
             f"{'开启' if config.enable_market_ws else '关闭'} "
             f"{config.market_ws_url if config.enable_market_ws else ''}".strip()
         )
+        print(
+            "[OK] 价格保护: "
+            f"PRICE_MODE={config.price_mode}, "
+            f"MAX_SLIPPAGE={config.max_slippage}, "
+            f"MAX_ORDER_USDC={config.max_order_usdc}"
+        )
         activities = bot.fetch_activity(wallet, limit=3)
         print(f"[OK] Data API 可访问，最近 TRADE 数量: {len(activities)}")
         if activities:
@@ -696,8 +733,9 @@ def local_interactive_menu(config_path: Path = Path(".env")) -> None:
         print("10. 切换 DRY_RUN")
         print("11. 修改跟单比例 COPY_RATIO")
         print("12. 修改目标用户/钱包")
-        print("13. 关闭开机自启")
-        print("14. 更新程序")
+        print("13. 修改价格保护")
+        print("14. 关闭开机自启")
+        print("15. 更新程序")
         print("0. 退出")
         choice = input("请选择: ").strip()
         try:
@@ -733,8 +771,12 @@ def local_interactive_menu(config_path: Path = Path(".env")) -> None:
                 if prompt_yes_no("是否立即重启服务让配置生效", True):
                     local_service_action("restart")
             elif choice == "13":
-                local_service_action("disable-autostart")
+                update_price_protection(config_path)
+                if prompt_yes_no("是否立即重启服务让配置生效", True):
+                    local_service_action("restart")
             elif choice == "14":
+                local_service_action("disable-autostart")
+            elif choice == "15":
                 update_program()
                 print("[INFO] 请重新运行 jy。")
                 return
@@ -789,6 +831,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_dry.add_argument("value", choices=["0", "1"])
     p_dry.add_argument("--config", default=".env")
     p_dry.add_argument("--restart", action="store_true", help="设置后立即重启服务")
+
+    p_price = sub.add_parser("set-price-protection", help="设置价格保护和滑点")
+    p_price.add_argument("--config", default=".env")
+    p_price.add_argument("--mode", choices=["safe", "aggressive"])
+    p_price.add_argument("--max-slippage")
+    p_price.add_argument("--max-order-usdc")
+    p_price.add_argument("--restart", action="store_true", help="设置后立即重启服务")
 
     p_install = sub.add_parser("install", help="从 GitHub 安装到 VPS，便于以后远程更新")
     p_install.add_argument("--host", required=True)
@@ -858,6 +907,18 @@ def main(argv: Optional[List[str]] = None) -> None:
         update_program(args.service_name)
     elif args.command == "set-dry-run":
         update_dry_run(Path(args.config), args.value)
+        if args.restart:
+            local_service_action("restart")
+    elif args.command == "set-price-protection":
+        config_path = Path(args.config)
+        if args.mode is None and args.max_slippage is None and args.max_order_usdc is None:
+            update_price_protection(config_path)
+        else:
+            existing = load_existing_env(config_path)
+            set_env_value(config_path, "PRICE_MODE", args.mode or existing.get("PRICE_MODE", "safe"))
+            set_env_value(config_path, "MAX_SLIPPAGE", args.max_slippage or existing.get("MAX_SLIPPAGE", "0.02"))
+            set_env_value(config_path, "MAX_ORDER_USDC", args.max_order_usdc or existing.get("MAX_ORDER_USDC", "0"))
+            print("[OK] 价格保护配置已更新")
         if args.restart:
             local_service_action("restart")
     elif args.command == "install":

@@ -7,7 +7,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from decimal import Decimal, getcontext
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, getcontext
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -119,6 +119,14 @@ class SeenStore:
 class BookCacheEntry:
     loaded_at: float
     book: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class PriceDecision:
+    price: Decimal
+    best_price: Optional[Decimal]
+    best_label: str
+    reason: str
 
 
 class BookCache:
@@ -515,7 +523,42 @@ class PolymarketCopyBot:
             )
             return
 
-        price = aggressive_price(side_raw, tick_size)
+        target_price = decimal_value(trade.get("price"))
+        decision = choose_copy_price(
+            side_raw,
+            target_price,
+            book,
+            tick_size,
+            self.config.price_mode,
+            self.config.max_slippage,
+        )
+        if decision is None:
+            print(
+                "[SKIP] price protection: "
+                f"side={side_raw} title={trade.get('title')} "
+                f"outcome={trade.get('outcome')} target_price={target_price} "
+                f"max_slippage={self.config.max_slippage}"
+            )
+            return
+
+        price = decision.price
+        capped_size = apply_max_order_usdc(copy_size, price, self.config.max_order_usdc)
+        if capped_size != copy_size:
+            print(
+                "[CAP] MAX_ORDER_USDC: "
+                f"copy_size={copy_size} -> {capped_size}, "
+                f"price={price}, max_order_usdc={self.config.max_order_usdc}"
+            )
+            copy_size = capped_size
+            if copy_size < min_order_size:
+                print(
+                    "[SKIP] MAX_ORDER_USDC below min_order_size: "
+                    f"copy_size={copy_size}, min_order_size={min_order_size}, "
+                    f"title={trade.get('title')}"
+                )
+                return
+
+        best_text = decision.best_price if decision.best_price is not None else "n/a"
         print(
             f"[COPY {side_raw}] "
             f"title={trade.get('title')} | "
@@ -523,8 +566,10 @@ class PolymarketCopyBot:
             f"asset={token_id} | "
             f"target_size={target_size} | "
             f"copy_size={copy_size} | "
-            f"target_price={trade.get('price')} | "
-            f"copy_limit_price={price}"
+            f"target_price={target_price} | "
+            f"{decision.best_label}={best_text} | "
+            f"copy_limit_price={price} | "
+            f"price_mode={self.config.price_mode}"
         )
 
         if self.config.dry_run:
@@ -614,6 +659,91 @@ def aggressive_price(side: str, tick_size: Decimal) -> Decimal:
     if side == "BUY":
         return Decimal("1") - tick_size
     return tick_size
+
+
+def choose_copy_price(
+    side: str,
+    target_price: Decimal,
+    book: Dict[str, Any],
+    tick_size: Decimal,
+    price_mode: str,
+    max_slippage: Decimal,
+) -> Optional[PriceDecision]:
+    if price_mode == "aggressive":
+        return PriceDecision(
+            price=aggressive_price(side, tick_size),
+            best_price=best_book_price(book, side),
+            best_label=best_price_label(side),
+            reason="aggressive",
+        )
+
+    safe_price = protected_limit_price(side, target_price, tick_size, max_slippage)
+    best_price = best_book_price(book, side)
+    best_label = best_price_label(side)
+    if best_price is None:
+        return None
+    if side == "BUY" and best_price > safe_price:
+        return None
+    if side == "SELL" and best_price < safe_price:
+        return None
+    return PriceDecision(
+        price=safe_price,
+        best_price=best_price,
+        best_label=best_label,
+        reason="safe",
+    )
+
+
+def protected_limit_price(
+    side: str,
+    target_price: Decimal,
+    tick_size: Decimal,
+    max_slippage: Decimal,
+) -> Decimal:
+    if side == "BUY":
+        raw_price = target_price + max_slippage
+        rounded = round_price_to_tick(raw_price, tick_size, ROUND_CEILING)
+        return min(max(rounded, tick_size), Decimal("1") - tick_size)
+    raw_price = target_price - max_slippage
+    rounded = round_price_to_tick(raw_price, tick_size, ROUND_FLOOR)
+    return min(max(rounded, tick_size), Decimal("1") - tick_size)
+
+
+def round_price_to_tick(price: Decimal, tick_size: Decimal, rounding: str) -> Decimal:
+    if tick_size <= 0:
+        tick_size = Decimal("0.01")
+    ticks = (price / tick_size).to_integral_value(rounding=rounding)
+    return ticks * tick_size
+
+
+def best_price_label(side: str) -> str:
+    return "best_ask" if side == "BUY" else "best_bid"
+
+
+def best_book_price(book: Dict[str, Any], side: str) -> Optional[Decimal]:
+    levels = book.get("asks") if side == "BUY" else book.get("bids")
+    if not isinstance(levels, list) or not levels:
+        return None
+    prices: List[Decimal] = []
+    for level in levels:
+        if not isinstance(level, dict) or level.get("price") in {None, ""}:
+            continue
+        try:
+            prices.append(decimal_value(level["price"]))
+        except Exception:
+            continue
+    if not prices:
+        return None
+    return min(prices) if side == "BUY" else max(prices)
+
+
+def apply_max_order_usdc(copy_size: Decimal, price: Decimal, max_order_usdc: Decimal) -> Decimal:
+    if max_order_usdc <= 0 or price <= 0:
+        return copy_size
+    estimated_usdc = copy_size * price
+    if estimated_usdc <= max_order_usdc:
+        return copy_size
+    return (max_order_usdc / price).quantize(Decimal("0.000001"), rounding=ROUND_FLOOR)
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:

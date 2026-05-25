@@ -50,6 +50,9 @@ class CopyBotConfig:
     deposit_wallet_address: str = ""
     poll_sec: float = 1.0
     copy_ratio: Decimal = Decimal("1.0")
+    price_mode: str = "safe"
+    max_slippage: Decimal = Decimal("0.02")
+    max_order_usdc: Decimal = Decimal("0")
     dry_run: bool = True
     state_file: Path = Path("seen_jetfadil.json")
     activity_limit: int = 100
@@ -95,6 +98,10 @@ def load_config(config_path: Optional[Path] = None) -> CopyBotConfig:
     target_username = _env("TARGET_USERNAME", DEFAULT_TARGET_USERNAME).lstrip("@")
     state_default = f"seen_{target_username}.json"
     funder = _env("DEPOSIT_WALLET_ADDRESS") or _env("FUNDER_ADDRESS") or _env("FUNDER")
+    max_slippage = _env("MAX_SLIPPAGE")
+    if not max_slippage:
+        max_slippage_bps = _env("MAX_SLIPPAGE_BPS")
+        max_slippage = str(Decimal(max_slippage_bps) / Decimal("10000")) if max_slippage_bps else "0.02"
 
     return CopyBotConfig(
         target_username=target_username,
@@ -106,6 +113,9 @@ def load_config(config_path: Optional[Path] = None) -> CopyBotConfig:
         deposit_wallet_address=funder,
         poll_sec=float(_env("POLL_SEC", "1")),
         copy_ratio=Decimal(_env("COPY_RATIO", "1.0")),
+        price_mode=_env("PRICE_MODE", "safe").lower(),
+        max_slippage=Decimal(max_slippage),
+        max_order_usdc=Decimal(_env("MAX_ORDER_USDC", "0")),
         dry_run=parse_bool(_env("DRY_RUN", "1"), default=True),
         state_file=Path(_env("STATE_FILE", state_default)),
         activity_limit=int(_env("ACTIVITY_LIMIT", "100")),
@@ -151,6 +161,16 @@ def validate_config(config: CopyBotConfig, require_private_key: bool = False) ->
             errors.append("DEPOSIT_WALLET_ADDRESS / FUNDER_ADDRESS 看起来不是合法 0x 钱包地址")
     if config.copy_ratio <= 0:
         errors.append("COPY_RATIO 必须大于 0")
+    if config.price_mode not in {"safe", "aggressive"}:
+        errors.append("PRICE_MODE 必须是 safe 或 aggressive")
+    if config.max_slippage < 0:
+        errors.append("MAX_SLIPPAGE 必须大于等于 0")
+    if config.max_slippage >= 1:
+        errors.append("MAX_SLIPPAGE 必须小于 1")
+    if config.price_mode == "aggressive":
+        warnings.append("PRICE_MODE=aggressive 会使用 0.99/0.01 激进限价，滑点风险很高")
+    if config.max_order_usdc < 0:
+        errors.append("MAX_ORDER_USDC 必须大于等于 0")
     if config.poll_sec <= 0:
         errors.append("POLL_SEC 必须大于 0")
     if config.poll_sec < 0.5:
@@ -177,6 +197,9 @@ def env_lines(values: Dict[str, str]) -> List[str]:
         "DEPOSIT_WALLET_ADDRESS",
         "POLL_SEC",
         "COPY_RATIO",
+        "PRICE_MODE",
+        "MAX_SLIPPAGE",
+        "MAX_ORDER_USDC",
         "DRY_RUN",
         "STATE_FILE",
         "ACTIVITY_LIMIT",
