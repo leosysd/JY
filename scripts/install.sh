@@ -68,6 +68,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$INSTALL_DIR
 EnvironmentFile=$INSTALL_DIR/.env
+Environment=PYTHONUNBUFFERED=1
 ExecStart=$INSTALL_DIR/venv/bin/polymarket-copy-bot --config $INSTALL_DIR/.env
 Restart=always
 RestartSec=3

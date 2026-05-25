@@ -188,6 +188,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory={remote_dir}
 EnvironmentFile={remote_dir}/.env
+Environment=PYTHONUNBUFFERED=1
 ExecStart={remote_dir}/venv/bin/polymarket-copy-bot --config {remote_dir}/.env
 Restart=always
 RestartSec=3
