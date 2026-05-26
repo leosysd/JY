@@ -1076,8 +1076,9 @@ class PolymarketQuantBot:
             return None
 
         candidates, candidate_records = self.build_lock_candidates(market, snapshot, position_before, bankroll_before)
-        selected = self.select_lock_candidate(candidates, include_rejected=self.config.dry_run)
-        if selected is None:
+        selected = self.select_lock_candidate(candidates)
+        rejected_sample = self.select_lock_candidate(candidates, include_rejected=True) if self.config.dry_run else None
+        if selected is None and rejected_sample is None:
             self.log_throttled(
                 "[AI LOCK] "
                 f"{market.title} 暂无锁利/补单候选，cost={position_before['total_cost']} "
@@ -1098,40 +1099,46 @@ class PolymarketQuantBot:
                 force=self.config.dry_run,
             )
             return None
-        selected_rejections = list(selected.get("dry_run_rejections") or [])
+        log_sample = selected or rejected_sample
+        selected_rejections = list(log_sample.get("dry_run_rejections") or []) if log_sample else []
         all_rejections = dry_run_rejections + [
             reason for reason in selected_rejections if reason not in dry_run_rejections
         ]
-        selected_score = selected.get("score")
+        selected_score = log_sample.get("score") if log_sample else None
         if (
             self.config.dry_run
             and isinstance(selected_score, tuple)
             and selected_score[0] <= 0
         ):
-            weak_reason = str(selected.get("reason") or "weak_candidate")
+            weak_reason = str(log_sample.get("reason") or "weak_candidate")
             if weak_reason not in all_rejections:
                 all_rejections.append(weak_reason)
         if all_rejections:
-            selected = dict(selected)
-            selected["dry_run_rejections"] = all_rejections
+            log_sample = dict(log_sample or {})
+            log_sample["dry_run_rejections"] = all_rejections
+            position_after = log_sample.get("position_after", position_before)
             self.record_lock_signal(
                 market,
                 snapshot,
                 action="would_skip",
                 reason=",".join(all_rejections),
                 candidates=candidate_records,
-                selected=selected.get("decision"),
-                selected_meta=lock_candidate_payload(selected),
+                selected=log_sample.get("decision"),
+                selected_meta=lock_candidate_payload(log_sample),
                 position_before=position_before,
-                position_after=selected.get("position_after", position_before),
+                position_after=position_after,
                 bankroll_before=bankroll_before,
                 bankroll_after=self.lock_bankroll_snapshot(
                     market.slug,
-                    selected.get("position_after", position_before)["total_cost"],
-                    selected.get("position_after", position_before)["worst_pnl"],
+                    position_after["total_cost"],
+                    position_after["worst_pnl"],
                 ),
                 force=True,
             )
+            if self.config.dry_run:
+                return None
+        if selected is None:
+            return None
 
         return self.execute_lock_plan(
             market,
@@ -1183,6 +1190,7 @@ class PolymarketQuantBot:
     ) -> Optional[QuantDecision]:
         decision = selected["decision"]
         legs = self.lock_plan_legs(selected)
+        paper_legs = self.paper_lock_plan_legs(selected)
         position_after = selected["position_after"]
         bankroll_after = self.lock_bankroll_snapshot(
             market.slug,
@@ -1194,7 +1202,8 @@ class PolymarketQuantBot:
         print(
             "[AI LOCK BUY] "
             f"mode=DRY_RUN market={decision.market.title} legs={len(legs)} "
-            f"outcome={decision.outcome} size={decision.size} price={decision.limit_price} "
+            f"outcome={decision.outcome} size={decision.size} "
+            f"fill={selected.get('expected_fill_price', decision.best_ask)} limit={decision.limit_price} "
             f"cost={selected['notional']} edge={decision.edge} "
             f"up_pnl={position_after['up_pnl']} down_pnl={position_after['down_pnl']} "
             f"total_cost={position_after['total_cost']} trades={position_after['trade_count']} "
@@ -1216,7 +1225,7 @@ class PolymarketQuantBot:
             force=True,
         )
         running_position = position_before
-        for index, leg in enumerate(legs):
+        for index, leg in enumerate(paper_legs):
             running_position = lock_position_after_trade(
                 running_position,
                 leg.outcome,
@@ -1228,7 +1237,7 @@ class PolymarketQuantBot:
                 leg,
                 mode="dry_run",
                 position_after=running_position,
-                locked_after=locked_after if index == len(legs) - 1 else False,
+                locked_after=locked_after if index == len(paper_legs) - 1 else False,
                 reason=reason,
                 status="paper",
             )
@@ -1413,6 +1422,32 @@ class PolymarketQuantBot:
         decision = selected.get("decision")
         return [decision] if isinstance(decision, QuantDecision) else []
 
+    def paper_lock_plan_legs(self, selected: Dict[str, Any]) -> List[QuantDecision]:
+        fill_prices = selected.get("expected_fill_prices")
+        if not isinstance(fill_prices, dict):
+            fill_prices = {}
+        fallback_fill = selected.get("expected_fill_price")
+        paper_legs: List[QuantDecision] = []
+        for leg in self.lock_plan_legs(selected):
+            fill_price = fill_prices.get(leg.outcome, fallback_fill)
+            if not isinstance(fill_price, Decimal):
+                fill_price = leg.best_ask
+            paper_legs.append(
+                QuantDecision(
+                    market=leg.market,
+                    outcome=leg.outcome,
+                    token_id=leg.token_id,
+                    probability=leg.probability,
+                    best_ask=leg.best_ask,
+                    raw_edge=leg.raw_edge,
+                    edge=leg.edge,
+                    limit_price=fill_price,
+                    size=leg.size,
+                    reason=f"{leg.reason} | paper_fill={fill_price} limit={leg.limit_price}",
+                )
+            )
+        return paper_legs
+
     def build_lock_candidates(
         self,
         market: QuantMarket,
@@ -1454,12 +1489,13 @@ class PolymarketQuantBot:
                 continue
             tick_size = decimal_value(book.get("tick_size", "0.01"))
             limit_price = protected_limit_price("BUY", best_ask, tick_size, self.config.max_slippage)
+            expected_fill_price = best_ask
             raw_edge = probability - best_ask
             edge = probability - limit_price
             if self.config.quant_size_mode == "shares":
                 size = self.config.quant_order_shares.quantize(Decimal("0.000001"), rounding=ROUND_FLOOR)
             else:
-                size = (self.config.quant_order_usdc / limit_price).quantize(
+                size = (self.config.quant_order_usdc / expected_fill_price).quantize(
                     Decimal("0.000001"),
                     rounding=ROUND_FLOOR,
                 )
@@ -1482,9 +1518,10 @@ class PolymarketQuantBot:
                     }
                 )
                 continue
-            notional = (size * limit_price).quantize(Decimal("0.0001"))
+            notional = (size * expected_fill_price).quantize(Decimal("0.0001"))
+            max_notional = (size * limit_price).quantize(Decimal("0.0001"))
             dry_run_rejections: List[str] = []
-            if notional > budget_remaining:
+            if max_notional > budget_remaining:
                 if self.config.dry_run:
                     dry_run_rejections.append("budget_cap_reached")
                 else:
@@ -1497,8 +1534,10 @@ class PolymarketQuantBot:
                             "raw_edge": raw_edge.quantize(Decimal("0.0001")),
                             "edge": edge.quantize(Decimal("0.0001")),
                             "limit_price": limit_price,
+                            "expected_fill_price": expected_fill_price,
                             "size": size,
                             "notional": notional,
+                            "max_notional": max_notional,
                             "budget_remaining": budget_remaining,
                             "market_budget_remaining": market_budget_remaining,
                             "bankroll_before": lock_bankroll_payload(bankroll_before),
@@ -1509,7 +1548,7 @@ class PolymarketQuantBot:
                     )
                     continue
 
-            position_after = lock_position_after_trade(position_before, outcome, size, limit_price)
+            position_after = lock_position_after_trade(position_before, outcome, size, expected_fill_price)
             improvement = position_after["worst_pnl"] - position_before["worst_pnl"]
             would_lock = position_after["worst_pnl"] >= self.config.quant_lock_min_profit
             open_worst_after = bankroll_before["other_unsettled_worst_pnl"] + position_after["worst_pnl"]
@@ -1538,8 +1577,10 @@ class PolymarketQuantBot:
                             "raw_edge": raw_edge.quantize(Decimal("0.0001")),
                             "edge": edge.quantize(Decimal("0.0001")),
                             "limit_price": limit_price,
+                            "expected_fill_price": expected_fill_price,
                             "size": size,
                             "notional": notional,
+                            "max_notional": max_notional,
                             "risk_drawdown_after": risk_drawdown_after.quantize(Decimal("0.0001")),
                             "max_drawdown_usdc": self.config.quant_max_drawdown_usdc,
                             "position_after": lock_position_payload(position_after),
@@ -1577,6 +1618,8 @@ class PolymarketQuantBot:
                 "reason": reason,
                 "score": score,
                 "notional": notional,
+                "max_notional": max_notional,
+                "expected_fill_price": expected_fill_price,
                 "position_after": position_after,
                 "improvement_worst_pnl": improvement,
                 "would_lock": would_lock,
@@ -1622,15 +1665,17 @@ class PolymarketQuantBot:
         sum_limit = up_decision.limit_price + down_decision.limit_price
         if sum_limit >= Decimal("1"):
             return None
-        notional = (size * sum_limit).quantize(Decimal("0.0001"))
-        market_cost_after = position_before["total_cost"] + notional
+        sum_fill = up_decision.best_ask + down_decision.best_ask
+        notional = (size * sum_fill).quantize(Decimal("0.0001"))
+        max_notional = (size * sum_limit).quantize(Decimal("0.0001"))
+        market_cost_after = position_before["total_cost"] + max_notional
         dry_run_rejections: List[str] = []
         if market_cost_after > self.config.quant_market_max_usdc:
             if self.config.dry_run:
                 dry_run_rejections.append("market_cap_reached")
             else:
                 return None
-        if notional > bankroll_before["available_to_add"]:
+        if max_notional > bankroll_before["available_to_add"]:
             if self.config.dry_run:
                 dry_run_rejections.append("bankroll_cap_reached")
             else:
@@ -1659,8 +1704,8 @@ class PolymarketQuantBot:
             size=size,
             reason="pure_arbitrage_down_leg",
         )
-        position_after_up = lock_position_after_trade(position_before, "Up", size, up_leg.limit_price)
-        position_after = lock_position_after_trade(position_after_up, "Down", size, down_leg.limit_price)
+        position_after_up = lock_position_after_trade(position_before, "Up", size, up_leg.best_ask)
+        position_after = lock_position_after_trade(position_after_up, "Down", size, down_leg.best_ask)
         expected_worst_profit = position_after["worst_pnl"] - position_before["worst_pnl"]
         return {
             "decision": up_leg,
@@ -1668,6 +1713,11 @@ class PolymarketQuantBot:
             "reason": "pure_arbitrage",
             "score": (Decimal("5"), expected_worst_profit, arb_edge, -notional),
             "notional": notional,
+            "max_notional": max_notional,
+            "expected_fill_prices": {
+                up_leg.outcome: up_leg.best_ask,
+                down_leg.outcome: down_leg.best_ask,
+            },
             "position_after": position_after,
             "improvement_worst_pnl": expected_worst_profit,
             "would_lock": position_after["worst_pnl"] >= self.config.quant_lock_min_profit,
@@ -1727,6 +1777,7 @@ class PolymarketQuantBot:
             for item in candidates
             if isinstance(item.get("score"), tuple)
             and (include_rejected or item["score"][0] > 0)
+            and (include_rejected or not item.get("dry_run_rejections"))
         ]
         if not usable:
             return None
@@ -2012,6 +2063,9 @@ def lock_candidate_payload(item: Dict[str, Any]) -> Dict[str, Any]:
         "limit_price": decision.limit_price,
         "size": decision.size,
         "notional": item.get("notional"),
+        "max_notional": item.get("max_notional"),
+        "expected_fill_price": item.get("expected_fill_price"),
+        "expected_fill_prices": item.get("expected_fill_prices"),
         "reason": item.get("reason"),
         "improvement_worst_pnl": item.get("improvement_worst_pnl"),
         "would_lock": bool(item.get("would_lock")),
