@@ -44,6 +44,52 @@ from .config import (
 DEFAULT_REMOTE_DIR = "/opt/polymarket-copy"
 DEFAULT_SERVICE = "polymarket-copy"
 DEFAULT_REPO_URL = "https://github.com/leosysd/JY.git"
+QUANT_PRESETS: Dict[str, Dict[str, str]] = {
+    "safe": {
+        "BOT_MODE": "quant",
+        "DRY_RUN": "1",
+        "QUANT_STRATEGY": "lock",
+        "QUANT_SIZE_MODE": "shares",
+        "QUANT_ORDER_SHARES": "5",
+        "QUANT_CAPITAL_USDC": "300",
+        "QUANT_MARKET_MAX_USDC": "60",
+        "QUANT_MAX_TRADES_PER_MARKET": "2",
+        "QUANT_REBUY_COOLDOWN_SEC": "20",
+        "QUANT_LOCK_MIN_PROFIT": "0.50",
+        "QUANT_LOCK_STOP_ON_LOCK": "1",
+        "QUANT_ARBITRAGE_MIN_PROFIT": "0.01",
+        "QUANT_MIN_EDGE": "0.08",
+        "QUANT_MIN_SECONDS_LEFT": "10",
+        "QUANT_MAX_SECONDS_LEFT": "60",
+        "QUANT_MAX_DRAWDOWN_USDC": "0",
+        "QUANT_COOLDOWN_SEC": "60",
+        "QUANT_RECORD_SIGNALS": "1",
+        "QUANT_SIGNAL_INTERVAL_SEC": "5",
+    },
+    "jetfadil": {
+        "BOT_MODE": "quant",
+        "DRY_RUN": "1",
+        "QUANT_STRATEGY": "lock",
+        "QUANT_SIZE_MODE": "shares",
+        "QUANT_ORDER_SHARES": "20",
+        "QUANT_CAPITAL_USDC": "300",
+        "QUANT_MARKET_MAX_USDC": "300",
+        "QUANT_MAX_TRADES_PER_MARKET": "16",
+        "QUANT_REBUY_COOLDOWN_SEC": "3",
+        "QUANT_LOCK_MIN_PROFIT": "0.20",
+        "QUANT_LOCK_STOP_ON_LOCK": "0",
+        "QUANT_ARBITRAGE_MIN_PROFIT": "0.005",
+        "QUANT_MIN_EDGE": "0.02",
+        "QUANT_MIN_SECONDS_LEFT": "3",
+        "QUANT_MAX_SECONDS_LEFT": "295",
+        "QUANT_MAX_DRAWDOWN_USDC": "0",
+        "QUANT_COOLDOWN_SEC": "3",
+        "QUANT_RECORD_SIGNALS": "1",
+        "QUANT_SIGNAL_INTERVAL_SEC": "2",
+        "MAX_SLIPPAGE": "0.03",
+        "MAX_ORDER_USDC": "0",
+    },
+}
 DEFAULT_REPO_BRANCH = "main"
 ANSI_RESET = "\033[0m"
 ANSI_GREEN = "\033[32m"
@@ -782,6 +828,20 @@ def update_quant_config(config_path: Path) -> None:
     print("[OK] AI量化参数已更新")
 
 
+def apply_quant_preset(config_path: Path, preset: str) -> None:
+    values = QUANT_PRESETS.get(preset)
+    if values is None:
+        raise SystemExit(f"未知预设: {preset}")
+    if not config_path.exists():
+        config_path.write_text("", encoding="utf-8")
+    for key, value in values.items():
+        set_env_value(config_path, key, value)
+    if preset == "jetfadil":
+        print("[OK] 已应用 JetFadil 风格模拟预设：20份额、多笔、双边库存锁利、300U 本金上限、DRY_RUN=1")
+    else:
+        print("[OK] 已应用安全模拟预设：末段入场、低频、DRY_RUN=1")
+
+
 def quant_once(config_path: Path) -> None:
     from .quant import PolymarketQuantBot
 
@@ -1106,6 +1166,7 @@ def local_interactive_menu(config_path: Path = Path(".env")) -> None:
         print("21. 查看 AI量化数据统计")
         print("22. 查看 AI量化数据")
         print("23. 清空 AI量化数据")
+        print("24. 应用 JetFadil 风格量化预设")
         print("0. 退出")
         choice = input("请选择: ").strip()
         try:
@@ -1170,6 +1231,10 @@ def local_interactive_menu(config_path: Path = Path(".env")) -> None:
                 tail_quant_data(config_path)
             elif choice == "23":
                 clear_quant_data(config_path)
+            elif choice == "24":
+                apply_quant_preset(config_path, "jetfadil")
+                if prompt_yes_no("是否立即重启服务让配置生效", True):
+                    local_service_action("restart")
             elif choice == "0":
                 return
             else:
@@ -1264,6 +1329,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_quant.add_argument("--signal-file")
     p_quant.add_argument("--signal-interval-sec")
     p_quant.add_argument("--restart", action="store_true", help="设置后立即重启服务")
+
+    p_quant_preset = sub.add_parser("set-quant-preset", help="应用 AI量化预设参数")
+    p_quant_preset.add_argument("preset", choices=sorted(QUANT_PRESETS))
+    p_quant_preset.add_argument("--config", default=".env")
+    p_quant_preset.add_argument("--restart", action="store_true", help="设置后立即重启服务")
 
     p_quant_once = sub.add_parser("quant-once", help="AI量化单次试算，不真实下单")
     p_quant_once.add_argument("--config", default=".env")
@@ -1365,6 +1435,10 @@ def main(argv: Optional[List[str]] = None) -> None:
             local_service_action("restart")
     elif args.command == "set-bot-mode":
         update_bot_mode(Path(args.config), args.value)
+        if args.restart:
+            local_service_action("restart")
+    elif args.command == "set-quant-preset":
+        apply_quant_preset(Path(args.config), args.preset)
         if args.restart:
             local_service_action("restart")
     elif args.command == "set-quant-config":
