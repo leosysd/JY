@@ -18,7 +18,6 @@ from .bot import (
     apply_max_order_usdc,
     best_book_price,
     decimal_value,
-    protected_limit_price,
 )
 from .config import CopyBotConfig, validate_config
 
@@ -540,7 +539,7 @@ class PolymarketQuantBot:
             "[AI QUANT BUY] "
             f"mode={mode} market={decision.market.title} outcome={decision.outcome} "
             f"prob={decision.probability} best_ask={decision.best_ask} "
-            f"edge={decision.edge} limit={decision.limit_price} size={decision.size} "
+            f"edge={decision.edge} price={decision.best_ask} size={decision.size} "
             f"ret_start={snapshot.ret_from_start} ret_1m={snapshot.ret_1m} "
             f"seconds_left={market.seconds_left} reason={decision.reason}"
         )
@@ -664,7 +663,7 @@ class PolymarketQuantBot:
         review: Dict[str, Any] = {
             "outcome": decision.outcome,
             "token_id": decision.token_id,
-            "original_limit_price": decision.limit_price,
+            "original_price": decision.limit_price,
             "size": decision.size,
         }
         try:
@@ -676,11 +675,10 @@ class PolymarketQuantBot:
                 return None, review
             tick_size = decimal_value(book.get("tick_size", "0.01"))
             min_order_size = decimal_value(book.get("min_order_size", "1"))
-            refreshed_limit = protected_limit_price("BUY", best_ask, tick_size, self.config.max_slippage)
             review.update(
                 {
                     "best_ask": best_ask,
-                    "refreshed_limit_price": refreshed_limit,
+                    "refreshed_price": best_ask,
                     "tick_size": tick_size,
                     "min_order_size": min_order_size,
                 }
@@ -689,10 +687,6 @@ class PolymarketQuantBot:
                 review["valid"] = False
                 review["skip_reason"] = "size_below_min_order"
                 return None, review
-            if refreshed_limit > decision.limit_price:
-                review["valid"] = False
-                review["skip_reason"] = "price_worse_after_review"
-                return None, review
             reviewed = QuantDecision(
                 market=decision.market,
                 outcome=decision.outcome,
@@ -700,8 +694,8 @@ class PolymarketQuantBot:
                 probability=decision.probability,
                 best_ask=best_ask,
                 raw_edge=(decision.probability - best_ask).quantize(Decimal("0.0001")),
-                edge=(decision.probability - refreshed_limit).quantize(Decimal("0.0001")),
-                limit_price=refreshed_limit,
+                edge=(decision.probability - best_ask).quantize(Decimal("0.0001")),
+                limit_price=best_ask,
                 size=decision.size,
                 reason=f"{decision.reason} | second_review",
             )
@@ -770,15 +764,14 @@ class PolymarketQuantBot:
                     }
                 )
                 continue
-            tick_size = decimal_value(book.get("tick_size", "0.01"))
-            limit_price = protected_limit_price("BUY", best_ask, tick_size, self.config.max_slippage)
+            limit_price = best_ask
             raw_edge = probability - best_ask
-            edge = probability - limit_price
-            size = (self.config.quant_order_usdc / limit_price).quantize(
+            edge = raw_edge
+            size = (self.config.quant_order_usdc / best_ask).quantize(
                 Decimal("0.000001"),
                 rounding=ROUND_FLOOR,
             )
-            size = apply_max_order_usdc(size, limit_price, self.config.max_order_usdc)
+            size = apply_max_order_usdc(size, best_ask, self.config.max_order_usdc)
             min_order_size = decimal_value(book.get("min_order_size", "1"))
             if size < min_order_size:
                 self.log_throttled(
@@ -812,7 +805,7 @@ class PolymarketQuantBot:
                 size=size,
                 reason=(
                     f"p({outcome})={probability.quantize(Decimal('0.0001'))} "
-                    f"> limit={limit_price} + effective_edge={edge.quantize(Decimal('0.0001'))}"
+                    f"> ask={best_ask} + edge={edge.quantize(Decimal('0.0001'))}"
                 ),
             )
             candidates.append(decision)
@@ -1202,8 +1195,7 @@ class PolymarketQuantBot:
         print(
             "[AI LOCK BUY] "
             f"mode=DRY_RUN market={decision.market.title} legs={len(legs)} "
-            f"outcome={decision.outcome} size={decision.size} "
-            f"fill={selected.get('expected_fill_price', decision.best_ask)} limit={decision.limit_price} "
+            f"outcome={decision.outcome} size={decision.size} price={decision.best_ask} "
             f"cost={selected['notional']} edge={decision.edge} "
             f"up_pnl={position_after['up_pnl']} down_pnl={position_after['down_pnl']} "
             f"total_cost={position_after['total_cost']} trades={position_after['trade_count']} "
@@ -1383,18 +1375,15 @@ class PolymarketQuantBot:
             return None, review_records
         if str(selected.get("reason")) == "pure_arbitrage" and len(reviewed_legs) == 2:
             sum_ask = reviewed_legs[0].best_ask + reviewed_legs[1].best_ask
-            sum_limit = reviewed_legs[0].limit_price + reviewed_legs[1].limit_price
             review_records.append(
                 {
                     "review_type": "pure_arbitrage",
                     "sum_ask": sum_ask,
-                    "sum_limit": sum_limit,
                     "min_profit": self.config.quant_arbitrage_min_profit,
-                    "valid": sum_ask < Decimal("1") - self.config.quant_arbitrage_min_profit
-                    and sum_limit < Decimal("1"),
+                    "valid": sum_ask < Decimal("1") - self.config.quant_arbitrage_min_profit,
                 }
             )
-            if sum_ask >= Decimal("1") - self.config.quant_arbitrage_min_profit or sum_limit >= Decimal("1"):
+            if sum_ask >= Decimal("1") - self.config.quant_arbitrage_min_profit:
                 return None, review_records
         position_after = position_before
         notional = Decimal("0")
@@ -1423,15 +1412,8 @@ class PolymarketQuantBot:
         return [decision] if isinstance(decision, QuantDecision) else []
 
     def paper_lock_plan_legs(self, selected: Dict[str, Any]) -> List[QuantDecision]:
-        fill_prices = selected.get("expected_fill_prices")
-        if not isinstance(fill_prices, dict):
-            fill_prices = {}
-        fallback_fill = selected.get("expected_fill_price")
         paper_legs: List[QuantDecision] = []
         for leg in self.lock_plan_legs(selected):
-            fill_price = fill_prices.get(leg.outcome, fallback_fill)
-            if not isinstance(fill_price, Decimal):
-                fill_price = leg.best_ask
             paper_legs.append(
                 QuantDecision(
                     market=leg.market,
@@ -1441,9 +1423,9 @@ class PolymarketQuantBot:
                     best_ask=leg.best_ask,
                     raw_edge=leg.raw_edge,
                     edge=leg.edge,
-                    limit_price=fill_price,
+                    limit_price=leg.best_ask,
                     size=leg.size,
-                    reason=f"{leg.reason} | paper_fill={fill_price} limit={leg.limit_price}",
+                    reason=f"{leg.reason} | paper_price={leg.best_ask}",
                 )
             )
         return paper_legs
@@ -1487,19 +1469,17 @@ class PolymarketQuantBot:
                     }
                 )
                 continue
-            tick_size = decimal_value(book.get("tick_size", "0.01"))
-            limit_price = protected_limit_price("BUY", best_ask, tick_size, self.config.max_slippage)
-            expected_fill_price = best_ask
+            limit_price = best_ask
             raw_edge = probability - best_ask
-            edge = probability - limit_price
+            edge = raw_edge
             if self.config.quant_size_mode == "shares":
                 size = self.config.quant_order_shares.quantize(Decimal("0.000001"), rounding=ROUND_FLOOR)
             else:
-                size = (self.config.quant_order_usdc / expected_fill_price).quantize(
+                size = (self.config.quant_order_usdc / best_ask).quantize(
                     Decimal("0.000001"),
                     rounding=ROUND_FLOOR,
                 )
-            size = apply_max_order_usdc(size, limit_price, self.config.max_order_usdc)
+            size = apply_max_order_usdc(size, best_ask, self.config.max_order_usdc)
             min_order_size = decimal_value(book.get("min_order_size", "1"))
             if size < min_order_size:
                 candidate_records.append(
@@ -1518,8 +1498,8 @@ class PolymarketQuantBot:
                     }
                 )
                 continue
-            notional = (size * expected_fill_price).quantize(Decimal("0.0001"))
-            max_notional = (size * limit_price).quantize(Decimal("0.0001"))
+            notional = (size * best_ask).quantize(Decimal("0.0001"))
+            max_notional = notional
             dry_run_rejections: List[str] = []
             if max_notional > budget_remaining:
                 if self.config.dry_run:
@@ -1534,7 +1514,6 @@ class PolymarketQuantBot:
                             "raw_edge": raw_edge.quantize(Decimal("0.0001")),
                             "edge": edge.quantize(Decimal("0.0001")),
                             "limit_price": limit_price,
-                            "expected_fill_price": expected_fill_price,
                             "size": size,
                             "notional": notional,
                             "max_notional": max_notional,
@@ -1548,7 +1527,7 @@ class PolymarketQuantBot:
                     )
                     continue
 
-            position_after = lock_position_after_trade(position_before, outcome, size, expected_fill_price)
+            position_after = lock_position_after_trade(position_before, outcome, size, best_ask)
             improvement = position_after["worst_pnl"] - position_before["worst_pnl"]
             would_lock = position_after["worst_pnl"] >= self.config.quant_lock_min_profit
             open_worst_after = bankroll_before["other_unsettled_worst_pnl"] + position_after["worst_pnl"]
@@ -1577,7 +1556,6 @@ class PolymarketQuantBot:
                             "raw_edge": raw_edge.quantize(Decimal("0.0001")),
                             "edge": edge.quantize(Decimal("0.0001")),
                             "limit_price": limit_price,
-                            "expected_fill_price": expected_fill_price,
                             "size": size,
                             "notional": notional,
                             "max_notional": max_notional,
@@ -1602,7 +1580,7 @@ class PolymarketQuantBot:
                 size=size,
                 reason=(
                     f"lock_model p({outcome})={probability.quantize(Decimal('0.0001'))} "
-                    f"limit={limit_price} effective_edge={edge.quantize(Decimal('0.0001'))}"
+                    f"ask={best_ask} edge={edge.quantize(Decimal('0.0001'))}"
                 ),
             )
             reason, score = self.score_lock_candidate(
@@ -1619,7 +1597,6 @@ class PolymarketQuantBot:
                 "score": score,
                 "notional": notional,
                 "max_notional": max_notional,
-                "expected_fill_price": expected_fill_price,
                 "position_after": position_after,
                 "improvement_worst_pnl": improvement,
                 "would_lock": would_lock,
@@ -1662,13 +1639,10 @@ class PolymarketQuantBot:
         size = min(up_decision.size, down_decision.size).quantize(Decimal("0.000001"), rounding=ROUND_FLOOR)
         if size <= 0:
             return None
-        sum_limit = up_decision.limit_price + down_decision.limit_price
-        if sum_limit >= Decimal("1"):
-            return None
         sum_fill = up_decision.best_ask + down_decision.best_ask
         notional = (size * sum_fill).quantize(Decimal("0.0001"))
-        max_notional = (size * sum_limit).quantize(Decimal("0.0001"))
-        market_cost_after = position_before["total_cost"] + max_notional
+        max_notional = notional
+        market_cost_after = position_before["total_cost"] + notional
         dry_run_rejections: List[str] = []
         if market_cost_after > self.config.quant_market_max_usdc:
             if self.config.dry_run:
@@ -1688,7 +1662,7 @@ class PolymarketQuantBot:
             best_ask=up_decision.best_ask,
             raw_edge=up_decision.raw_edge,
             edge=up_decision.edge,
-            limit_price=up_decision.limit_price,
+            limit_price=up_decision.best_ask,
             size=size,
             reason="pure_arbitrage_up_leg",
         )
@@ -1700,7 +1674,7 @@ class PolymarketQuantBot:
             best_ask=down_decision.best_ask,
             raw_edge=down_decision.raw_edge,
             edge=down_decision.edge,
-            limit_price=down_decision.limit_price,
+            limit_price=down_decision.best_ask,
             size=size,
             reason="pure_arbitrage_down_leg",
         )
@@ -1714,15 +1688,10 @@ class PolymarketQuantBot:
             "score": (Decimal("5"), expected_worst_profit, arb_edge, -notional),
             "notional": notional,
             "max_notional": max_notional,
-            "expected_fill_prices": {
-                up_leg.outcome: up_leg.best_ask,
-                down_leg.outcome: down_leg.best_ask,
-            },
             "position_after": position_after,
             "improvement_worst_pnl": expected_worst_profit,
             "would_lock": position_after["worst_pnl"] >= self.config.quant_lock_min_profit,
             "sum_ask": sum_ask,
-            "sum_limit": sum_limit,
             "arbitrage_edge": arb_edge,
             "dry_run_rejections": dry_run_rejections,
         }
@@ -2064,8 +2033,6 @@ def lock_candidate_payload(item: Dict[str, Any]) -> Dict[str, Any]:
         "size": decision.size,
         "notional": item.get("notional"),
         "max_notional": item.get("max_notional"),
-        "expected_fill_price": item.get("expected_fill_price"),
-        "expected_fill_prices": item.get("expected_fill_prices"),
         "reason": item.get("reason"),
         "improvement_worst_pnl": item.get("improvement_worst_pnl"),
         "would_lock": bool(item.get("would_lock")),
@@ -2073,7 +2040,6 @@ def lock_candidate_payload(item: Dict[str, Any]) -> Dict[str, Any]:
         "position_after": lock_position_payload(item.get("position_after", base_lock_position())),
         "legs": leg_payloads,
         "sum_ask": item.get("sum_ask"),
-        "sum_limit": item.get("sum_limit"),
         "arbitrage_edge": item.get("arbitrage_edge"),
         "dry_run_rejections": item.get("dry_run_rejections", []),
     }

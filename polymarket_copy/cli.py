@@ -86,7 +86,6 @@ QUANT_PRESETS: Dict[str, Dict[str, str]] = {
         "QUANT_COOLDOWN_SEC": "3",
         "QUANT_RECORD_SIGNALS": "1",
         "QUANT_SIGNAL_INTERVAL_SEC": "2",
-        "MAX_SLIPPAGE": "0.03",
         "MAX_ORDER_USDC": "0",
     },
 }
@@ -1031,7 +1030,7 @@ def summarize_quant_data(config_path: Path) -> None:
             print(
                 "  selected="
                 f"{selected.get('outcome')} edge={selected.get('edge')} "
-                f"ask={selected.get('best_ask')} limit={selected.get('limit_price')}"
+                f"price={selected.get('best_ask')}"
             )
 
 
