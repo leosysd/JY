@@ -197,16 +197,15 @@ jy set-dry-run 1 --restart
 jy set-dry-run 0 --restart
 ```
 
-价格保护建议保持默认：
+当前 copy 模式按无脑跟单处理：
 
 ```bash
-jy set-price-protection --mode safe --max-slippage 0.02 --max-order-usdc 0 --restart
+jy set-price-protection --mode aggressive --max-slippage 0.05 --max-order-usdc 0 --restart
 ```
 
 说明：
 
-- `safe`：按目标成交价加最大滑点保护，盘口太差就跳过。
-- `aggressive`：更容易成交，但滑点风险更大，不建议一开始实盘使用。
+- copy 模式会直接使用 0.99/0.01 限价跟单，不再因为 `safe/MAX_SLIPPAGE` 跳过正常订单。
 - `COPY_RATIO`：跟单比例。
 - `MAX_ORDER_USDC`：单笔最大金额，`0` 表示不限制。
 - CLOB `/book` 返回 404 时会自动跳过并标记 seen，避免已失效订单簿无限重试。

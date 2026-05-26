@@ -199,7 +199,10 @@ def print_config_summary(config_path: Path, require_private_key: Optional[bool] 
     print(f"目标: @{config.target_username} / {config.target_wallet}")
     print(f"模式: {config.mode_label}")
     print(f"跟单比例: {config.copy_ratio}")
-    print(f"价格保护: {config.price_mode}, 最大滑点: {config.max_slippage}, 单笔上限: {config.max_order_usdc} USDC")
+    if config.bot_mode == "copy":
+        print(f"价格模式: 无脑跟单, 单笔上限: {config.max_order_usdc} USDC")
+    else:
+        print(f"价格保护: {config.price_mode}, 最大滑点: {config.max_slippage}, 单笔上限: {config.max_order_usdc} USDC")
     print(
         "AI量化: "
         f"{config.quant_symbol}, strategy={config.quant_strategy}, source={config.quant_price_source}, "
@@ -627,11 +630,12 @@ def menu_status_line(config_path: Path, service_name: str = DEFAULT_SERVICE) -> 
         errors, warnings = validate_config(config, require_private_key=not config.dry_run)
     except Exception as exc:
         return f"服务: {service_state} | 配置: 读取失败 ({exc})"
+    price_text = "无脑跟单" if config.bot_mode == "copy" else f"{config.price_mode}/{config.max_slippage}"
     return (
         f"服务: {service_state} | 配置: {config_status_text(errors, warnings)} | "
         f"策略: {config.bot_mode} | "
         f"模式: {mode_status_text(config.mode_label)} | "
-        f"价格: {config.price_mode}/{config.max_slippage} | "
+        f"价格: {price_text} | "
         f"目标: {color_text('@' + config.target_username, ANSI_CYAN)}"
     )
 

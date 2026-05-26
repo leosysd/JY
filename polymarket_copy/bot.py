@@ -611,7 +611,7 @@ class PolymarketCopyBot:
             f"target_price={target_price} | "
             f"{decision.best_label}={best_text} | "
             f"copy_limit_price={price} | "
-            f"price_mode={self.config.price_mode}"
+            f"price_mode=blind"
         )
 
         if self.config.dry_run:
@@ -721,28 +721,11 @@ def choose_copy_price(
     price_mode: str,
     max_slippage: Decimal,
 ) -> Optional[PriceDecision]:
-    if price_mode == "aggressive":
-        return PriceDecision(
-            price=aggressive_price(side, tick_size),
-            best_price=best_book_price(book, side),
-            best_label=best_price_label(side),
-            reason="aggressive",
-        )
-
-    safe_price = protected_limit_price(side, target_price, tick_size, max_slippage)
-    best_price = best_book_price(book, side)
-    best_label = best_price_label(side)
-    if best_price is None:
-        return None
-    if side == "BUY" and best_price > safe_price:
-        return None
-    if side == "SELL" and best_price < safe_price:
-        return None
     return PriceDecision(
-        price=safe_price,
-        best_price=best_price,
-        best_label=best_label,
-        reason="safe",
+        price=aggressive_price(side, tick_size),
+        best_price=best_book_price(book, side),
+        best_label=best_price_label(side),
+        reason="blind",
     )
 
 
