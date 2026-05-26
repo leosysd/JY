@@ -22,6 +22,7 @@ from .config import (
     DEFAULT_CLOB_API_URL,
     DEFAULT_MARKET_WS_URL,
     DEFAULT_POLYMARKET_RTDS_WS_URL,
+    DEFAULT_QUANT_ARBITRAGE_MIN_PROFIT,
     DEFAULT_QUANT_CHAINLINK_MAX_AGE_SEC,
     DEFAULT_QUANT_CHAINLINK_START_TOLERANCE_SEC,
     DEFAULT_QUANT_CHAINLINK_TIMEOUT_SEC,
@@ -181,6 +182,10 @@ def init_config(config_path: Path) -> None:
         "QUANT_REBUY_COOLDOWN_SEC": existing.get("QUANT_REBUY_COOLDOWN_SEC", DEFAULT_QUANT_REBUY_COOLDOWN_SEC),
         "QUANT_LOCK_MIN_PROFIT": existing.get("QUANT_LOCK_MIN_PROFIT", "0.50"),
         "QUANT_LOCK_STOP_ON_LOCK": existing.get("QUANT_LOCK_STOP_ON_LOCK", "1"),
+        "QUANT_ARBITRAGE_MIN_PROFIT": existing.get(
+            "QUANT_ARBITRAGE_MIN_PROFIT",
+            DEFAULT_QUANT_ARBITRAGE_MIN_PROFIT,
+        ),
         "QUANT_MIN_EDGE": existing.get("QUANT_MIN_EDGE", "0.04"),
         "QUANT_MIN_SECONDS_LEFT": existing.get("QUANT_MIN_SECONDS_LEFT", DEFAULT_QUANT_MIN_SECONDS_LEFT),
         "QUANT_MAX_SECONDS_LEFT": existing.get("QUANT_MAX_SECONDS_LEFT", DEFAULT_QUANT_MAX_SECONDS_LEFT),
@@ -218,6 +223,7 @@ def print_config_summary(config_path: Path, require_private_key: Optional[bool] 
         f"size_mode={config.quant_size_mode}, order_usdc={config.quant_order_usdc}, "
         f"order_shares={config.quant_order_shares}, "
         f"min_edge={config.quant_min_edge}, "
+        f"arb_min_profit={config.quant_arbitrage_min_profit}, "
         f"entry_window={config.quant_min_seconds_left}-{config.quant_max_seconds_left}s"
     )
     print(
@@ -756,6 +762,10 @@ def update_quant_config(config_path: Path) -> None:
         "QUANT_REBUY_COOLDOWN_SEC": prompt_text("补单/反手冷却秒数 QUANT_REBUY_COOLDOWN_SEC", existing.get("QUANT_REBUY_COOLDOWN_SEC", DEFAULT_QUANT_REBUY_COOLDOWN_SEC)),
         "QUANT_LOCK_MIN_PROFIT": prompt_text("锁利最低利润 QUANT_LOCK_MIN_PROFIT", existing.get("QUANT_LOCK_MIN_PROFIT", "0.50")),
         "QUANT_LOCK_STOP_ON_LOCK": prompt_text("锁利后停止本市场 QUANT_LOCK_STOP_ON_LOCK，1=停止", existing.get("QUANT_LOCK_STOP_ON_LOCK", "1")),
+        "QUANT_ARBITRAGE_MIN_PROFIT": prompt_text(
+            "纯双边套利每份最低利润 QUANT_ARBITRAGE_MIN_PROFIT",
+            existing.get("QUANT_ARBITRAGE_MIN_PROFIT", DEFAULT_QUANT_ARBITRAGE_MIN_PROFIT),
+        ),
         "QUANT_MIN_EDGE": prompt_text("最小优势 QUANT_MIN_EDGE，0.04=4分钱", existing.get("QUANT_MIN_EDGE", "0.04")),
         "QUANT_MIN_SECONDS_LEFT": prompt_text("最少剩余秒数 QUANT_MIN_SECONDS_LEFT", existing.get("QUANT_MIN_SECONDS_LEFT", DEFAULT_QUANT_MIN_SECONDS_LEFT)),
         "QUANT_MAX_SECONDS_LEFT": prompt_text("最多剩余秒数 QUANT_MAX_SECONDS_LEFT", existing.get("QUANT_MAX_SECONDS_LEFT", DEFAULT_QUANT_MAX_SECONDS_LEFT)),
@@ -1243,6 +1253,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_quant.add_argument("--rebuy-cooldown-sec")
     p_quant.add_argument("--lock-min-profit")
     p_quant.add_argument("--lock-stop-on-lock", choices=["0", "1"])
+    p_quant.add_argument("--arb-min-profit")
     p_quant.add_argument("--min-edge")
     p_quant.add_argument("--min-seconds-left")
     p_quant.add_argument("--max-seconds-left")
@@ -1377,6 +1388,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 args.rebuy_cooldown_sec,
                 args.lock_min_profit,
                 args.lock_stop_on_lock,
+                args.arb_min_profit,
                 args.min_edge,
                 args.min_seconds_left,
                 args.max_seconds_left,
@@ -1458,6 +1470,12 @@ def main(argv: Optional[List[str]] = None) -> None:
                 config_path,
                 "QUANT_LOCK_STOP_ON_LOCK",
                 args.lock_stop_on_lock or existing.get("QUANT_LOCK_STOP_ON_LOCK", "1"),
+            )
+            set_env_value(
+                config_path,
+                "QUANT_ARBITRAGE_MIN_PROFIT",
+                args.arb_min_profit
+                or existing.get("QUANT_ARBITRAGE_MIN_PROFIT", DEFAULT_QUANT_ARBITRAGE_MIN_PROFIT),
             )
             set_env_value(config_path, "QUANT_MIN_EDGE", args.min_edge or existing.get("QUANT_MIN_EDGE", "0.04"))
             set_env_value(

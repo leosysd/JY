@@ -384,6 +384,8 @@ class QuantStateStore:
         position_after: Dict[str, Decimal],
         locked_after: bool,
         reason: str,
+        status: str = "posted",
+        order_response: Optional[Any] = None,
     ) -> None:
         entry = self.lock_market_entry(market)
         now = int(time.time())
@@ -402,13 +404,44 @@ class QuantStateStore:
                 "size": str(decision.size),
                 "cost": str(cost.quantize(Decimal("0.0001"))),
                 "reason": reason,
+                "status": status,
                 "seconds_left": market.seconds_left,
             }
         )
+        if order_response is not None:
+            entry["trades"][-1]["order_response"] = json_safe(order_response)
         entry["locked"] = bool(locked_after)
         entry["last_trade_ts"] = now
         entry["position"] = lock_position_payload(position_after)
         self.state["last_order_ts"] = now
+        self.save()
+
+    def append_lock_order_error(
+        self,
+        market: QuantMarket,
+        decision: QuantDecision,
+        reason: str,
+        error: str,
+        leg_index: int,
+    ) -> None:
+        entry = self.lock_market_entry(market)
+        errors = entry.setdefault("order_errors", [])
+        if not isinstance(errors, list):
+            errors = []
+            entry["order_errors"] = errors
+        errors.append(
+            {
+                "ts": int(time.time()),
+                "reason": reason,
+                "error": error,
+                "leg_index": leg_index,
+                "outcome": decision.outcome,
+                "token_id": decision.token_id,
+                "limit_price": str(decision.limit_price),
+                "size": str(decision.size),
+                "seconds_left": market.seconds_left,
+            }
+        )
         self.save()
 
     def settle_lock_market(self, slug: str, winning_outcome: str, realized_pnl: Decimal) -> None:
@@ -460,6 +493,7 @@ class PolymarketQuantBot:
             f"market_cap={self.config.quant_market_max_usdc} "
             f"max_drawdown={self.config.quant_max_drawdown_usdc} "
             f"min_edge={self.config.quant_min_edge} "
+            f"arb_min_profit={self.config.quant_arbitrage_min_profit} "
             f"entry_window={self.config.quant_min_seconds_left}-{self.config.quant_max_seconds_left}s"
         )
         if self.config.quant_record_signals:
@@ -495,7 +529,7 @@ class PolymarketQuantBot:
             self.log_throttled(f"[AI QUANT] Chainlink 价格暂不可用，跳过本轮: {exc}")
             return None
         if self.config.quant_strategy == "lock":
-            return self.make_lock_decision(market, snapshot)
+            return self.make_lock_decision(market, snapshot, client=client)
 
         decision = self.make_decision(market, snapshot)
         if decision is None:
@@ -514,20 +548,34 @@ class PolymarketQuantBot:
             self.state.mark_market(decision, mode="dry_run")
             return decision
 
-        book = self.book_cache.get_book(decision.token_id)
+        reviewed, review = self.second_review_buy(decision)
+        if reviewed is None:
+            print(f"[AI QUANT SKIP] second_review_failed market={market.title} review={review}")
+            self.record_signal(
+                market,
+                snapshot,
+                "skip",
+                "second_review_failed",
+                [review],
+                selected=decision,
+                force=True,
+            )
+            return None
+
+        book = self.fetch_fresh_book(reviewed.token_id)
         tick_size = decimal_value(book.get("tick_size", "0.01"))
         neg_risk = bool(book.get("neg_risk", market.neg_risk))
         self.order_helper._post_order(  # noqa: SLF001 - shared local order helper
             client,
-            decision.token_id,
-            decision.limit_price,
-            decision.size,
+            reviewed.token_id,
+            reviewed.limit_price,
+            reviewed.size,
             "BUY",
             tick_size,
             neg_risk,
         )
-        self.state.mark_market(decision, mode="live")
-        return decision
+        self.state.mark_market(reviewed, mode="live")
+        return reviewed
 
     def find_current_market(self) -> Optional[QuantMarket]:
         now = int(time.time())
@@ -603,11 +651,69 @@ class PolymarketQuantBot:
             up_probability=up_probability,
         )
 
+    def fetch_fresh_book(self, token_id: str) -> Dict[str, Any]:
+        book = self.http.get_json(
+            f"{self.config.clob_api_url}/book",
+            params={"token_id": token_id},
+        )
+        if self.market_ws:
+            self.market_ws.remember_book(token_id, book)
+        return book
+
+    def second_review_buy(self, decision: QuantDecision) -> Tuple[Optional[QuantDecision], Dict[str, Any]]:
+        review: Dict[str, Any] = {
+            "outcome": decision.outcome,
+            "token_id": decision.token_id,
+            "original_limit_price": decision.limit_price,
+            "size": decision.size,
+        }
+        try:
+            book = self.fetch_fresh_book(decision.token_id)
+            best_ask = best_book_price(book, "BUY")
+            if best_ask is None:
+                review["valid"] = False
+                review["skip_reason"] = "no_best_ask"
+                return None, review
+            tick_size = decimal_value(book.get("tick_size", "0.01"))
+            min_order_size = decimal_value(book.get("min_order_size", "1"))
+            refreshed_limit = protected_limit_price("BUY", best_ask, tick_size, self.config.max_slippage)
+            review.update(
+                {
+                    "best_ask": best_ask,
+                    "refreshed_limit_price": refreshed_limit,
+                    "tick_size": tick_size,
+                    "min_order_size": min_order_size,
+                }
+            )
+            if decision.size < min_order_size:
+                review["valid"] = False
+                review["skip_reason"] = "size_below_min_order"
+                return None, review
+            if refreshed_limit > decision.limit_price:
+                review["valid"] = False
+                review["skip_reason"] = "price_worse_after_review"
+                return None, review
+            reviewed = QuantDecision(
+                market=decision.market,
+                outcome=decision.outcome,
+                token_id=decision.token_id,
+                probability=decision.probability,
+                best_ask=best_ask,
+                raw_edge=(decision.probability - best_ask).quantize(Decimal("0.0001")),
+                edge=(decision.probability - refreshed_limit).quantize(Decimal("0.0001")),
+                limit_price=refreshed_limit,
+                size=decision.size,
+                reason=f"{decision.reason} | second_review",
+            )
+            review["valid"] = True
+            return reviewed, review
+        except Exception as exc:
+            review["valid"] = False
+            review["skip_reason"] = f"review_error:{type(exc).__name__}"
+            review["error"] = repr(exc)
+            return None, review
+
     def make_decision(self, market: QuantMarket, snapshot: BtcSnapshot) -> Optional[QuantDecision]:
-        if self.state.has_market(market.slug):
-            self.log_throttled(f"[AI QUANT] {market.slug} 已有决策记录，本窗口不重复下单。")
-            self.record_signal(market, snapshot, "skip", "market_already_decided", [])
-            return None
         if not self.state.cooldown_ready(self.config.quant_cooldown_sec):
             self.log_throttled("[AI QUANT] 冷却中，暂不下单。")
             self.record_signal(market, snapshot, "skip", "cooldown", [])
@@ -834,9 +940,38 @@ class PolymarketQuantBot:
             "settled_markets": Decimal(settled_count),
         }
 
-    def make_lock_decision(self, market: QuantMarket, snapshot: BtcSnapshot) -> Optional[QuantDecision]:
-        if not self.config.dry_run:
-            raise RuntimeError("QUANT_STRATEGY=lock 第一版只允许 DRY_RUN=1，暂不接实盘下单")
+    def lock_loop_snapshot(self, market: QuantMarket, position: Dict[str, Decimal]) -> Dict[str, Any]:
+        asks: Dict[str, Any] = {
+            "up_ask": None,
+            "down_ask": None,
+            "sum_ask": None,
+            "worst_pnl": position["worst_pnl"],
+            "up_pnl": position["up_pnl"],
+            "down_pnl": position["down_pnl"],
+        }
+        for outcome, token_id in zip(market.outcomes, market.token_ids):
+            key = "up_ask" if outcome == "Up" else "down_ask" if outcome == "Down" else ""
+            if not key:
+                continue
+            try:
+                book = self.book_cache.get_book(token_id)
+                best_ask = best_book_price(book, "BUY")
+                asks[key] = best_ask
+            except Exception as exc:
+                asks[f"{key}_error"] = f"{type(exc).__name__}:{exc}"
+        up_ask = asks.get("up_ask")
+        down_ask = asks.get("down_ask")
+        if isinstance(up_ask, Decimal) and isinstance(down_ask, Decimal):
+            asks["sum_ask"] = up_ask + down_ask
+            asks["pure_arb_edge"] = Decimal("1") - asks["sum_ask"]
+        return asks
+
+    def make_lock_decision(
+        self,
+        market: QuantMarket,
+        snapshot: BtcSnapshot,
+        client: Any = None,
+    ) -> Optional[QuantDecision]:
         self.settle_finished_lock_markets()
         entry = self.state.lock_market_entry(market)
         position_before = lock_position_from_entry(entry)
@@ -979,7 +1114,56 @@ class PolymarketQuantBot:
             )
             return None
 
+        return self.execute_lock_plan(
+            market,
+            snapshot,
+            selected,
+            candidate_records,
+            position_before,
+            bankroll_before,
+            client=client,
+        )
+
+    def execute_lock_plan(
+        self,
+        market: QuantMarket,
+        snapshot: BtcSnapshot,
+        selected: Dict[str, Any],
+        candidate_records: List[Dict[str, Any]],
+        position_before: Dict[str, Decimal],
+        bankroll_before: Dict[str, Decimal],
+        client: Any = None,
+    ) -> Optional[QuantDecision]:
+        if self.config.dry_run:
+            return self.execute_lock_paper(
+                market,
+                snapshot,
+                selected,
+                candidate_records,
+                position_before,
+                bankroll_before,
+            )
+        return self.execute_lock_live(
+            market,
+            snapshot,
+            selected,
+            candidate_records,
+            position_before,
+            bankroll_before,
+            client=client,
+        )
+
+    def execute_lock_paper(
+        self,
+        market: QuantMarket,
+        snapshot: BtcSnapshot,
+        selected: Dict[str, Any],
+        candidate_records: List[Dict[str, Any]],
+        position_before: Dict[str, Decimal],
+        bankroll_before: Dict[str, Decimal],
+    ) -> Optional[QuantDecision]:
         decision = selected["decision"]
+        legs = self.lock_plan_legs(selected)
         position_after = selected["position_after"]
         bankroll_after = self.lock_bankroll_snapshot(
             market.slug,
@@ -990,8 +1174,8 @@ class PolymarketQuantBot:
         reason = str(selected["reason"])
         print(
             "[AI LOCK BUY] "
-            f"mode=DRY_RUN market={decision.market.title} outcome={decision.outcome} "
-            f"size={decision.size} price={decision.limit_price} "
+            f"mode=DRY_RUN market={decision.market.title} legs={len(legs)} "
+            f"outcome={decision.outcome} size={decision.size} price={decision.limit_price} "
             f"cost={selected['notional']} edge={decision.edge} "
             f"up_pnl={position_after['up_pnl']} down_pnl={position_after['down_pnl']} "
             f"total_cost={position_after['total_cost']} trades={position_after['trade_count']} "
@@ -1012,15 +1196,203 @@ class PolymarketQuantBot:
             bankroll_after=bankroll_after,
             force=True,
         )
-        self.state.append_lock_trade(
+        running_position = position_before
+        for index, leg in enumerate(legs):
+            running_position = lock_position_after_trade(
+                running_position,
+                leg.outcome,
+                leg.size,
+                leg.limit_price,
+            )
+            self.state.append_lock_trade(
+                market,
+                leg,
+                mode="dry_run",
+                position_after=running_position,
+                locked_after=locked_after if index == len(legs) - 1 else False,
+                reason=reason,
+                status="paper",
+            )
+        return decision
+
+    def execute_lock_live(
+        self,
+        market: QuantMarket,
+        snapshot: BtcSnapshot,
+        selected: Dict[str, Any],
+        candidate_records: List[Dict[str, Any]],
+        position_before: Dict[str, Decimal],
+        bankroll_before: Dict[str, Decimal],
+        client: Any = None,
+    ) -> Optional[QuantDecision]:
+        if client is None:
+            raise RuntimeError("lock live executor requires an initialized CLOB client")
+        reviewed, review_records = self.review_lock_plan(selected, position_before, bankroll_before)
+        if reviewed is None:
+            self.record_lock_signal(
+                market,
+                snapshot,
+                action="skip",
+                reason="second_review_failed",
+                candidates=candidate_records + review_records,
+                position_before=position_before,
+                position_after=position_before,
+                bankroll_before=bankroll_before,
+                bankroll_after=bankroll_before,
+                selected_meta={"review_records": review_records},
+                force=True,
+            )
+            print(f"[AI LOCK SKIP] second_review_failed market={market.title} review={review_records}")
+            return None
+
+        legs = self.lock_plan_legs(reviewed)
+        decision = reviewed["decision"]
+        reason = str(reviewed["reason"])
+        position_after = reviewed["position_after"]
+        bankroll_after = self.lock_bankroll_snapshot(
+            market.slug,
+            position_after["total_cost"],
+            position_after["worst_pnl"],
+        )
+        locked_after = position_after["worst_pnl"] >= self.config.quant_lock_min_profit
+        running_position = position_before
+        posted_legs = 0
+        for index, leg in enumerate(legs):
+            try:
+                book = self.fetch_fresh_book(leg.token_id)
+                tick_size = decimal_value(book.get("tick_size", "0.01"))
+                neg_risk = bool(book.get("neg_risk", market.neg_risk))
+                response = self.order_helper._post_order(  # noqa: SLF001 - shared local order helper
+                    client,
+                    leg.token_id,
+                    leg.limit_price,
+                    leg.size,
+                    "BUY",
+                    tick_size,
+                    neg_risk,
+                )
+                running_position = lock_position_after_trade(
+                    running_position,
+                    leg.outcome,
+                    leg.size,
+                    leg.limit_price,
+                )
+                self.state.append_lock_trade(
+                    market,
+                    leg,
+                    mode="live",
+                    position_after=running_position,
+                    locked_after=locked_after if index == len(legs) - 1 else False,
+                    reason=reason,
+                    status="posted",
+                    order_response=response,
+                )
+                posted_legs += 1
+            except Exception as exc:
+                fail_reason = "first_leg_failed" if index == 0 else "second_leg_failed"
+                self.state.append_lock_order_error(market, leg, fail_reason, repr(exc), index)
+                self.record_lock_signal(
+                    market,
+                    snapshot,
+                    action="lock_live_error",
+                    reason=fail_reason,
+                    candidates=candidate_records + review_records,
+                    selected=leg,
+                    selected_meta={"posted_legs": posted_legs, "error": repr(exc)},
+                    position_before=position_before,
+                    position_after=running_position,
+                    bankroll_before=bankroll_before,
+                    bankroll_after=self.lock_bankroll_snapshot(
+                        market.slug,
+                        running_position["total_cost"],
+                        running_position["worst_pnl"],
+                    ),
+                    force=True,
+                )
+                print(
+                    "[AI LOCK LIVE ERROR] "
+                    f"market={market.title} reason={fail_reason} posted_legs={posted_legs} error={repr(exc)}"
+                )
+                return legs[0] if posted_legs else None
+
+        print(
+            "[AI LOCK BUY] "
+            f"mode=LIVE market={market.title} legs={len(legs)} cost={reviewed['notional']} "
+            f"up_pnl={position_after['up_pnl']} down_pnl={position_after['down_pnl']} "
+            f"locked={1 if locked_after else 0} reason={reason}"
+        )
+        self.record_lock_signal(
             market,
-            decision,
-            mode="dry_run",
-            position_after=position_after,
-            locked_after=locked_after,
+            snapshot,
+            action="lock_live_buy",
             reason=reason,
+            candidates=candidate_records + review_records,
+            selected=decision,
+            selected_meta=lock_candidate_payload(reviewed) | {"review_records": review_records},
+            position_before=position_before,
+            position_after=position_after,
+            bankroll_before=bankroll_before,
+            bankroll_after=bankroll_after,
+            force=True,
         )
         return decision
+
+    def review_lock_plan(
+        self,
+        selected: Dict[str, Any],
+        position_before: Dict[str, Decimal],
+        bankroll_before: Dict[str, Decimal],
+    ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+        reviewed_legs: List[QuantDecision] = []
+        review_records: List[Dict[str, Any]] = []
+        for leg in self.lock_plan_legs(selected):
+            reviewed, review = self.second_review_buy(leg)
+            review_records.append(review | {"review_type": "lock_leg"})
+            if reviewed is None:
+                return None, review_records
+            reviewed_legs.append(reviewed)
+        if not reviewed_legs:
+            return None, review_records
+        if str(selected.get("reason")) == "pure_arbitrage" and len(reviewed_legs) == 2:
+            sum_ask = reviewed_legs[0].best_ask + reviewed_legs[1].best_ask
+            sum_limit = reviewed_legs[0].limit_price + reviewed_legs[1].limit_price
+            review_records.append(
+                {
+                    "review_type": "pure_arbitrage",
+                    "sum_ask": sum_ask,
+                    "sum_limit": sum_limit,
+                    "min_profit": self.config.quant_arbitrage_min_profit,
+                    "valid": sum_ask < Decimal("1") - self.config.quant_arbitrage_min_profit
+                    and sum_limit < Decimal("1"),
+                }
+            )
+            if sum_ask >= Decimal("1") - self.config.quant_arbitrage_min_profit or sum_limit >= Decimal("1"):
+                return None, review_records
+        position_after = position_before
+        notional = Decimal("0")
+        for leg in reviewed_legs:
+            position_after = lock_position_after_trade(position_after, leg.outcome, leg.size, leg.limit_price)
+            notional += leg.size * leg.limit_price
+        if position_after["total_cost"] > self.config.quant_market_max_usdc:
+            review_records.append({"review_type": "budget", "valid": False, "skip_reason": "market_cap_reached"})
+            return None, review_records
+        if notional > bankroll_before["available_to_add"]:
+            review_records.append({"review_type": "budget", "valid": False, "skip_reason": "bankroll_cap_reached"})
+            return None, review_records
+        reviewed = dict(selected)
+        reviewed["legs"] = reviewed_legs
+        reviewed["decision"] = reviewed_legs[0]
+        reviewed["position_after"] = position_after
+        reviewed["notional"] = notional.quantize(Decimal("0.0001"))
+        reviewed["improvement_worst_pnl"] = position_after["worst_pnl"] - position_before["worst_pnl"]
+        return reviewed, review_records
+
+    def lock_plan_legs(self, selected: Dict[str, Any]) -> List[QuantDecision]:
+        legs = selected.get("legs")
+        if isinstance(legs, list) and all(isinstance(leg, QuantDecision) for leg in legs):
+            return legs
+        decision = selected.get("decision")
+        return [decision] if isinstance(decision, QuantDecision) else []
 
     def build_lock_candidates(
         self,
@@ -1031,6 +1403,7 @@ class PolymarketQuantBot:
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         candidates: List[Dict[str, Any]] = []
         candidate_records: List[Dict[str, Any]] = []
+        outcome_items: Dict[str, Dict[str, Any]] = {}
         market_budget_remaining = self.config.quant_market_max_usdc - position_before["total_cost"]
         budget_remaining = min(bankroll_before["available_to_add"], market_budget_remaining)
         for outcome, token_id in zip(market.outcomes, market.token_ids):
@@ -1174,6 +1547,7 @@ class PolymarketQuantBot:
             )
             item = {
                 "decision": decision,
+                "legs": [decision],
                 "reason": reason,
                 "score": score,
                 "notional": notional,
@@ -1181,9 +1555,85 @@ class PolymarketQuantBot:
                 "improvement_worst_pnl": improvement,
                 "would_lock": would_lock,
             }
+            outcome_items[outcome] = item
             candidates.append(item)
             candidate_records.append(lock_candidate_payload(item) | {"valid": True})
+        arb_item = self.detect_pure_arbitrage(position_before, bankroll_before, outcome_items)
+        if arb_item is not None:
+            candidates.append(arb_item)
+            candidate_records.append(lock_candidate_payload(arb_item) | {"valid": True})
         return candidates, candidate_records
+
+    def detect_pure_arbitrage(
+        self,
+        position_before: Dict[str, Decimal],
+        bankroll_before: Dict[str, Decimal],
+        outcome_items: Dict[str, Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        up_item = outcome_items.get("Up")
+        down_item = outcome_items.get("Down")
+        if up_item is None or down_item is None:
+            return None
+        up_decision = up_item.get("decision")
+        down_decision = down_item.get("decision")
+        if not isinstance(up_decision, QuantDecision) or not isinstance(down_decision, QuantDecision):
+            return None
+        sum_ask = up_decision.best_ask + down_decision.best_ask
+        arb_edge = Decimal("1") - sum_ask
+        if sum_ask >= Decimal("1") - self.config.quant_arbitrage_min_profit:
+            return None
+        size = min(up_decision.size, down_decision.size).quantize(Decimal("0.000001"), rounding=ROUND_FLOOR)
+        if size <= 0:
+            return None
+        sum_limit = up_decision.limit_price + down_decision.limit_price
+        if sum_limit >= Decimal("1"):
+            return None
+        notional = (size * sum_limit).quantize(Decimal("0.0001"))
+        market_cost_after = position_before["total_cost"] + notional
+        if market_cost_after > self.config.quant_market_max_usdc:
+            return None
+        if notional > bankroll_before["available_to_add"]:
+            return None
+        up_leg = QuantDecision(
+            market=up_decision.market,
+            outcome=up_decision.outcome,
+            token_id=up_decision.token_id,
+            probability=up_decision.probability,
+            best_ask=up_decision.best_ask,
+            raw_edge=up_decision.raw_edge,
+            edge=up_decision.edge,
+            limit_price=up_decision.limit_price,
+            size=size,
+            reason="pure_arbitrage_up_leg",
+        )
+        down_leg = QuantDecision(
+            market=down_decision.market,
+            outcome=down_decision.outcome,
+            token_id=down_decision.token_id,
+            probability=down_decision.probability,
+            best_ask=down_decision.best_ask,
+            raw_edge=down_decision.raw_edge,
+            edge=down_decision.edge,
+            limit_price=down_decision.limit_price,
+            size=size,
+            reason="pure_arbitrage_down_leg",
+        )
+        position_after_up = lock_position_after_trade(position_before, "Up", size, up_leg.limit_price)
+        position_after = lock_position_after_trade(position_after_up, "Down", size, down_leg.limit_price)
+        expected_worst_profit = position_after["worst_pnl"] - position_before["worst_pnl"]
+        return {
+            "decision": up_leg,
+            "legs": [up_leg, down_leg],
+            "reason": "pure_arbitrage",
+            "score": (Decimal("5"), expected_worst_profit, arb_edge, -notional),
+            "notional": notional,
+            "position_after": position_after,
+            "improvement_worst_pnl": expected_worst_profit,
+            "would_lock": position_after["worst_pnl"] >= self.config.quant_lock_min_profit,
+            "sum_ask": sum_ask,
+            "sum_limit": sum_limit,
+            "arbitrage_edge": arb_edge,
+        }
 
     def score_lock_candidate(
         self,
@@ -1198,15 +1648,15 @@ class PolymarketQuantBot:
                 "lock_profit",
                 (Decimal("4"), position_after["worst_pnl"], improvement, decision.edge),
             )
+        if self.detect_inventory_lock(position_before, position_after):
+            return (
+                "inventory_lock",
+                (Decimal("3"), improvement, position_after["worst_pnl"], -position_after["total_cost"]),
+            )
         if decision.edge < self.config.quant_min_edge:
             return (
                 "weak_candidate",
                 (Decimal("0"), decision.edge, improvement, -position_after["total_cost"]),
-            )
-        if improvement > 0:
-            return (
-                "improve_worst_pnl",
-                (Decimal("3"), improvement, decision.edge, decision.probability),
             )
         if position_before["trade_count"] == 0:
             return (
@@ -1217,6 +1667,13 @@ class PolymarketQuantBot:
             "weak_candidate",
             (Decimal("0"), decision.edge, improvement, -position_after["total_cost"]),
         )
+
+    def detect_inventory_lock(
+        self,
+        position_before: Dict[str, Decimal],
+        position_after: Dict[str, Decimal],
+    ) -> bool:
+        return position_before["trade_count"] > 0 and position_after["worst_pnl"] > position_before["worst_pnl"]
 
     def select_lock_candidate(self, candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         usable = [
@@ -1242,9 +1699,12 @@ class PolymarketQuantBot:
         bankroll_after: Dict[str, Decimal],
         selected: Optional[QuantDecision] = None,
         selected_meta: Optional[Dict[str, Any]] = None,
+        market_snapshot: Optional[Dict[str, Any]] = None,
         force: bool = False,
     ) -> None:
         now = datetime.now(timezone.utc)
+        if market_snapshot is None:
+            market_snapshot = self.lock_loop_snapshot(market, position_before)
         record: Dict[str, Any] = {
             "ts": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
             "unix_ts": int(now.timestamp()),
@@ -1278,6 +1738,7 @@ class PolymarketQuantBot:
             "position_after": lock_position_payload(position_after),
             "bankroll_before": lock_bankroll_payload(bankroll_before),
             "bankroll_after": lock_bankroll_payload(bankroll_after),
+            "market_snapshot": market_snapshot,
             "config": {
                 "size_mode": self.config.quant_size_mode,
                 "order_usdc": self.config.quant_order_usdc,
@@ -1288,6 +1749,7 @@ class PolymarketQuantBot:
                 "rebuy_cooldown_sec": self.config.quant_rebuy_cooldown_sec,
                 "lock_min_profit": self.config.quant_lock_min_profit,
                 "lock_stop_on_lock": self.config.quant_lock_stop_on_lock,
+                "arbitrage_min_profit": self.config.quant_arbitrage_min_profit,
                 "min_edge": self.config.quant_min_edge,
                 "min_seconds_left": self.config.quant_min_seconds_left,
                 "max_seconds_left": self.config.quant_max_seconds_left,
@@ -1339,6 +1801,7 @@ class PolymarketQuantBot:
                 "ret_3m": snapshot.ret_3m,
                 "up_probability": snapshot.up_probability,
             },
+            "market_snapshot": self.lock_loop_snapshot(market, base_lock_position()),
             "config": {
                 "strategy": self.config.quant_strategy,
                 "size_mode": self.config.quant_size_mode,
@@ -1489,6 +1952,10 @@ def lock_candidate_payload(item: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(decision, QuantDecision):
         return {}
     score = item.get("score")
+    legs = item.get("legs")
+    leg_payloads: List[Dict[str, Any]] = []
+    if isinstance(legs, list):
+        leg_payloads = [decision_payload_from_dataclass(leg) for leg in legs if isinstance(leg, QuantDecision)]
     return {
         "outcome": decision.outcome,
         "token_id": decision.token_id,
@@ -1504,6 +1971,24 @@ def lock_candidate_payload(item: Dict[str, Any]) -> Dict[str, Any]:
         "would_lock": bool(item.get("would_lock")),
         "score": list(score) if isinstance(score, tuple) else score,
         "position_after": lock_position_payload(item.get("position_after", base_lock_position())),
+        "legs": leg_payloads,
+        "sum_ask": item.get("sum_ask"),
+        "sum_limit": item.get("sum_limit"),
+        "arbitrage_edge": item.get("arbitrage_edge"),
+    }
+
+
+def decision_payload_from_dataclass(decision: QuantDecision) -> Dict[str, Any]:
+    return {
+        "outcome": decision.outcome,
+        "token_id": decision.token_id,
+        "probability": decision.probability,
+        "best_ask": decision.best_ask,
+        "raw_edge": decision.raw_edge,
+        "edge": decision.edge,
+        "limit_price": decision.limit_price,
+        "size": decision.size,
+        "reason": decision.reason,
     }
 
 

@@ -627,7 +627,7 @@ class PolymarketCopyBot:
         side_raw: str,
         tick_size: Decimal,
         neg_risk: bool,
-    ) -> None:
+    ) -> Any:
         order_lib = self._load_order_lib()
         side = order_lib["BUY"] if side_raw == "BUY" else order_lib["SELL"]
         response = client.create_and_post_order(
@@ -644,6 +644,7 @@ class PolymarketCopyBot:
             order_type=order_lib["OrderType"].GTC,
         )
         print(f"[ORDER RESP] {response}")
+        return response
 
     def _load_order_lib(self) -> Dict[str, Any]:
         if self._order_lib is not None:

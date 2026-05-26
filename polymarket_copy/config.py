@@ -25,6 +25,7 @@ DEFAULT_QUANT_REBUY_COOLDOWN_SEC = "15"
 DEFAULT_QUANT_MAX_DRAWDOWN_USDC = "0"
 DEFAULT_QUANT_MIN_SECONDS_LEFT = "10"
 DEFAULT_QUANT_MAX_SECONDS_LEFT = "60"
+DEFAULT_QUANT_ARBITRAGE_MIN_PROFIT = "0.01"
 
 
 def parse_bool(value: object, default: bool = False) -> bool:
@@ -113,6 +114,7 @@ class CopyBotConfig:
     quant_rebuy_cooldown_sec: float = float(DEFAULT_QUANT_REBUY_COOLDOWN_SEC)
     quant_lock_min_profit: Decimal = Decimal("0.50")
     quant_lock_stop_on_lock: bool = True
+    quant_arbitrage_min_profit: Decimal = Decimal(DEFAULT_QUANT_ARBITRAGE_MIN_PROFIT)
     quant_min_edge: Decimal = Decimal("0.04")
     quant_min_seconds_left: int = int(DEFAULT_QUANT_MIN_SECONDS_LEFT)
     quant_max_seconds_left: int = int(DEFAULT_QUANT_MAX_SECONDS_LEFT)
@@ -228,6 +230,7 @@ def load_config(config_path: Optional[Path] = None) -> CopyBotConfig:
         quant_rebuy_cooldown_sec=float(_env("QUANT_REBUY_COOLDOWN_SEC", DEFAULT_QUANT_REBUY_COOLDOWN_SEC)),
         quant_lock_min_profit=Decimal(_env("QUANT_LOCK_MIN_PROFIT", "0.50")),
         quant_lock_stop_on_lock=parse_bool(_env("QUANT_LOCK_STOP_ON_LOCK", "1"), default=True),
+        quant_arbitrage_min_profit=Decimal(_env("QUANT_ARBITRAGE_MIN_PROFIT", DEFAULT_QUANT_ARBITRAGE_MIN_PROFIT)),
         quant_min_edge=Decimal(_env("QUANT_MIN_EDGE", "0.04")),
         quant_min_seconds_left=int(_env("QUANT_MIN_SECONDS_LEFT", DEFAULT_QUANT_MIN_SECONDS_LEFT)),
         quant_max_seconds_left=int(_env("QUANT_MAX_SECONDS_LEFT", DEFAULT_QUANT_MAX_SECONDS_LEFT)),
@@ -308,7 +311,7 @@ def validate_config(config: CopyBotConfig, require_private_key: bool = False) ->
     if config.quant_strategy not in {"single", "lock"}:
         errors.append("QUANT_STRATEGY 必须是 single 或 lock")
     if config.quant_strategy == "lock" and not config.dry_run:
-        errors.append("QUANT_STRATEGY=lock 第一版只允许 DRY_RUN=1，确认模拟稳定后再接实盘")
+        warnings.append("QUANT_STRATEGY=lock 正在使用实盘执行器，请先用小金额确认二次复核和日志")
     if config.quant_size_mode not in {"usdc", "shares"}:
         errors.append("QUANT_SIZE_MODE 必须是 usdc 或 shares")
     if config.quant_order_usdc <= 0:
@@ -327,6 +330,8 @@ def validate_config(config: CopyBotConfig, require_private_key: bool = False) ->
         errors.append("QUANT_REBUY_COOLDOWN_SEC 必须大于等于 0")
     if config.quant_lock_min_profit < 0:
         errors.append("QUANT_LOCK_MIN_PROFIT 必须大于等于 0")
+    if config.quant_arbitrage_min_profit < 0:
+        errors.append("QUANT_ARBITRAGE_MIN_PROFIT 必须大于等于 0")
     if config.quant_min_edge < 0:
         errors.append("QUANT_MIN_EDGE 必须大于等于 0")
     if config.quant_min_seconds_left < 0:
@@ -395,6 +400,7 @@ def env_lines(values: Dict[str, str]) -> List[str]:
         "QUANT_REBUY_COOLDOWN_SEC",
         "QUANT_LOCK_MIN_PROFIT",
         "QUANT_LOCK_STOP_ON_LOCK",
+        "QUANT_ARBITRAGE_MIN_PROFIT",
         "QUANT_MIN_EDGE",
         "QUANT_MIN_SECONDS_LEFT",
         "QUANT_MAX_SECONDS_LEFT",
