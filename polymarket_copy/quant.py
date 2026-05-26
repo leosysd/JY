@@ -458,6 +458,7 @@ class PolymarketQuantBot:
             f"order_shares={self.config.quant_order_shares} "
             f"capital={self.config.quant_capital_usdc} "
             f"market_cap={self.config.quant_market_max_usdc} "
+            f"max_drawdown={self.config.quant_max_drawdown_usdc} "
             f"min_edge={self.config.quant_min_edge} "
             f"min_seconds_left={self.config.quant_min_seconds_left}"
         )
@@ -819,6 +820,43 @@ class PolymarketQuantBot:
         entry = self.state.lock_market_entry(market)
         position_before = lock_position_from_entry(entry)
         bankroll_before = self.lock_bankroll_snapshot(market.slug, position_before["total_cost"])
+        if bankroll_before["equity"] <= 0:
+            self.log_throttled(
+                f"[AI LOCK] 模拟本金已耗尽 equity={bankroll_before['equity']}，停止新增模拟单。"
+            )
+            self.record_lock_signal(
+                market,
+                snapshot,
+                action="skip",
+                reason="equity_depleted",
+                candidates=[],
+                position_before=position_before,
+                position_after=position_before,
+                bankroll_before=bankroll_before,
+                bankroll_after=bankroll_before,
+            )
+            return None
+        if (
+            self.config.quant_max_drawdown_usdc > 0
+            and bankroll_before["realized_pnl"] <= -self.config.quant_max_drawdown_usdc
+        ):
+            self.log_throttled(
+                "[AI LOCK] "
+                f"已达到最大模拟回撤 realized_pnl={bankroll_before['realized_pnl']} "
+                f"limit=-{self.config.quant_max_drawdown_usdc}，停止新增模拟单。"
+            )
+            self.record_lock_signal(
+                market,
+                snapshot,
+                action="skip",
+                reason="max_drawdown_reached",
+                candidates=[],
+                position_before=position_before,
+                position_after=position_before,
+                bankroll_before=bankroll_before,
+                bankroll_after=bankroll_before,
+            )
+            return None
         if self.config.quant_lock_stop_on_lock and bool(entry.get("locked")):
             self.log_throttled(f"[AI LOCK] {market.slug} 已经锁利，停止本市场。")
             self.record_lock_signal(
@@ -1081,6 +1119,11 @@ class PolymarketQuantBot:
                 "lock_profit",
                 (Decimal("4"), position_after["worst_pnl"], improvement, decision.edge),
             )
+        if decision.edge < self.config.quant_min_edge:
+            return (
+                "weak_candidate",
+                (Decimal("0"), decision.edge, improvement, -position_after["total_cost"]),
+            )
         if improvement > 0:
             return (
                 "improve_worst_pnl",
@@ -1091,14 +1134,9 @@ class PolymarketQuantBot:
                 "initial_probe",
                 (Decimal("2"), decision.edge, decision.probability, -position_after["total_cost"]),
             )
-        if decision.edge >= self.config.quant_min_edge:
-            return (
-                "add_same_side_edge",
-                (Decimal("1"), decision.edge, decision.probability, -position_after["total_cost"]),
-            )
         return (
-            "weak_candidate",
-            (Decimal("0"), decision.edge, improvement, -position_after["total_cost"]),
+            "add_same_side_edge",
+            (Decimal("1"), decision.edge, decision.probability, -position_after["total_cost"]),
         )
 
     def select_lock_candidate(self, candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -1173,6 +1211,7 @@ class PolymarketQuantBot:
                 "lock_stop_on_lock": self.config.quant_lock_stop_on_lock,
                 "min_edge": self.config.quant_min_edge,
                 "min_seconds_left": self.config.quant_min_seconds_left,
+                "max_drawdown_usdc": self.config.quant_max_drawdown_usdc,
                 "max_slippage": self.config.max_slippage,
             },
             "candidates": candidates,

@@ -18,6 +18,11 @@ DEFAULT_POLYMARKET_RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
 DEFAULT_QUANT_CHAINLINK_TIMEOUT_SEC = "20"
 DEFAULT_QUANT_CHAINLINK_MAX_AGE_SEC = "240"
 DEFAULT_QUANT_CHAINLINK_START_TOLERANCE_SEC = "180"
+DEFAULT_QUANT_ORDER_SHARES = "10"
+DEFAULT_QUANT_MARKET_MAX_USDC = "120"
+DEFAULT_QUANT_MAX_TRADES_PER_MARKET = "20"
+DEFAULT_QUANT_REBUY_COOLDOWN_SEC = "8"
+DEFAULT_QUANT_MAX_DRAWDOWN_USDC = "60"
 
 
 def parse_bool(value: object, default: bool = False) -> bool:
@@ -99,15 +104,16 @@ class CopyBotConfig:
     quant_strategy: str = "single"
     quant_size_mode: str = "usdc"
     quant_order_usdc: Decimal = Decimal("5")
-    quant_order_shares: Decimal = Decimal("20")
+    quant_order_shares: Decimal = Decimal(DEFAULT_QUANT_ORDER_SHARES)
     quant_capital_usdc: Decimal = Decimal("300")
-    quant_market_max_usdc: Decimal = Decimal("300")
-    quant_max_trades_per_market: int = 35
-    quant_rebuy_cooldown_sec: float = 5.0
+    quant_market_max_usdc: Decimal = Decimal(DEFAULT_QUANT_MARKET_MAX_USDC)
+    quant_max_trades_per_market: int = int(DEFAULT_QUANT_MAX_TRADES_PER_MARKET)
+    quant_rebuy_cooldown_sec: float = float(DEFAULT_QUANT_REBUY_COOLDOWN_SEC)
     quant_lock_min_profit: Decimal = Decimal("0.50")
     quant_lock_stop_on_lock: bool = True
     quant_min_edge: Decimal = Decimal("0.04")
     quant_min_seconds_left: int = 45
+    quant_max_drawdown_usdc: Decimal = Decimal(DEFAULT_QUANT_MAX_DRAWDOWN_USDC)
     quant_cooldown_sec: float = 60.0
     quant_log_interval_sec: float = 10.0
     quant_state_file: Path = Path("quant_state.json")
@@ -212,18 +218,19 @@ def load_config(config_path: Optional[Path] = None) -> CopyBotConfig:
         quant_strategy=_env("QUANT_STRATEGY", "single").lower(),
         quant_size_mode=_env("QUANT_SIZE_MODE", "usdc").lower(),
         quant_order_usdc=Decimal(_env("QUANT_ORDER_USDC", "5")),
-        quant_order_shares=Decimal(_env("QUANT_ORDER_SHARES", "20")),
+        quant_order_shares=Decimal(_env("QUANT_ORDER_SHARES", DEFAULT_QUANT_ORDER_SHARES)),
         quant_capital_usdc=Decimal(_env("QUANT_CAPITAL_USDC", "300")),
-        quant_market_max_usdc=Decimal(_env("QUANT_MARKET_MAX_USDC", "300")),
-        quant_max_trades_per_market=int(_env("QUANT_MAX_TRADES_PER_MARKET", "35")),
-        quant_rebuy_cooldown_sec=float(_env("QUANT_REBUY_COOLDOWN_SEC", "5")),
+        quant_market_max_usdc=Decimal(_env("QUANT_MARKET_MAX_USDC", DEFAULT_QUANT_MARKET_MAX_USDC)),
+        quant_max_trades_per_market=int(_env("QUANT_MAX_TRADES_PER_MARKET", DEFAULT_QUANT_MAX_TRADES_PER_MARKET)),
+        quant_rebuy_cooldown_sec=float(_env("QUANT_REBUY_COOLDOWN_SEC", DEFAULT_QUANT_REBUY_COOLDOWN_SEC)),
         quant_lock_min_profit=Decimal(_env("QUANT_LOCK_MIN_PROFIT", "0.50")),
         quant_lock_stop_on_lock=parse_bool(_env("QUANT_LOCK_STOP_ON_LOCK", "1"), default=True),
         quant_min_edge=Decimal(_env("QUANT_MIN_EDGE", "0.04")),
         quant_min_seconds_left=int(_env("QUANT_MIN_SECONDS_LEFT", "45")),
+        quant_max_drawdown_usdc=Decimal(_env("QUANT_MAX_DRAWDOWN_USDC", DEFAULT_QUANT_MAX_DRAWDOWN_USDC)),
         quant_cooldown_sec=float(_env("QUANT_COOLDOWN_SEC", "60")),
         quant_log_interval_sec=float(_env("QUANT_LOG_INTERVAL_SEC", "10")),
-        quant_state_file=Path(_env("QUANT_STATE_FILE", "quant_state.json")),
+        quant_state_file=_path_env("QUANT_STATE_FILE", "quant_state.json", config_path),
         quant_record_signals=parse_bool(_env("QUANT_RECORD_SIGNALS", "1"), default=True),
         quant_signal_file=_path_env("QUANT_SIGNAL_FILE", "data/quant_signals.jsonl", config_path),
         quant_signal_interval_sec=float(_env("QUANT_SIGNAL_INTERVAL_SEC", "30")),
@@ -320,6 +327,8 @@ def validate_config(config: CopyBotConfig, require_private_key: bool = False) ->
         errors.append("QUANT_MIN_EDGE 必须大于等于 0")
     if config.quant_min_seconds_left < 0:
         errors.append("QUANT_MIN_SECONDS_LEFT 必须大于等于 0")
+    if config.quant_max_drawdown_usdc < 0:
+        errors.append("QUANT_MAX_DRAWDOWN_USDC 必须大于等于 0")
     if config.quant_cooldown_sec < 0:
         errors.append("QUANT_COOLDOWN_SEC 必须大于等于 0")
     if config.quant_log_interval_sec <= 0:
@@ -382,6 +391,7 @@ def env_lines(values: Dict[str, str]) -> List[str]:
         "QUANT_LOCK_STOP_ON_LOCK",
         "QUANT_MIN_EDGE",
         "QUANT_MIN_SECONDS_LEFT",
+        "QUANT_MAX_DRAWDOWN_USDC",
         "QUANT_COOLDOWN_SEC",
         "QUANT_LOG_INTERVAL_SEC",
         "QUANT_STATE_FILE",

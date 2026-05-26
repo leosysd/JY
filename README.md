@@ -230,11 +230,13 @@ JetFadil 风格锁利模拟：
 ```bash
 jy set-bot-mode quant
 jy set-dry-run 1
-jy set-quant-config --strategy lock --size-mode shares --order-shares 20 --capital-usdc 300 --market-max-usdc 300 --max-trades-per-market 35 --rebuy-cooldown-sec 5 --lock-min-profit 0.50 --price-source chainlink --chainlink-timeout-sec 20 --chainlink-max-age-sec 240 --chainlink-start-tolerance-sec 180 --record-signals 1 --signal-interval-sec 5
+jy set-quant-config --strategy lock --size-mode shares --order-shares 10 --capital-usdc 300 --market-max-usdc 120 --max-trades-per-market 20 --rebuy-cooldown-sec 8 --lock-min-profit 0.50 --min-edge 0.04 --max-drawdown-usdc 60 --price-source chainlink --chainlink-timeout-sec 20 --chainlink-max-age-sec 240 --chainlink-start-tolerance-sec 180 --record-signals 1 --signal-interval-sec 5
 jy quant-data clear
 jy app-logs clear
 jy service restart
 ```
+
+`jy quant-data clear` 会同时清空 `data/quant_signals.jsonl` 和 `quant_state.json`，适合重新开始一轮 24 小时模拟。
 
 查看结果：
 
