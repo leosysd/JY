@@ -24,6 +24,7 @@ from .config import CopyBotConfig, validate_config
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/history-candles"
+MAX_LOCK_TRADES_PER_SIDE = Decimal("20")
 
 
 @dataclass(frozen=True)
@@ -1172,6 +1173,7 @@ class PolymarketQuantBot:
             f"cost={selected['notional']} edge={decision.edge} "
             f"up_pnl={position_after['up_pnl']} down_pnl={position_after['down_pnl']} "
             f"total_cost={position_after['total_cost']} trades={position_after['trade_count']} "
+            f"up_trades={position_after['up_trade_count']} down_trades={position_after['down_trade_count']} "
             f"available={bankroll_after['available_to_add']} "
             f"locked={1 if locked_after else 0} reason={reason}"
         )
@@ -1471,6 +1473,26 @@ class PolymarketQuantBot:
                     }
                 )
                 continue
+            side_count_key = "up_trade_count" if outcome == "Up" else "down_trade_count"
+            side_trade_count_before = position_before[side_count_key]
+            if side_trade_count_before >= MAX_LOCK_TRADES_PER_SIDE:
+                candidate_records.append(
+                    {
+                        "outcome": outcome,
+                        "token_id": token_id,
+                        "probability": probability.quantize(Decimal("0.0001")),
+                        "best_ask": best_ask,
+                        "raw_edge": raw_edge.quantize(Decimal("0.0001")),
+                        "edge": edge.quantize(Decimal("0.0001")),
+                        "limit_price": limit_price,
+                        "size": size,
+                        "side_trade_count_before": int(side_trade_count_before),
+                        "side_trade_limit": int(MAX_LOCK_TRADES_PER_SIDE),
+                        "valid": False,
+                        "skip_reason": "side_trade_cap_reached",
+                    }
+                )
+                continue
             notional = (size * best_ask).quantize(Decimal("0.0001"))
             max_notional = notional
             dry_run_rejections: List[str] = []
@@ -1574,6 +1596,9 @@ class PolymarketQuantBot:
                 "improvement_worst_pnl": improvement,
                 "would_lock": would_lock,
                 "dry_run_rejections": dry_run_rejections,
+                "side_trade_count_before": side_trade_count_before,
+                "side_trade_count_after": position_after[side_count_key],
+                "side_trade_limit": MAX_LOCK_TRADES_PER_SIDE,
             }
             outcome_items[outcome] = item
             candidates.append(item)
@@ -1604,6 +1629,11 @@ class PolymarketQuantBot:
         up_decision = up_item.get("decision")
         down_decision = down_item.get("decision")
         if not isinstance(up_decision, QuantDecision) or not isinstance(down_decision, QuantDecision):
+            return None
+        if (
+            position_before["up_trade_count"] >= MAX_LOCK_TRADES_PER_SIDE
+            or position_before["down_trade_count"] >= MAX_LOCK_TRADES_PER_SIDE
+        ):
             return None
         sum_ask = up_decision.best_ask + down_decision.best_ask
         arb_edge = Decimal("1") - sum_ask
@@ -1677,34 +1707,43 @@ class PolymarketQuantBot:
         would_lock: bool,
         improvement: Decimal,
     ) -> Tuple[str, Tuple[Decimal, ...]]:
+        pnl_gap = abs(position_after["up_pnl"] - position_after["down_pnl"])
+        base_score = (
+            Decimal("1"),
+            position_after["worst_pnl"],
+            -pnl_gap,
+            improvement,
+            decision.edge,
+            -position_after["total_cost"],
+        )
         if would_lock:
             return (
                 "lock_profit",
-                (Decimal("4"), position_after["worst_pnl"], improvement, decision.edge, -position_after["total_cost"]),
+                (Decimal("2"), position_after["worst_pnl"], -pnl_gap, improvement, decision.edge, -position_after["total_cost"]),
             )
         if self.detect_inventory_lock(position_before, position_after):
             return (
                 "inventory_lock",
-                (Decimal("3"), improvement, position_after["worst_pnl"], decision.edge, -position_after["total_cost"]),
+                base_score,
             )
         if position_before["trade_count"] == 0:
             return (
                 "initial_probe",
-                (Decimal("2"), decision.edge, decision.probability, -position_after["total_cost"]),
+                (Decimal("1"), decision.edge, -pnl_gap, position_after["worst_pnl"], -position_after["total_cost"]),
             )
         if decision.edge < self.config.quant_min_edge:
             if self.is_rebalance_side(position_before, decision.outcome):
                 return (
                     "rebalance_worst_side",
-                    (Decimal("0"), position_after["worst_pnl"], improvement, decision.edge, -position_after["total_cost"]),
+                    base_score,
                 )
             return (
                 "weak_candidate",
-                (Decimal("0"), position_after["worst_pnl"], improvement, decision.edge, -position_after["total_cost"]),
+                base_score,
             )
         return (
             "chase_edge",
-            (Decimal("1"), decision.edge, position_after["worst_pnl"], improvement, -position_after["total_cost"]),
+            base_score,
         )
 
     def detect_inventory_lock(
@@ -1916,6 +1955,8 @@ def base_lock_position() -> Dict[str, Decimal]:
         "worst_pnl": Decimal("0"),
         "best_pnl": Decimal("0"),
         "trade_count": Decimal("0"),
+        "up_trade_count": Decimal("0"),
+        "down_trade_count": Decimal("0"),
     }
 
 
@@ -1955,9 +1996,11 @@ def lock_position_from_entry(entry: Dict[str, Any]) -> Dict[str, Decimal]:
         if outcome == "Up":
             position["up_size"] += size
             position["up_cost"] += cost
+            position["up_trade_count"] += Decimal("1")
         elif outcome == "Down":
             position["down_size"] += size
             position["down_cost"] += cost
+            position["down_trade_count"] += Decimal("1")
         else:
             continue
         valid_count += 1
@@ -1976,9 +2019,11 @@ def lock_position_after_trade(
     if outcome == "Up":
         position["up_size"] += size
         position["up_cost"] += cost
+        position["up_trade_count"] += Decimal("1")
     else:
         position["down_size"] += size
         position["down_cost"] += cost
+        position["down_trade_count"] += Decimal("1")
     position["trade_count"] += Decimal("1")
     return recalc_lock_position(position)
 
@@ -1986,7 +2031,7 @@ def lock_position_after_trade(
 def lock_position_payload(position: Dict[str, Decimal]) -> Dict[str, Any]:
     payload: Dict[str, Any] = {}
     for key, value in position.items():
-        if key == "trade_count":
+        if key in {"trade_count", "up_trade_count", "down_trade_count"}:
             payload[key] = int(value)
         else:
             payload[key] = str(value.quantize(Decimal("0.0001")))
@@ -2033,6 +2078,9 @@ def lock_candidate_payload(item: Dict[str, Any]) -> Dict[str, Any]:
         "sum_ask": item.get("sum_ask"),
         "arbitrage_edge": item.get("arbitrage_edge"),
         "dry_run_rejections": item.get("dry_run_rejections", []),
+        "side_trade_count_before": item.get("side_trade_count_before"),
+        "side_trade_count_after": item.get("side_trade_count_after"),
+        "side_trade_limit": item.get("side_trade_limit"),
     }
 
 
