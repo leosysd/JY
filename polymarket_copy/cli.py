@@ -1243,6 +1243,155 @@ def print_quant_trace_table(config_path: Path, entry_minute: int = 1, limit: int
         )
 
 
+def _fmt_usd(value: Optional[float]) -> str:
+    if value is None:
+        return "----"
+    sign = "+" if value >= 0 else ""
+    return f"{sign}{value:.2f}"
+
+
+def _fmt_size(value: Optional[float]) -> str:
+    return "----" if value is None else f"{value:.2f}"
+
+
+def _short_title(value: object) -> str:
+    title = str(value or "")
+    return title.replace("Bitcoin Up or Down - ", "").strip() or "-"
+
+
+def _trade_time(timestamp: object) -> str:
+    numeric = _num(timestamp)
+    if numeric is None:
+        return "-"
+    return datetime.fromtimestamp(int(numeric), tz=timezone.utc).strftime("%m-%d %H:%M:%S")
+
+
+def _trade_cost(trade: Dict[str, Any]) -> Optional[float]:
+    usdc_size = _num(trade.get("usdcSize"))
+    if usdc_size is not None:
+        return usdc_size
+    size = _num(trade.get("size"))
+    price = _num(trade.get("price"))
+    if size is None or price is None:
+        return None
+    return size * price
+
+
+def _single_buy_pnl(trade: Dict[str, Any], winner: str) -> Optional[float]:
+    if str(trade.get("side") or "").upper() != "BUY" or not winner:
+        return None
+    size = _num(trade.get("size"))
+    cost = _trade_cost(trade)
+    if size is None or cost is None:
+        return None
+    return size - cost if str(trade.get("outcome") or "") == winner else -cost
+
+
+def _fetch_target_trades(config_path: Path, limit: int) -> Tuple[str, List[Dict[str, Any]]]:
+    import requests
+
+    config = load_config(config_path)
+    wallet = config.target_wallet
+    if not wallet:
+        wallet = PolymarketCopyBot(config).resolve_target_wallet()
+    response = requests.get(
+        "https://data-api.polymarket.com/activity",
+        params={
+            "user": wallet,
+            "type": "TRADE",
+            "limit": max(1, min(limit, 500)),
+            "sortBy": "TIMESTAMP",
+            "sortDirection": "DESC",
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, list):
+        raise RuntimeError(f"activity 返回异常: {data}")
+    return wallet, [trade for trade in data if isinstance(trade, dict)]
+
+
+def print_target_history_table(config_path: Path, limit: int = 100) -> None:
+    wallet, trades = _fetch_target_trades(config_path, limit)
+    print(f"[DATA] 目标真实历史成交: {wallet}")
+    if not trades:
+        print("[INFO] 暂无历史成交。")
+        return
+
+    trades = sorted(trades, key=lambda item: int(item.get("timestamp") or 0))
+    winners: Dict[str, Tuple[str, bool]] = {}
+    positions: Dict[str, Dict[str, float]] = {}
+    rows: List[Dict[str, Any]] = []
+    for trade in trades:
+        slug = str(trade.get("slug") or trade.get("eventSlug") or "")
+        if slug and slug not in winners:
+            winners[slug] = _winner_from_gamma(slug)
+        winner, is_closed = winners.get(slug, ("", False))
+        outcome = str(trade.get("outcome") or "")
+        side = str(trade.get("side") or "")
+        size = _num(trade.get("size")) or 0.0
+        price = _num(trade.get("price"))
+        cost = _trade_cost(trade) or 0.0
+        position = positions.setdefault(slug, {"up_size": 0.0, "down_size": 0.0, "cost": 0.0})
+        if side.upper() == "BUY":
+            if outcome == "Up":
+                position["up_size"] += size
+            elif outcome == "Down":
+                position["down_size"] += size
+            position["cost"] += cost
+        up_win_pnl = position["up_size"] - position["cost"]
+        down_win_pnl = position["down_size"] - position["cost"]
+        final_pnl = None
+        final_result = "未结算"
+        winner_label = winner or "未结算"
+        if winner:
+            final_pnl = up_win_pnl if winner == "Up" else down_win_pnl
+            final_result = "盈利" if final_pnl > 0 else "亏损"
+            if not is_closed:
+                winner_label = f"预计{winner}"
+        rows.append(
+            {
+                "time": _trade_time(trade.get("timestamp")),
+                "market": _short_title(trade.get("title")),
+                "side": side,
+                "outcome": outcome,
+                "price": price,
+                "size": size,
+                "cost": cost,
+                "single_pnl": _single_buy_pnl(trade, winner),
+                "up_win_pnl": up_win_pnl,
+                "down_win_pnl": down_win_pnl,
+                "winner": winner_label,
+                "final_pnl": final_pnl,
+                "result": final_result,
+            }
+        )
+
+    header = (
+        f"{'#':>3}  {'时间(UTC)':<14} {'市场':<24} {'方向':<4} {'价格':>7} {'份额':>7} "
+        f"{'金额':>8} {'单笔结算':>9} {'Up赢':>8} {'Down赢':>8} {'结果':<8} {'本场盈亏':>9} {'判断':<4}"
+    )
+    print(header)
+    print("-" * len(header))
+    for index, row in enumerate(rows[-limit:], 1):
+        print(
+            f"{index:>3}  "
+            f"{row['time']:<14} "
+            f"{row['market'][:24]:<24} "
+            f"{row['outcome']:<4} "
+            f"{_fmt_price(row['price']):>7} "
+            f"{_fmt_size(row['size']):>7} "
+            f"{_fmt_usd(row['cost']):>8} "
+            f"{_fmt_usd(row['single_pnl']):>9} "
+            f"{_fmt_usd(row['up_win_pnl']):>8} "
+            f"{_fmt_usd(row['down_win_pnl']):>8} "
+            f"{row['winner']:<8} "
+            f"{_fmt_usd(row['final_pnl']):>9} "
+            f"{row['result']:<4}"
+        )
+
+
 def update_target(config_path: Path) -> None:
     existing = load_existing_env(config_path)
     username = prompt_text("目标用户名 TARGET_USERNAME", existing.get("TARGET_USERNAME", DEFAULT_TARGET_USERNAME)).lstrip("@")
@@ -1376,6 +1525,7 @@ def local_interactive_menu(config_path: Path = Path(".env")) -> None:
         print("23. 清空 AI量化数据")
         print("24. 应用 JetFadil 风格量化预设")
         print("25. 查看盘口走势表")
+        print("26. 查看目标真实历史成交")
         print("0. 退出")
         choice = input("请选择: ").strip()
         try:
@@ -1446,6 +1596,8 @@ def local_interactive_menu(config_path: Path = Path(".env")) -> None:
                     local_service_action("restart")
             elif choice == "25":
                 print_quant_trace_table(config_path)
+            elif choice == "26":
+                print_target_history_table(config_path)
             elif choice == "0":
                 return
             else:
@@ -1561,6 +1713,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_quant_data.add_argument("--lines", type=int, default=20)
     p_quant_data.add_argument("--entry-minute", type=int, default=1)
     p_quant_data.add_argument("--limit", type=int, default=20)
+
+    p_target_history = sub.add_parser("target-history", help="查看目标钱包真实历史成交")
+    p_target_history.add_argument("--config", default=".env")
+    p_target_history.add_argument("--limit", type=int, default=100)
 
     p_install = sub.add_parser("install", help="从 GitHub 安装到 VPS，便于以后远程更新")
     p_install.add_argument("--host", required=True)
@@ -1826,6 +1982,8 @@ def main(argv: Optional[List[str]] = None) -> None:
             print(configured_quant_signal_file(config_path))
         elif args.action == "table":
             print_quant_trace_table(config_path, entry_minute=args.entry_minute, limit=args.limit)
+    elif args.command == "target-history":
+        print_target_history_table(Path(args.config), limit=args.limit)
     elif args.command == "install":
         install_from_git(
             host=args.host,
