@@ -12,8 +12,9 @@ import sys
 import tempfile
 from collections import Counter
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import dotenv_values
 
@@ -1034,6 +1035,214 @@ def summarize_quant_data(config_path: Path) -> None:
             )
 
 
+def _num(value: object) -> Optional[float]:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_price(value: Optional[float]) -> str:
+    return "----" if value is None else f"{value:.4f}"
+
+
+def _fmt_pnl(value: Optional[float]) -> str:
+    if value is None:
+        return "----"
+    sign = "+" if value >= 0 else ""
+    return f"{sign}{value:.4f}"
+
+
+def _json_list(value: object) -> List[Any]:
+    if isinstance(value, list):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return []
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _format_market_time(start_ts: int, end_ts: int) -> str:
+    start = datetime.fromtimestamp(start_ts, tz=timezone.utc)
+    end = datetime.fromtimestamp(end_ts, tz=timezone.utc)
+    return f"{start:%m-%d %H:%M}-{end:%H:%M}"
+
+
+def _snapshot_value(records: List[Dict[str, Any]], target_elapsed: int, direction: str) -> Optional[float]:
+    key = "up_ask" if direction == "Up" else "down_ask"
+    best: Optional[Tuple[int, Dict[str, Any]]] = None
+    for record in records:
+        elapsed = int(record.get("_elapsed") or 0)
+        diff = abs(elapsed - target_elapsed)
+        if best is None or diff < best[0]:
+            best = (diff, record)
+    if best is None:
+        return None
+    snapshot = best[1].get("market_snapshot")
+    if not isinstance(snapshot, dict):
+        return None
+    return _num(snapshot.get(key))
+
+
+def _winner_from_gamma(slug: str) -> Tuple[str, bool]:
+    try:
+        import requests
+
+        response = requests.get(f"https://gamma-api.polymarket.com/events/slug/{slug}", timeout=8)
+        response.raise_for_status()
+        data = response.json()
+    except Exception:
+        return "", False
+    markets = data.get("markets") if isinstance(data, dict) else None
+    if not isinstance(markets, list) or not markets:
+        return "", False
+    market = markets[0]
+    outcomes = _json_list(market.get("outcomes"))
+    prices = _json_list(market.get("outcomePrices"))
+    if not outcomes or not prices or len(outcomes) != len(prices):
+        return "", False
+    numeric_prices = [_num(price) or 0.0 for price in prices]
+    max_index = max(range(len(numeric_prices)), key=lambda index: numeric_prices[index])
+    closed = bool(market.get("closed") or data.get("closed"))
+    if closed or numeric_prices[max_index] >= 0.99:
+        return str(outcomes[max_index]), closed
+    return "", False
+
+
+def _load_quant_market_groups(data_file: Path) -> Dict[str, List[Dict[str, Any]]]:
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for line in data_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        market = record.get("market")
+        snapshot = record.get("market_snapshot")
+        if not isinstance(market, dict) or not isinstance(snapshot, dict):
+            continue
+        slug = str(market.get("slug") or "")
+        start_ts = int(market.get("start_ts") or 0)
+        unix_ts = int(record.get("unix_ts") or 0)
+        if not slug or not start_ts or not unix_ts:
+            continue
+        record["_elapsed"] = max(0, unix_ts - start_ts)
+        groups.setdefault(slug, []).append(record)
+    for records in groups.values():
+        records.sort(key=lambda item: int(item.get("unix_ts") or 0))
+    return groups
+
+
+def print_quant_trace_table(config_path: Path, entry_minute: int = 1, limit: int = 20) -> None:
+    data_file = configured_quant_signal_file(config_path)
+    print(f"[DATA] AI量化数据: {data_file}")
+    if not data_file.exists():
+        print("[INFO] AI量化数据还不存在。")
+        return
+    entry_minute = max(0, min(4, entry_minute))
+    groups = _load_quant_market_groups(data_file)
+    if not groups:
+        print("[INFO] 暂无可生成盘口走势表的数据。")
+        return
+
+    rows: List[Dict[str, Any]] = []
+    market_items = sorted(
+        groups.items(),
+        key=lambda item: int(
+            item[1][0].get("market", {}).get("start_ts")
+            if isinstance(item[1][0].get("market"), dict)
+            else 0
+        ),
+    )
+    if limit > 0:
+        market_items = market_items[-max(1, (limit + 1) // 2) :]
+
+    for slug, records in market_items:
+        first = records[0]
+        market = first.get("market") if isinstance(first.get("market"), dict) else {}
+        start_ts = int(market.get("start_ts") or 0)
+        end_ts = int(market.get("end_ts") or 0)
+        if not start_ts or not end_ts:
+            continue
+        winner, is_closed = _winner_from_gamma(slug)
+        market_time = _format_market_time(start_ts, end_ts)
+        for direction in ("Up", "Down"):
+            prices = {
+                "0m": _snapshot_value(records, 0, direction),
+                "1m": _snapshot_value(records, 60, direction),
+                "2m": _snapshot_value(records, 120, direction),
+                "3m": _snapshot_value(records, 180, direction),
+                "4m": _snapshot_value(records, 240, direction),
+                "end": _snapshot_value(records, 295, direction) or _snapshot_value(records, 290, direction),
+            }
+            entry = prices[f"{entry_minute}m"]
+            exit_price = prices["end"]
+            price_change = None if entry is None or exit_price is None else exit_price - entry
+            settlement_pnl = None
+            result = "未结算"
+            winner_label = winner or "未结算"
+            if winner:
+                settlement_pnl = (1.0 - entry) if direction == winner and entry is not None else (None if entry is None else -entry)
+                result = "盈利" if settlement_pnl is not None and settlement_pnl > 0 else "亏损"
+                if not is_closed:
+                    winner_label = f"预计{winner}"
+            rows.append(
+                {
+                    "start_ts": start_ts,
+                    "market_time": market_time,
+                    "direction": direction,
+                    "entry_point": f"{entry_minute}分钟",
+                    "entry": entry,
+                    "m1": prices["1m"],
+                    "m2": prices["2m"],
+                    "m3": prices["3m"],
+                    "m4": prices["4m"],
+                    "exit": exit_price,
+                    "winner": winner_label,
+                    "price_change": price_change,
+                    "settlement_pnl": settlement_pnl,
+                    "result": result,
+                }
+            )
+    direction_rank = {"Up": 0, "Down": 1}
+    rows.sort(key=lambda item: (int(item["start_ts"]), direction_rank.get(str(item["direction"]), 9)))
+    if limit > 0:
+        rows = rows[-limit:]
+
+    header = (
+        f"{'#':>3}  {'市场时间':<17} {'方向':<4} {'入场点':<6} {'入场价':>8} {'1分钟价':>8} "
+        f"{'2分钟价':>8} {'3分钟价':>8} {'4分钟价':>8} {'结束价':>8} {'最终结果':<8} "
+        f"{'价格变化':>9} {'结算盈亏':>9} {'判断':<4}"
+    )
+    print(header)
+    print("-" * len(header))
+    for index, row in enumerate(rows, 1):
+        print(
+            f"{index:>3}  "
+            f"{row['market_time']:<17} "
+            f"{row['direction']:<4} "
+            f"{row['entry_point']:<6} "
+            f"{_fmt_price(row['entry']):>8} "
+            f"{_fmt_price(row['m1']):>8} "
+            f"{_fmt_price(row['m2']):>8} "
+            f"{_fmt_price(row['m3']):>8} "
+            f"{_fmt_price(row['m4']):>8} "
+            f"{_fmt_price(row['exit']):>8} "
+            f"{row['winner']:<8} "
+            f"{_fmt_pnl(row['price_change']):>9} "
+            f"{_fmt_pnl(row['settlement_pnl']):>9} "
+            f"{row['result']:<4}"
+        )
+
+
 def update_target(config_path: Path) -> None:
     existing = load_existing_env(config_path)
     username = prompt_text("目标用户名 TARGET_USERNAME", existing.get("TARGET_USERNAME", DEFAULT_TARGET_USERNAME)).lstrip("@")
@@ -1166,6 +1375,7 @@ def local_interactive_menu(config_path: Path = Path(".env")) -> None:
         print("22. 查看 AI量化数据")
         print("23. 清空 AI量化数据")
         print("24. 应用 JetFadil 风格量化预设")
+        print("25. 查看盘口走势表")
         print("0. 退出")
         choice = input("请选择: ").strip()
         try:
@@ -1234,6 +1444,8 @@ def local_interactive_menu(config_path: Path = Path(".env")) -> None:
                 apply_quant_preset(config_path, "jetfadil")
                 if prompt_yes_no("是否立即重启服务让配置生效", True):
                     local_service_action("restart")
+            elif choice == "25":
+                print_quant_trace_table(config_path)
             elif choice == "0":
                 return
             else:
@@ -1344,9 +1556,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_app_logs.add_argument("--no-follow", action="store_true", help="tail 时只打印末尾日志，不持续跟随")
 
     p_quant_data = sub.add_parser("quant-data", help="查看或清空 AI量化结构化数据")
-    p_quant_data.add_argument("action", choices=["summary", "tail", "clear", "path"])
+    p_quant_data.add_argument("action", choices=["summary", "tail", "clear", "path", "table"])
     p_quant_data.add_argument("--config", default=".env")
     p_quant_data.add_argument("--lines", type=int, default=20)
+    p_quant_data.add_argument("--entry-minute", type=int, default=1)
+    p_quant_data.add_argument("--limit", type=int, default=20)
 
     p_install = sub.add_parser("install", help="从 GitHub 安装到 VPS，便于以后远程更新")
     p_install.add_argument("--host", required=True)
@@ -1610,6 +1824,8 @@ def main(argv: Optional[List[str]] = None) -> None:
             clear_quant_data(config_path)
         elif args.action == "path":
             print(configured_quant_signal_file(config_path))
+        elif args.action == "table":
+            print_quant_trace_table(config_path, entry_minute=args.entry_minute, limit=args.limit)
     elif args.command == "install":
         install_from_git(
             host=args.host,
