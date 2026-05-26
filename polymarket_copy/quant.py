@@ -1070,8 +1070,9 @@ class PolymarketQuantBot:
 
         candidates, candidate_records = self.build_lock_candidates(market, snapshot, position_before, bankroll_before)
         selected = self.select_lock_candidate(candidates)
-        rejected_sample = self.select_lock_candidate(candidates, include_rejected=True) if self.config.dry_run else None
-        if selected is None and rejected_sample is None:
+        if selected is None and self.config.dry_run:
+            selected = self.select_lock_candidate(candidates, include_rejected=True)
+        if selected is None:
             self.log_throttled(
                 "[AI LOCK] "
                 f"{market.title} 暂无锁利/补单候选，cost={position_before['total_cost']} "
@@ -1092,46 +1093,18 @@ class PolymarketQuantBot:
                 force=self.config.dry_run,
             )
             return None
-        log_sample = selected or rejected_sample
-        selected_rejections = list(log_sample.get("dry_run_rejections") or []) if log_sample else []
+        selected_rejections = list(selected.get("dry_run_rejections") or [])
         all_rejections = dry_run_rejections + [
             reason for reason in selected_rejections if reason not in dry_run_rejections
         ]
-        selected_score = log_sample.get("score") if log_sample else None
-        if (
-            self.config.dry_run
-            and isinstance(selected_score, tuple)
-            and selected_score[0] <= 0
-        ):
-            weak_reason = str(log_sample.get("reason") or "weak_candidate")
+        selected_score = selected.get("score")
+        if self.config.dry_run and isinstance(selected_score, tuple) and selected_score[0] <= 0:
+            weak_reason = str(selected.get("reason") or "weak_candidate")
             if weak_reason not in all_rejections:
                 all_rejections.append(weak_reason)
         if all_rejections:
-            log_sample = dict(log_sample or {})
-            log_sample["dry_run_rejections"] = all_rejections
-            position_after = log_sample.get("position_after", position_before)
-            self.record_lock_signal(
-                market,
-                snapshot,
-                action="would_skip",
-                reason=",".join(all_rejections),
-                candidates=candidate_records,
-                selected=log_sample.get("decision"),
-                selected_meta=lock_candidate_payload(log_sample),
-                position_before=position_before,
-                position_after=position_after,
-                bankroll_before=bankroll_before,
-                bankroll_after=self.lock_bankroll_snapshot(
-                    market.slug,
-                    position_after["total_cost"],
-                    position_after["worst_pnl"],
-                ),
-                force=True,
-            )
-            if self.config.dry_run:
-                return None
-        if selected is None:
-            return None
+            selected = dict(selected)
+            selected["dry_run_rejections"] = all_rejections
 
         return self.execute_lock_plan(
             market,
@@ -1703,30 +1676,35 @@ class PolymarketQuantBot:
         decision: QuantDecision,
         would_lock: bool,
         improvement: Decimal,
-    ) -> Tuple[str, Tuple[Decimal, Decimal, Decimal, Decimal]]:
+    ) -> Tuple[str, Tuple[Decimal, ...]]:
         if would_lock:
             return (
                 "lock_profit",
-                (Decimal("4"), position_after["worst_pnl"], improvement, decision.edge),
+                (Decimal("4"), position_after["worst_pnl"], improvement, decision.edge, -position_after["total_cost"]),
             )
         if self.detect_inventory_lock(position_before, position_after):
             return (
                 "inventory_lock",
-                (Decimal("3"), improvement, position_after["worst_pnl"], -position_after["total_cost"]),
-            )
-        if decision.edge < self.config.quant_min_edge:
-            return (
-                "weak_candidate",
-                (Decimal("0"), decision.edge, improvement, -position_after["total_cost"]),
+                (Decimal("3"), improvement, position_after["worst_pnl"], decision.edge, -position_after["total_cost"]),
             )
         if position_before["trade_count"] == 0:
             return (
                 "initial_probe",
                 (Decimal("2"), decision.edge, decision.probability, -position_after["total_cost"]),
             )
+        if decision.edge < self.config.quant_min_edge:
+            if self.is_rebalance_side(position_before, decision.outcome):
+                return (
+                    "rebalance_worst_side",
+                    (Decimal("0"), position_after["worst_pnl"], improvement, decision.edge, -position_after["total_cost"]),
+                )
+            return (
+                "weak_candidate",
+                (Decimal("0"), position_after["worst_pnl"], improvement, decision.edge, -position_after["total_cost"]),
+            )
         return (
-            "weak_candidate",
-            (Decimal("0"), decision.edge, improvement, -position_after["total_cost"]),
+            "chase_edge",
+            (Decimal("1"), decision.edge, position_after["worst_pnl"], improvement, -position_after["total_cost"]),
         )
 
     def detect_inventory_lock(
@@ -1735,6 +1713,19 @@ class PolymarketQuantBot:
         position_after: Dict[str, Decimal],
     ) -> bool:
         return position_before["trade_count"] > 0 and position_after["worst_pnl"] > position_before["worst_pnl"]
+
+    def is_rebalance_side(self, position_before: Dict[str, Decimal], outcome: str) -> bool:
+        if position_before["trade_count"] == 0:
+            return False
+        if position_before["up_pnl"] < position_before["down_pnl"]:
+            return outcome == "Up"
+        if position_before["down_pnl"] < position_before["up_pnl"]:
+            return outcome == "Down"
+        if position_before["up_size"] < position_before["down_size"]:
+            return outcome == "Up"
+        if position_before["down_size"] < position_before["up_size"]:
+            return outcome == "Down"
+        return False
 
     def select_lock_candidate(
         self,
