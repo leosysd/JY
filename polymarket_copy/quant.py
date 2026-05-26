@@ -27,6 +27,9 @@ OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/history-candles"
 MAX_LOCK_TRADES_PER_SIDE = Decimal("20")
 SAME_OUTCOME_REPEAT_SEC = 6
 SAME_OUTCOME_MIN_PRICE_MOVE = Decimal("0.01")
+LATE_STAGE_STRICT_SECONDS = 60
+INVENTORY_GAP_ORDER_MULTIPLIER = Decimal("3")
+MAX_WORST_LOSS_ORDER_MULTIPLIER = Decimal("2")
 
 
 @dataclass(frozen=True)
@@ -1362,6 +1365,31 @@ class PolymarketQuantBot:
         for leg in reviewed_legs:
             position_after = lock_position_after_trade(position_after, leg.outcome, leg.size, leg.limit_price)
             notional += leg.size * leg.limit_price
+        if str(selected.get("reason")) != "pure_arbitrage" and len(reviewed_legs) == 1:
+            reviewed_leg = reviewed_legs[0]
+            improvement = position_after["worst_pnl"] - position_before["worst_pnl"]
+            would_lock = position_after["worst_pnl"] >= self.config.quant_lock_min_profit
+            reviewed_reason, reviewed_score = self.score_lock_candidate(
+                position_before,
+                position_after,
+                reviewed_leg,
+                would_lock,
+                improvement,
+            )
+            review_records.append(
+                {
+                    "review_type": "model_guard",
+                    "reason": reviewed_reason,
+                    "score": list(reviewed_score),
+                    "valid": reviewed_score[0] > 0,
+                    "position_after": lock_position_payload(position_after),
+                }
+            )
+            if reviewed_score[0] <= 0:
+                return None, review_records
+            selected = dict(selected)
+            selected["reason"] = reviewed_reason
+            selected["score"] = reviewed_score
         if position_after["total_cost"] > self.config.quant_market_max_usdc:
             review_records.append({"review_type": "budget", "valid": False, "skip_reason": "market_cap_reached"})
             return None, review_records
@@ -1728,6 +1756,91 @@ class PolymarketQuantBot:
         strong_market_momentum = decision.best_ask >= Decimal("0.65")
         cheap_inventory_hedge = decision.best_ask <= Decimal("0.35") and improvement > 0
         expected_positive = expected_gain > Decimal("0")
+        selected_pnl_after = pnl_for_outcome(position_after, decision.outcome)
+        min_side_size_after = min(position_after["up_size"], position_after["down_size"])
+        inventory_gap_after = abs(position_after["up_size"] - position_after["down_size"])
+        near_equal_size = (
+            min_side_size_after > 0
+            and inventory_gap_after <= max(decision.size, Decimal("1"))
+        )
+        negative_near_lock = near_equal_size and position_after["total_cost"] > min_side_size_after
+        is_rebalance = self.is_rebalance_side(position_before, decision.outcome)
+        large_inventory_gap_before = (
+            position_before["trade_count"] > 0
+            and abs(position_before["up_size"] - position_before["down_size"])
+            >= max(decision.size * INVENTORY_GAP_ORDER_MULTIPLIER, decision.size)
+        )
+        tail_loss_limit = -(decision.size * MAX_WORST_LOSS_ORDER_MULTIPLIER)
+        creates_deep_tail_loss = (
+            position_after["worst_pnl"] < tail_loss_limit
+            and position_after["worst_pnl"] < position_before["worst_pnl"]
+        )
+        late_stage = decision.market.seconds_left <= LATE_STAGE_STRICT_SECONDS
+        if negative_near_lock and not would_lock:
+            return (
+                "negative_lock",
+                (
+                    Decimal("0"),
+                    position_after["worst_pnl"],
+                    expected_after,
+                    improvement,
+                    decision.edge,
+                    -position_after["total_cost"],
+                ),
+            )
+        if late_stage and not would_lock and improvement <= 0:
+            return (
+                "late_stage_requires_lock_or_rebalance",
+                (
+                    Decimal("0"),
+                    expected_after,
+                    improvement,
+                    decision.edge,
+                    -pnl_gap,
+                    -position_after["total_cost"],
+                ),
+            )
+        if large_inventory_gap_before and not is_rebalance and improvement <= 0:
+            return (
+                "inventory_gap_would_widen",
+                (
+                    Decimal("0"),
+                    expected_after,
+                    improvement,
+                    -pnl_gap,
+                    decision.edge,
+                    -position_after["total_cost"],
+                ),
+            )
+        if creates_deep_tail_loss and not would_lock and not (is_rebalance and improvement > 0):
+            return (
+                "tail_risk_would_worsen",
+                (
+                    Decimal("0"),
+                    position_after["worst_pnl"],
+                    improvement,
+                    expected_after,
+                    decision.edge,
+                    -position_after["total_cost"],
+                ),
+            )
+        if (
+            position_before["trade_count"] > 0
+            and selected_pnl_after < 0
+            and improvement <= 0
+            and not would_lock
+        ):
+            return (
+                "expensive_negative_win_pnl",
+                (
+                    Decimal("0"),
+                    selected_pnl_after,
+                    expected_after,
+                    improvement,
+                    decision.edge,
+                    -position_after["total_cost"],
+                ),
+            )
         if decision.best_ask <= Decimal("0.05") and not self.is_rebalance_side(position_before, decision.outcome):
             return (
                 "cheap_side_without_inventory",
@@ -1809,7 +1922,7 @@ class PolymarketQuantBot:
                 ),
             )
         if (
-            self.is_rebalance_side(position_before, decision.outcome)
+            is_rebalance
             and improvement > 0
             and gap_improvement > 0
             and expected_gain >= -(notional * Decimal("0.20"))
@@ -2083,6 +2196,10 @@ def recalc_lock_position(position: Dict[str, Decimal]) -> Dict[str, Decimal]:
 def expected_lock_pnl(position: Dict[str, Decimal], up_probability: Decimal) -> Decimal:
     up_probability = min(max(up_probability, Decimal("0")), Decimal("1"))
     return position["up_pnl"] * up_probability + position["down_pnl"] * (Decimal("1") - up_probability)
+
+
+def pnl_for_outcome(position: Dict[str, Decimal], outcome: str) -> Decimal:
+    return position["up_pnl"] if outcome == "Up" else position["down_pnl"]
 
 
 def lock_position_from_entry(entry: Dict[str, Any]) -> Dict[str, Decimal]:
