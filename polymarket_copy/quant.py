@@ -1728,6 +1728,19 @@ class PolymarketQuantBot:
         strong_market_momentum = decision.best_ask >= Decimal("0.65") and is_favorite
         cheap_inventory_hedge = decision.best_ask <= Decimal("0.35") and improvement > 0
         expected_positive = expected_gain > Decimal("0")
+        if decision.best_ask <= Decimal("0.05") and not self.is_rebalance_side(position_before, decision.outcome):
+            return (
+                "cheap_side_without_inventory",
+                (
+                    Decimal("0"),
+                    expected_after,
+                    expected_gain,
+                    improvement,
+                    decision.edge,
+                    -pnl_gap,
+                    -position_after["total_cost"],
+                ),
+            )
         if would_lock:
             return (
                 "lock_profit",
