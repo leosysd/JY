@@ -783,9 +783,15 @@ class PolymarketQuantBot:
                 continue
         return None
 
-    def lock_bankroll_snapshot(self, current_slug: str, current_cost: Decimal) -> Dict[str, Decimal]:
+    def lock_bankroll_snapshot(
+        self,
+        current_slug: str,
+        current_cost: Decimal,
+        current_worst_pnl: Decimal = Decimal("0"),
+    ) -> Dict[str, Decimal]:
         realized_pnl = Decimal("0")
         other_unsettled_cost = Decimal("0")
+        other_unsettled_worst_pnl = Decimal("0")
         unsettled_count = 0
         settled_count = 0
         for slug, entry in self.state.lock_market_entries().items():
@@ -798,15 +804,24 @@ class PolymarketQuantBot:
             position = lock_position_from_entry(entry)
             if position["total_cost"] > 0:
                 other_unsettled_cost += position["total_cost"]
+                other_unsettled_worst_pnl += position["worst_pnl"]
                 unsettled_count += 1
         equity = self.config.quant_capital_usdc + realized_pnl
+        open_worst_pnl = current_worst_pnl + other_unsettled_worst_pnl
+        risk_equity = equity + open_worst_pnl
+        risk_drawdown = self.config.quant_capital_usdc - risk_equity
         available_to_add = equity - other_unsettled_cost - current_cost
         return {
             "capital_usdc": self.config.quant_capital_usdc,
             "realized_pnl": realized_pnl,
             "equity": equity,
             "other_unsettled_cost": other_unsettled_cost,
+            "other_unsettled_worst_pnl": other_unsettled_worst_pnl,
             "current_market_cost": current_cost,
+            "current_market_worst_pnl": current_worst_pnl,
+            "open_worst_pnl": open_worst_pnl,
+            "risk_equity": risk_equity,
+            "risk_drawdown_usdc": max(risk_drawdown, Decimal("0")),
             "available_to_add": max(available_to_add, Decimal("0")),
             "raw_available_to_add": available_to_add,
             "unsettled_markets": Decimal(unsettled_count),
@@ -819,7 +834,11 @@ class PolymarketQuantBot:
         self.settle_finished_lock_markets()
         entry = self.state.lock_market_entry(market)
         position_before = lock_position_from_entry(entry)
-        bankroll_before = self.lock_bankroll_snapshot(market.slug, position_before["total_cost"])
+        bankroll_before = self.lock_bankroll_snapshot(
+            market.slug,
+            position_before["total_cost"],
+            position_before["worst_pnl"],
+        )
         if bankroll_before["equity"] <= 0:
             self.log_throttled(
                 f"[AI LOCK] 模拟本金已耗尽 equity={bankroll_before['equity']}，停止新增模拟单。"
@@ -838,7 +857,7 @@ class PolymarketQuantBot:
             return None
         if (
             self.config.quant_max_drawdown_usdc > 0
-            and bankroll_before["realized_pnl"] <= -self.config.quant_max_drawdown_usdc
+            and bankroll_before["risk_drawdown_usdc"] >= self.config.quant_max_drawdown_usdc
         ):
             self.log_throttled(
                 "[AI LOCK] "
@@ -940,7 +959,11 @@ class PolymarketQuantBot:
 
         decision = selected["decision"]
         position_after = selected["position_after"]
-        bankroll_after = self.lock_bankroll_snapshot(market.slug, position_after["total_cost"])
+        bankroll_after = self.lock_bankroll_snapshot(
+            market.slug,
+            position_after["total_cost"],
+            position_after["worst_pnl"],
+        )
         locked_after = position_after["worst_pnl"] >= self.config.quant_lock_min_profit
         reason = str(selected["reason"])
         print(
@@ -1071,6 +1094,40 @@ class PolymarketQuantBot:
             position_after = lock_position_after_trade(position_before, outcome, size, limit_price)
             improvement = position_after["worst_pnl"] - position_before["worst_pnl"]
             would_lock = position_after["worst_pnl"] >= self.config.quant_lock_min_profit
+            open_worst_after = bankroll_before["other_unsettled_worst_pnl"] + position_after["worst_pnl"]
+            risk_equity_after = (
+                self.config.quant_capital_usdc
+                + bankroll_before["realized_pnl"]
+                + open_worst_after
+            )
+            risk_drawdown_after = max(
+                self.config.quant_capital_usdc - risk_equity_after,
+                Decimal("0"),
+            )
+            if (
+                self.config.quant_max_drawdown_usdc > 0
+                and risk_drawdown_after > self.config.quant_max_drawdown_usdc
+            ):
+                candidate_records.append(
+                    {
+                        "outcome": outcome,
+                        "token_id": token_id,
+                        "probability": probability.quantize(Decimal("0.0001")),
+                        "best_ask": best_ask,
+                        "raw_edge": raw_edge.quantize(Decimal("0.0001")),
+                        "edge": edge.quantize(Decimal("0.0001")),
+                        "limit_price": limit_price,
+                        "size": size,
+                        "notional": notional,
+                        "risk_drawdown_after": risk_drawdown_after.quantize(Decimal("0.0001")),
+                        "max_drawdown_usdc": self.config.quant_max_drawdown_usdc,
+                        "position_after": lock_position_payload(position_after),
+                        "bankroll_before": lock_bankroll_payload(bankroll_before),
+                        "valid": False,
+                        "skip_reason": "max_drawdown_candidate",
+                    }
+                )
+                continue
             decision = QuantDecision(
                 market=market,
                 outcome=outcome,
@@ -1134,9 +1191,14 @@ class PolymarketQuantBot:
                 "initial_probe",
                 (Decimal("2"), decision.edge, decision.probability, -position_after["total_cost"]),
             )
+        if decision.edge >= self.config.quant_min_edge * Decimal("1.5"):
+            return (
+                "add_same_side_edge",
+                (Decimal("1"), decision.edge, decision.probability, -position_after["total_cost"]),
+            )
         return (
-            "add_same_side_edge",
-            (Decimal("1"), decision.edge, decision.probability, -position_after["total_cost"]),
+            "weak_candidate",
+            (Decimal("0"), decision.edge, improvement, -position_after["total_cost"]),
         )
 
     def select_lock_candidate(self, candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:

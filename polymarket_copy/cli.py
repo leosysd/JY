@@ -919,9 +919,13 @@ def summarize_quant_data(config_path: Path) -> None:
         print("当前模拟资金:")
         print(f"  已结算盈亏 realized_pnl={latest_bankroll.get('realized_pnl')}")
         print(f"  当前权益 equity={latest_bankroll.get('equity')}")
+        print(f"  风险权益 risk_equity={latest_bankroll.get('risk_equity')}")
+        print(f"  最坏回撤 risk_drawdown_usdc={latest_bankroll.get('risk_drawdown_usdc')}")
         print(f"  可继续下单 available_to_add={latest_bankroll.get('available_to_add')}")
         print(f"  当前市场成本 current_market_cost={latest_bankroll.get('current_market_cost')}")
+        print(f"  当前市场最坏收益 current_market_worst_pnl={latest_bankroll.get('current_market_worst_pnl')}")
         print(f"  其他未结算成本 other_unsettled_cost={latest_bankroll.get('other_unsettled_cost')}")
+        print(f"  其他未结算最坏收益 other_unsettled_worst_pnl={latest_bankroll.get('other_unsettled_worst_pnl')}")
         print(
             "  "
             f"已结算/未结算市场 settled={latest_bankroll.get('settled_markets')} "
