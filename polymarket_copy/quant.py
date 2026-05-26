@@ -714,22 +714,32 @@ class PolymarketQuantBot:
             return None, review
 
     def make_decision(self, market: QuantMarket, snapshot: BtcSnapshot) -> Optional[QuantDecision]:
+        dry_run_rejections: List[str] = []
         if not self.state.cooldown_ready(self.config.quant_cooldown_sec):
             self.log_throttled("[AI QUANT] 冷却中，暂不下单。")
-            self.record_signal(market, snapshot, "skip", "cooldown", [])
-            return None
+            if self.config.dry_run:
+                dry_run_rejections.append("cooldown")
+            else:
+                self.record_signal(market, snapshot, "skip", "cooldown", [], force=True)
+                return None
         if market.seconds_left < self.config.quant_min_seconds_left:
             self.log_throttled(
                 f"[AI QUANT] {market.title} 剩余 {market.seconds_left}s，低于最小剩余时间，跳过。"
             )
-            self.record_signal(market, snapshot, "skip", "low_seconds_left", [])
-            return None
+            if self.config.dry_run:
+                dry_run_rejections.append("low_seconds_left")
+            else:
+                self.record_signal(market, snapshot, "skip", "low_seconds_left", [], force=True)
+                return None
         if market.seconds_left > self.config.quant_max_seconds_left:
             self.log_throttled(
                 f"[AI QUANT] {market.title} remaining={market.seconds_left}s above entry window, wait."
             )
-            self.record_signal(market, snapshot, "skip", "too_early", [])
-            return None
+            if self.config.dry_run:
+                dry_run_rejections.append("too_early")
+            else:
+                self.record_signal(market, snapshot, "skip", "too_early", [], force=True)
+                return None
 
         candidates: List[QuantDecision] = []
         candidate_records: List[Dict[str, Any]] = []
@@ -810,10 +820,27 @@ class PolymarketQuantBot:
 
         if not candidates:
             self.log_throttled("[AI QUANT] 没有可用盘口候选。")
-            self.record_signal(market, snapshot, "skip", "no_valid_candidates", candidate_records)
+            self.record_signal(
+                market,
+                snapshot,
+                "would_skip" if self.config.dry_run else "skip",
+                "no_valid_candidates",
+                candidate_records,
+                force=self.config.dry_run,
+            )
             return None
 
         best = max(candidates, key=lambda item: item.edge)
+        if dry_run_rejections:
+            self.record_signal(
+                market,
+                snapshot,
+                "would_skip",
+                ",".join(dry_run_rejections),
+                candidate_records,
+                selected=best,
+                force=True,
+            )
         if best.edge < self.config.quant_min_edge:
             self.log_throttled(
                 "[AI QUANT] "
@@ -823,12 +850,14 @@ class PolymarketQuantBot:
             self.record_signal(
                 market,
                 snapshot,
-                "skip",
+                "would_skip" if self.config.dry_run else "skip",
                 "edge_below_min",
                 candidate_records,
                 selected=best,
+                force=self.config.dry_run,
             )
-            return None
+            if not self.config.dry_run:
+                return None
         self.record_signal(
             market,
             snapshot,
@@ -980,120 +1009,74 @@ class PolymarketQuantBot:
             position_before["total_cost"],
             position_before["worst_pnl"],
         )
-        if bankroll_before["equity"] <= 0:
-            self.log_throttled(
-                f"[AI LOCK] 模拟本金已耗尽 equity={bankroll_before['equity']}，停止新增模拟单。"
-            )
+        dry_run_rejections: List[str] = []
+
+        def block_or_record(reason: str, message: str = "") -> bool:
+            if message:
+                self.log_throttled(message)
+            if self.config.dry_run:
+                dry_run_rejections.append(reason)
+                return False
             self.record_lock_signal(
                 market,
                 snapshot,
                 action="skip",
-                reason="equity_depleted",
+                reason=reason,
                 candidates=[],
                 position_before=position_before,
                 position_after=position_before,
                 bankroll_before=bankroll_before,
                 bankroll_after=bankroll_before,
+                force=True,
             )
+            return True
+
+        if bankroll_before["equity"] <= 0 and block_or_record(
+            "equity_depleted",
+            f"[AI LOCK] 模拟本金已耗尽 equity={bankroll_before['equity']}，停止新增模拟单。",
+        ):
             return None
         if (
             self.config.quant_max_drawdown_usdc > 0
             and bankroll_before["risk_drawdown_usdc"] >= self.config.quant_max_drawdown_usdc
-        ):
-            self.log_throttled(
+            and block_or_record(
+                "max_drawdown_reached",
                 "[AI LOCK] "
                 f"已达到最大模拟回撤 realized_pnl={bankroll_before['realized_pnl']} "
-                f"limit=-{self.config.quant_max_drawdown_usdc}，停止新增模拟单。"
+                f"limit=-{self.config.quant_max_drawdown_usdc}，停止新增模拟单。",
             )
-            self.record_lock_signal(
-                market,
-                snapshot,
-                action="skip",
-                reason="max_drawdown_reached",
-                candidates=[],
-                position_before=position_before,
-                position_after=position_before,
-                bankroll_before=bankroll_before,
-                bankroll_after=bankroll_before,
-            )
+        ):
             return None
-        if self.config.quant_lock_stop_on_lock and bool(entry.get("locked")):
-            self.log_throttled(f"[AI LOCK] {market.slug} 已经锁利，停止本市场。")
-            self.record_lock_signal(
-                market,
-                snapshot,
-                action="skip",
-                reason="market_locked",
-                candidates=[],
-                position_before=position_before,
-                position_after=position_before,
-                bankroll_before=bankroll_before,
-                bankroll_after=bankroll_before,
-            )
+        if self.config.quant_lock_stop_on_lock and bool(entry.get("locked")) and block_or_record(
+            "market_locked",
+            f"[AI LOCK] {market.slug} 已经锁利，停止本市场。",
+        ):
             return None
-        if market.seconds_left < self.config.quant_min_seconds_left:
-            self.log_throttled(
-                f"[AI LOCK] {market.title} 剩余 {market.seconds_left}s，低于最小剩余时间，跳过。"
-            )
-            self.record_lock_signal(
-                market,
-                snapshot,
-                action="skip",
-                reason="low_seconds_left",
-                candidates=[],
-                position_before=position_before,
-                position_after=position_before,
-                bankroll_before=bankroll_before,
-                bankroll_after=bankroll_before,
-            )
+        if market.seconds_left < self.config.quant_min_seconds_left and block_or_record(
+            "low_seconds_left",
+            f"[AI LOCK] {market.title} 剩余 {market.seconds_left}s，低于最小剩余时间，跳过。",
+        ):
             return None
-        if market.seconds_left > self.config.quant_max_seconds_left:
-            self.log_throttled(
-                f"[AI LOCK] {market.title} remaining={market.seconds_left}s above entry window, wait."
-            )
-            self.record_lock_signal(
-                market,
-                snapshot,
-                action="skip",
-                reason="too_early",
-                candidates=[],
-                position_before=position_before,
-                position_after=position_before,
-                bankroll_before=bankroll_before,
-                bankroll_after=bankroll_before,
-            )
+        if market.seconds_left > self.config.quant_max_seconds_left and block_or_record(
+            "too_early",
+            f"[AI LOCK] {market.title} remaining={market.seconds_left}s above entry window, wait.",
+        ):
             return None
-        if position_before["trade_count"] >= Decimal(str(self.config.quant_max_trades_per_market)):
-            self.log_throttled(f"[AI LOCK] {market.slug} 已达到单市场最多笔数，跳过。")
-            self.record_lock_signal(
-                market,
-                snapshot,
-                action="skip",
-                reason="max_trades_reached",
-                candidates=[],
-                position_before=position_before,
-                position_after=position_before,
-                bankroll_before=bankroll_before,
-                bankroll_after=bankroll_before,
-            )
+        if position_before["trade_count"] >= Decimal(str(self.config.quant_max_trades_per_market)) and block_or_record(
+            "max_trades_reached",
+            f"[AI LOCK] {market.slug} 已达到单市场最多笔数，跳过。",
+        ):
             return None
         last_trade_ts = float(entry.get("last_trade_ts") or 0)
-        if last_trade_ts and time.time() - last_trade_ts < self.config.quant_rebuy_cooldown_sec:
-            self.record_lock_signal(
-                market,
-                snapshot,
-                action="skip",
-                reason="rebuy_cooldown",
-                candidates=[],
-                position_before=position_before,
-                position_after=position_before,
-                bankroll_before=bankroll_before,
-                bankroll_after=bankroll_before,
-            )
+        if (
+            last_trade_ts
+            and time.time() - last_trade_ts < self.config.quant_rebuy_cooldown_sec
+            and block_or_record("rebuy_cooldown")
+        ):
             return None
 
         candidates, candidate_records = self.build_lock_candidates(market, snapshot, position_before, bankroll_before)
-        selected = self.select_lock_candidate(candidates)
+        selected = self.select_lock_candidate(candidates, include_rejected=self.config.dry_run)
         if selected is None:
             self.log_throttled(
                 "[AI LOCK] "
@@ -1104,15 +1087,51 @@ class PolymarketQuantBot:
             self.record_lock_signal(
                 market,
                 snapshot,
-                action="skip",
+                action="would_skip" if self.config.dry_run else "skip",
                 reason="no_lock_candidate",
                 candidates=candidate_records,
                 position_before=position_before,
                 position_after=position_before,
                 bankroll_before=bankroll_before,
                 bankroll_after=bankroll_before,
+                selected_meta={"dry_run_rejections": dry_run_rejections} if dry_run_rejections else None,
+                force=self.config.dry_run,
             )
             return None
+        selected_rejections = list(selected.get("dry_run_rejections") or [])
+        all_rejections = dry_run_rejections + [
+            reason for reason in selected_rejections if reason not in dry_run_rejections
+        ]
+        selected_score = selected.get("score")
+        if (
+            self.config.dry_run
+            and isinstance(selected_score, tuple)
+            and selected_score[0] <= 0
+        ):
+            weak_reason = str(selected.get("reason") or "weak_candidate")
+            if weak_reason not in all_rejections:
+                all_rejections.append(weak_reason)
+        if all_rejections:
+            selected = dict(selected)
+            selected["dry_run_rejections"] = all_rejections
+            self.record_lock_signal(
+                market,
+                snapshot,
+                action="would_skip",
+                reason=",".join(all_rejections),
+                candidates=candidate_records,
+                selected=selected.get("decision"),
+                selected_meta=lock_candidate_payload(selected),
+                position_before=position_before,
+                position_after=selected.get("position_after", position_before),
+                bankroll_before=bankroll_before,
+                bankroll_after=self.lock_bankroll_snapshot(
+                    market.slug,
+                    selected.get("position_after", position_before)["total_cost"],
+                    selected.get("position_after", position_before)["worst_pnl"],
+                ),
+                force=True,
+            )
 
         return self.execute_lock_plan(
             market,
@@ -1464,27 +1483,31 @@ class PolymarketQuantBot:
                 )
                 continue
             notional = (size * limit_price).quantize(Decimal("0.0001"))
+            dry_run_rejections: List[str] = []
             if notional > budget_remaining:
-                candidate_records.append(
-                    {
-                        "outcome": outcome,
-                        "token_id": token_id,
-                        "probability": probability.quantize(Decimal("0.0001")),
-                        "best_ask": best_ask,
-                        "raw_edge": raw_edge.quantize(Decimal("0.0001")),
-                        "edge": edge.quantize(Decimal("0.0001")),
-                        "limit_price": limit_price,
-                        "size": size,
-                        "notional": notional,
-                        "budget_remaining": budget_remaining,
-                        "market_budget_remaining": market_budget_remaining,
-                        "bankroll_before": lock_bankroll_payload(bankroll_before),
-                        "position_before": lock_position_payload(position_before),
-                        "valid": False,
-                        "skip_reason": "budget_cap_reached",
-                    }
-                )
-                continue
+                if self.config.dry_run:
+                    dry_run_rejections.append("budget_cap_reached")
+                else:
+                    candidate_records.append(
+                        {
+                            "outcome": outcome,
+                            "token_id": token_id,
+                            "probability": probability.quantize(Decimal("0.0001")),
+                            "best_ask": best_ask,
+                            "raw_edge": raw_edge.quantize(Decimal("0.0001")),
+                            "edge": edge.quantize(Decimal("0.0001")),
+                            "limit_price": limit_price,
+                            "size": size,
+                            "notional": notional,
+                            "budget_remaining": budget_remaining,
+                            "market_budget_remaining": market_budget_remaining,
+                            "bankroll_before": lock_bankroll_payload(bankroll_before),
+                            "position_before": lock_position_payload(position_before),
+                            "valid": False,
+                            "skip_reason": "budget_cap_reached",
+                        }
+                    )
+                    continue
 
             position_after = lock_position_after_trade(position_before, outcome, size, limit_price)
             improvement = position_after["worst_pnl"] - position_before["worst_pnl"]
@@ -1503,26 +1526,29 @@ class PolymarketQuantBot:
                 self.config.quant_max_drawdown_usdc > 0
                 and risk_drawdown_after > self.config.quant_max_drawdown_usdc
             ):
-                candidate_records.append(
-                    {
-                        "outcome": outcome,
-                        "token_id": token_id,
-                        "probability": probability.quantize(Decimal("0.0001")),
-                        "best_ask": best_ask,
-                        "raw_edge": raw_edge.quantize(Decimal("0.0001")),
-                        "edge": edge.quantize(Decimal("0.0001")),
-                        "limit_price": limit_price,
-                        "size": size,
-                        "notional": notional,
-                        "risk_drawdown_after": risk_drawdown_after.quantize(Decimal("0.0001")),
-                        "max_drawdown_usdc": self.config.quant_max_drawdown_usdc,
-                        "position_after": lock_position_payload(position_after),
-                        "bankroll_before": lock_bankroll_payload(bankroll_before),
-                        "valid": False,
-                        "skip_reason": "max_drawdown_candidate",
-                    }
-                )
-                continue
+                if self.config.dry_run:
+                    dry_run_rejections.append("max_drawdown_candidate")
+                else:
+                    candidate_records.append(
+                        {
+                            "outcome": outcome,
+                            "token_id": token_id,
+                            "probability": probability.quantize(Decimal("0.0001")),
+                            "best_ask": best_ask,
+                            "raw_edge": raw_edge.quantize(Decimal("0.0001")),
+                            "edge": edge.quantize(Decimal("0.0001")),
+                            "limit_price": limit_price,
+                            "size": size,
+                            "notional": notional,
+                            "risk_drawdown_after": risk_drawdown_after.quantize(Decimal("0.0001")),
+                            "max_drawdown_usdc": self.config.quant_max_drawdown_usdc,
+                            "position_after": lock_position_payload(position_after),
+                            "bankroll_before": lock_bankroll_payload(bankroll_before),
+                            "valid": False,
+                            "skip_reason": "max_drawdown_candidate",
+                        }
+                    )
+                    continue
             decision = QuantDecision(
                 market=market,
                 outcome=outcome,
@@ -1554,14 +1580,22 @@ class PolymarketQuantBot:
                 "position_after": position_after,
                 "improvement_worst_pnl": improvement,
                 "would_lock": would_lock,
+                "dry_run_rejections": dry_run_rejections,
             }
             outcome_items[outcome] = item
             candidates.append(item)
-            candidate_records.append(lock_candidate_payload(item) | {"valid": True})
+            candidate_record = lock_candidate_payload(item) | {"valid": not dry_run_rejections}
+            if dry_run_rejections:
+                candidate_record["would_skip_reasons"] = dry_run_rejections
+            candidate_records.append(candidate_record)
         arb_item = self.detect_pure_arbitrage(position_before, bankroll_before, outcome_items)
         if arb_item is not None:
             candidates.append(arb_item)
-            candidate_records.append(lock_candidate_payload(arb_item) | {"valid": True})
+            dry_run_rejections = arb_item.get("dry_run_rejections") or []
+            candidate_record = lock_candidate_payload(arb_item) | {"valid": not dry_run_rejections}
+            if dry_run_rejections:
+                candidate_record["would_skip_reasons"] = dry_run_rejections
+            candidate_records.append(candidate_record)
         return candidates, candidate_records
 
     def detect_pure_arbitrage(
@@ -1590,10 +1624,17 @@ class PolymarketQuantBot:
             return None
         notional = (size * sum_limit).quantize(Decimal("0.0001"))
         market_cost_after = position_before["total_cost"] + notional
+        dry_run_rejections: List[str] = []
         if market_cost_after > self.config.quant_market_max_usdc:
-            return None
+            if self.config.dry_run:
+                dry_run_rejections.append("market_cap_reached")
+            else:
+                return None
         if notional > bankroll_before["available_to_add"]:
-            return None
+            if self.config.dry_run:
+                dry_run_rejections.append("bankroll_cap_reached")
+            else:
+                return None
         up_leg = QuantDecision(
             market=up_decision.market,
             outcome=up_decision.outcome,
@@ -1633,6 +1674,7 @@ class PolymarketQuantBot:
             "sum_ask": sum_ask,
             "sum_limit": sum_limit,
             "arbitrage_edge": arb_edge,
+            "dry_run_rejections": dry_run_rejections,
         }
 
     def score_lock_candidate(
@@ -1675,12 +1717,16 @@ class PolymarketQuantBot:
     ) -> bool:
         return position_before["trade_count"] > 0 and position_after["worst_pnl"] > position_before["worst_pnl"]
 
-    def select_lock_candidate(self, candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    def select_lock_candidate(
+        self,
+        candidates: List[Dict[str, Any]],
+        include_rejected: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         usable = [
             item
             for item in candidates
             if isinstance(item.get("score"), tuple)
-            and item["score"][0] > 0
+            and (include_rejected or item["score"][0] > 0)
         ]
         if not usable:
             return None
@@ -1975,6 +2021,7 @@ def lock_candidate_payload(item: Dict[str, Any]) -> Dict[str, Any]:
         "sum_ask": item.get("sum_ask"),
         "sum_limit": item.get("sum_limit"),
         "arbitrage_edge": item.get("arbitrage_edge"),
+        "dry_run_rejections": item.get("dry_run_rejections", []),
     }
 
 
