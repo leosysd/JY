@@ -1003,18 +1003,13 @@ class PolymarketQuantBot:
             position_before["total_cost"],
             position_before["worst_pnl"],
         )
-        dry_run_rejections: List[str] = []
-
         def block_or_record(reason: str, message: str = "") -> bool:
             if message:
                 self.log_throttled(message)
-            if self.config.dry_run:
-                dry_run_rejections.append(reason)
-                return False
             self.record_lock_signal(
                 market,
                 snapshot,
-                action="skip",
+                action="would_skip" if self.config.dry_run else "skip",
                 reason=reason,
                 candidates=[],
                 position_before=position_before,
@@ -1088,14 +1083,10 @@ class PolymarketQuantBot:
                 position_after=position_before,
                 bankroll_before=bankroll_before,
                 bankroll_after=bankroll_before,
-                selected_meta={"dry_run_rejections": dry_run_rejections} if dry_run_rejections else None,
                 force=self.config.dry_run,
             )
             return None
-        selected_rejections = list(selected.get("dry_run_rejections") or [])
-        all_rejections = dry_run_rejections + [
-            reason for reason in selected_rejections if reason not in dry_run_rejections
-        ]
+        all_rejections = list(selected.get("dry_run_rejections") or [])
         selected_score = selected.get("score")
         if self.config.dry_run and isinstance(selected_score, tuple) and selected_score[0] <= 0:
             weak_reason = str(selected.get("reason") or "weak_candidate")
