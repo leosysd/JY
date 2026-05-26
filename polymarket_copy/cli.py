@@ -76,7 +76,7 @@ QUANT_PRESETS: Dict[str, Dict[str, str]] = {
         "QUANT_CAPITAL_USDC": "300",
         "QUANT_MARKET_MAX_USDC": "300",
         "QUANT_MAX_TRADES_PER_MARKET": "30",
-        "QUANT_REBUY_COOLDOWN_SEC": "3",
+        "QUANT_REBUY_COOLDOWN_SEC": "8",
         "QUANT_LOCK_MIN_PROFIT": "0.20",
         "QUANT_LOCK_STOP_ON_LOCK": "0",
         "QUANT_ARBITRAGE_MIN_PROFIT": "0.005",
