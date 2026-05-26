@@ -931,8 +931,8 @@ def summarize_quant_data(config_path: Path) -> None:
         print("最新市场仓位:")
         print(
             "  "
-            f"up_shares={latest_position.get('up_shares')} "
-            f"down_shares={latest_position.get('down_shares')} "
+            f"up_size={latest_position.get('up_size')} "
+            f"down_size={latest_position.get('down_size')} "
             f"total_cost={latest_position.get('total_cost')}"
         )
         print(
