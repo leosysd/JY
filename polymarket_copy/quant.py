@@ -1071,8 +1071,6 @@ class PolymarketQuantBot:
 
         candidates, candidate_records = self.build_lock_candidates(market, snapshot, position_before, bankroll_before)
         selected = self.select_lock_candidate(candidates)
-        if selected is None and self.config.dry_run:
-            selected = self.select_lock_candidate(candidates, include_rejected=True)
         if selected is None:
             self.log_throttled(
                 "[AI LOCK] "
@@ -1585,6 +1583,9 @@ class PolymarketQuantBot:
                 would_lock,
                 improvement,
             )
+            model_rejections: List[str] = []
+            if score and score[0] <= 0:
+                model_rejections.append(reason)
             item = {
                 "decision": decision,
                 "legs": [decision],
@@ -1594,17 +1595,20 @@ class PolymarketQuantBot:
                 "max_notional": max_notional,
                 "position_after": position_after,
                 "improvement_worst_pnl": improvement,
+                "expected_pnl_before": expected_lock_pnl(position_before, probability if outcome == "Up" else Decimal("1") - probability),
+                "expected_pnl_after": expected_lock_pnl(position_after, probability if outcome == "Up" else Decimal("1") - probability),
                 "would_lock": would_lock,
-                "dry_run_rejections": dry_run_rejections,
+                "dry_run_rejections": dry_run_rejections + model_rejections,
                 "side_trade_count_before": side_trade_count_before,
                 "side_trade_count_after": position_after[side_count_key],
                 "side_trade_limit": MAX_LOCK_TRADES_PER_SIDE,
             }
             outcome_items[outcome] = item
             candidates.append(item)
-            candidate_record = lock_candidate_payload(item) | {"valid": not dry_run_rejections}
-            if dry_run_rejections:
-                candidate_record["would_skip_reasons"] = dry_run_rejections
+            all_rejections = item.get("dry_run_rejections") or []
+            candidate_record = lock_candidate_payload(item) | {"valid": not all_rejections}
+            if all_rejections:
+                candidate_record["would_skip_reasons"] = all_rejections
             candidate_records.append(candidate_record)
         arb_item = self.detect_pure_arbitrage(position_before, bankroll_before, outcome_items)
         if arb_item is not None:
@@ -1707,43 +1711,115 @@ class PolymarketQuantBot:
         would_lock: bool,
         improvement: Decimal,
     ) -> Tuple[str, Tuple[Decimal, ...]]:
+        p_up = decision.probability if decision.outcome == "Up" else Decimal("1") - decision.probability
+        expected_before = expected_lock_pnl(position_before, p_up)
+        expected_after = expected_lock_pnl(position_after, p_up)
+        expected_gain = expected_after - expected_before
+        notional = max(position_after["total_cost"] - position_before["total_cost"], Decimal("0.000001"))
+        expected_efficiency = expected_gain / notional
+        pnl_gap_before = abs(position_before["up_pnl"] - position_before["down_pnl"])
         pnl_gap = abs(position_after["up_pnl"] - position_after["down_pnl"])
-        base_score = (
-            Decimal("1"),
-            position_after["worst_pnl"],
-            -pnl_gap,
-            improvement,
-            decision.edge,
-            -position_after["total_cost"],
-        )
+        gap_improvement = pnl_gap_before - pnl_gap
+        favorite_outcome = "Up" if p_up >= Decimal("0.5") else "Down"
+        is_favorite = decision.outcome == favorite_outcome
+        strong_market_momentum = decision.best_ask >= Decimal("0.65") and is_favorite
+        cheap_inventory_hedge = decision.best_ask <= Decimal("0.35") and improvement > 0
+        expected_positive = expected_gain > Decimal("0")
         if would_lock:
             return (
                 "lock_profit",
-                (Decimal("2"), position_after["worst_pnl"], -pnl_gap, improvement, decision.edge, -position_after["total_cost"]),
-            )
-        if self.detect_inventory_lock(position_before, position_after):
-            return (
-                "inventory_lock",
-                base_score,
+                (
+                    Decimal("5"),
+                    position_after["worst_pnl"],
+                    expected_after,
+                    -pnl_gap,
+                    improvement,
+                    decision.edge,
+                    -position_after["total_cost"],
+                ),
             )
         if position_before["trade_count"] == 0:
-            return (
-                "initial_probe",
-                (Decimal("1"), decision.edge, -pnl_gap, position_after["worst_pnl"], -position_after["total_cost"]),
-            )
-        if decision.edge < self.config.quant_min_edge:
-            if self.is_rebalance_side(position_before, decision.outcome):
+            if not is_favorite and decision.edge < Decimal("0"):
                 return (
-                    "rebalance_worst_side",
-                    base_score,
+                    "initial_wrong_side",
+                    (Decimal("0"), expected_after, decision.edge, -pnl_gap, -position_after["total_cost"]),
                 )
             return (
-                "weak_candidate",
-                base_score,
+                "initial_momentum_probe",
+                (
+                    Decimal("3"),
+                    expected_after,
+                    decision.edge,
+                    decision.probability,
+                    -pnl_gap,
+                    -position_after["total_cost"],
+                ),
+            )
+        if expected_positive and (is_favorite or decision.edge >= self.config.quant_min_edge):
+            return (
+                "expected_value_add",
+                (
+                    Decimal("4"),
+                    expected_after,
+                    expected_efficiency,
+                    decision.edge,
+                    -pnl_gap,
+                    -position_after["total_cost"],
+                ),
+            )
+        if strong_market_momentum:
+            return (
+                "momentum_follow",
+                (
+                    Decimal("3"),
+                    expected_after,
+                    decision.probability,
+                    decision.best_ask,
+                    decision.edge,
+                    -pnl_gap,
+                    -position_after["total_cost"],
+                ),
+            )
+        if (
+            self.is_rebalance_side(position_before, decision.outcome)
+            and improvement > 0
+            and gap_improvement > 0
+            and expected_gain >= -(notional * Decimal("0.20"))
+        ):
+            return (
+                "rebalance_worst_side",
+                (
+                    Decimal("2"),
+                    improvement,
+                    gap_improvement,
+                    expected_after,
+                    -pnl_gap,
+                    -position_after["total_cost"],
+                ),
+            )
+        if cheap_inventory_hedge and expected_gain >= -(notional * Decimal("0.35")):
+            return (
+                "cheap_inventory_hedge",
+                (
+                    Decimal("1"),
+                    improvement,
+                    expected_after,
+                    -pnl_gap,
+                    decision.edge,
+                    -position_after["total_cost"],
+                ),
             )
         return (
-            "chase_edge",
-            base_score,
+            "weak_candidate",
+            (
+                Decimal("0"),
+                expected_after,
+                expected_gain,
+                improvement,
+                decision.edge,
+                -pnl_gap,
+                -position_after["total_cost"],
+            ),
         )
 
     def detect_inventory_lock(
@@ -1976,6 +2052,11 @@ def recalc_lock_position(position: Dict[str, Decimal]) -> Dict[str, Decimal]:
     return position
 
 
+def expected_lock_pnl(position: Dict[str, Decimal], up_probability: Decimal) -> Decimal:
+    up_probability = min(max(up_probability, Decimal("0")), Decimal("1"))
+    return position["up_pnl"] * up_probability + position["down_pnl"] * (Decimal("1") - up_probability)
+
+
 def lock_position_from_entry(entry: Dict[str, Any]) -> Dict[str, Decimal]:
     position = base_lock_position()
     trades = entry.get("trades")
@@ -2071,6 +2152,8 @@ def lock_candidate_payload(item: Dict[str, Any]) -> Dict[str, Any]:
         "max_notional": item.get("max_notional"),
         "reason": item.get("reason"),
         "improvement_worst_pnl": item.get("improvement_worst_pnl"),
+        "expected_pnl_before": item.get("expected_pnl_before"),
+        "expected_pnl_after": item.get("expected_pnl_after"),
         "would_lock": bool(item.get("would_lock")),
         "score": list(score) if isinstance(score, tuple) else score,
         "position_after": lock_position_payload(item.get("position_after", base_lock_position())),
