@@ -25,6 +25,8 @@ from .config import CopyBotConfig, validate_config
 GAMMA_API = "https://gamma-api.polymarket.com"
 OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/history-candles"
 MAX_LOCK_TRADES_PER_SIDE = Decimal("20")
+SAME_OUTCOME_REPEAT_SEC = 6
+SAME_OUTCOME_MIN_PRICE_MOVE = Decimal("0.01")
 
 
 @dataclass(frozen=True)
@@ -1064,7 +1066,13 @@ class PolymarketQuantBot:
         ):
             return None
 
-        candidates, candidate_records = self.build_lock_candidates(market, snapshot, position_before, bankroll_before)
+        candidates, candidate_records = self.build_lock_candidates(
+            market,
+            snapshot,
+            position_before,
+            bankroll_before,
+            entry,
+        )
         selected = self.select_lock_candidate(candidates)
         if selected is None:
             self.log_throttled(
@@ -1400,6 +1408,7 @@ class PolymarketQuantBot:
         snapshot: BtcSnapshot,
         position_before: Dict[str, Decimal],
         bankroll_before: Dict[str, Decimal],
+        entry: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         candidates: List[Dict[str, Any]] = []
         candidate_records: List[Dict[str, Any]] = []
@@ -1485,6 +1494,9 @@ class PolymarketQuantBot:
             notional = (size * best_ask).quantize(Decimal("0.0001"))
             max_notional = notional
             dry_run_rejections: List[str] = []
+            repeat_skip_reason = same_outcome_repeat_skip(entry, outcome, best_ask)
+            if repeat_skip_reason:
+                dry_run_rejections.append(repeat_skip_reason)
             if max_notional > budget_remaining:
                 if self.config.dry_run:
                     dry_run_rejections.append("budget_cap_reached")
@@ -2098,6 +2110,31 @@ def lock_position_after_trade(
         position["down_trade_count"] += Decimal("1")
     position["trade_count"] += Decimal("1")
     return recalc_lock_position(position)
+
+
+def same_outcome_repeat_skip(
+    entry: Optional[Dict[str, Any]],
+    outcome: str,
+    best_ask: Decimal,
+) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    trades = entry.get("trades")
+    if not isinstance(trades, list) or not trades:
+        return ""
+    for trade in reversed(trades):
+        if not isinstance(trade, dict):
+            continue
+        if str(trade.get("outcome") or "") != outcome:
+            return ""
+        last_ts = int(state_decimal(trade.get("ts")))
+        if last_ts <= 0 or time.time() - last_ts >= SAME_OUTCOME_REPEAT_SEC:
+            return ""
+        last_price = state_decimal(trade.get("limit_price"))
+        if abs(best_ask - last_price) >= SAME_OUTCOME_MIN_PRICE_MOVE:
+            return ""
+        return "same_outcome_no_price_move"
+    return ""
 
 
 def lock_position_payload(position: Dict[str, Decimal]) -> Dict[str, Any]:
