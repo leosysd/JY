@@ -230,7 +230,7 @@ JetFadil 风格锁利模拟：
 ```bash
 jy set-bot-mode quant
 jy set-dry-run 1
-jy set-quant-config --strategy lock --size-mode shares --order-shares 5 --capital-usdc 300 --market-max-usdc 60 --max-trades-per-market 8 --rebuy-cooldown-sec 15 --lock-min-profit 0.50 --min-edge 0.08 --max-drawdown-usdc 0 --price-source chainlink --chainlink-timeout-sec 20 --chainlink-max-age-sec 240 --chainlink-start-tolerance-sec 180 --record-signals 1 --signal-interval-sec 5
+jy set-quant-config --strategy lock --size-mode shares --order-shares 5 --capital-usdc 300 --market-max-usdc 60 --max-trades-per-market 2 --rebuy-cooldown-sec 20 --lock-min-profit 0.50 --min-edge 0.08 --min-seconds-left 10 --max-seconds-left 60 --max-drawdown-usdc 0 --price-source chainlink --chainlink-timeout-sec 20 --chainlink-max-age-sec 240 --chainlink-start-tolerance-sec 180 --record-signals 1 --signal-interval-sec 5
 jy quant-data clear
 jy app-logs clear
 jy service restart

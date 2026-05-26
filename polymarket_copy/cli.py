@@ -27,7 +27,9 @@ from .config import (
     DEFAULT_QUANT_CHAINLINK_TIMEOUT_SEC,
     DEFAULT_QUANT_MARKET_MAX_USDC,
     DEFAULT_QUANT_MAX_DRAWDOWN_USDC,
+    DEFAULT_QUANT_MAX_SECONDS_LEFT,
     DEFAULT_QUANT_MAX_TRADES_PER_MARKET,
+    DEFAULT_QUANT_MIN_SECONDS_LEFT,
     DEFAULT_QUANT_ORDER_SHARES,
     DEFAULT_QUANT_REBUY_COOLDOWN_SEC,
     DEFAULT_TARGET_USERNAME,
@@ -180,7 +182,8 @@ def init_config(config_path: Path) -> None:
         "QUANT_LOCK_MIN_PROFIT": existing.get("QUANT_LOCK_MIN_PROFIT", "0.50"),
         "QUANT_LOCK_STOP_ON_LOCK": existing.get("QUANT_LOCK_STOP_ON_LOCK", "1"),
         "QUANT_MIN_EDGE": existing.get("QUANT_MIN_EDGE", "0.04"),
-        "QUANT_MIN_SECONDS_LEFT": existing.get("QUANT_MIN_SECONDS_LEFT", "45"),
+        "QUANT_MIN_SECONDS_LEFT": existing.get("QUANT_MIN_SECONDS_LEFT", DEFAULT_QUANT_MIN_SECONDS_LEFT),
+        "QUANT_MAX_SECONDS_LEFT": existing.get("QUANT_MAX_SECONDS_LEFT", DEFAULT_QUANT_MAX_SECONDS_LEFT),
         "QUANT_MAX_DRAWDOWN_USDC": existing.get("QUANT_MAX_DRAWDOWN_USDC", DEFAULT_QUANT_MAX_DRAWDOWN_USDC),
         "QUANT_COOLDOWN_SEC": existing.get("QUANT_COOLDOWN_SEC", "60"),
         "QUANT_LOG_INTERVAL_SEC": existing.get("QUANT_LOG_INTERVAL_SEC", "10"),
@@ -214,7 +217,8 @@ def print_config_summary(config_path: Path, require_private_key: Optional[bool] 
         f"{config.quant_symbol}, strategy={config.quant_strategy}, source={config.quant_price_source}, "
         f"size_mode={config.quant_size_mode}, order_usdc={config.quant_order_usdc}, "
         f"order_shares={config.quant_order_shares}, "
-        f"min_edge={config.quant_min_edge}, min_seconds_left={config.quant_min_seconds_left}"
+        f"min_edge={config.quant_min_edge}, "
+        f"entry_window={config.quant_min_seconds_left}-{config.quant_max_seconds_left}s"
     )
     print(
         "AI锁利模拟: "
@@ -753,7 +757,8 @@ def update_quant_config(config_path: Path) -> None:
         "QUANT_LOCK_MIN_PROFIT": prompt_text("锁利最低利润 QUANT_LOCK_MIN_PROFIT", existing.get("QUANT_LOCK_MIN_PROFIT", "0.50")),
         "QUANT_LOCK_STOP_ON_LOCK": prompt_text("锁利后停止本市场 QUANT_LOCK_STOP_ON_LOCK，1=停止", existing.get("QUANT_LOCK_STOP_ON_LOCK", "1")),
         "QUANT_MIN_EDGE": prompt_text("最小优势 QUANT_MIN_EDGE，0.04=4分钱", existing.get("QUANT_MIN_EDGE", "0.04")),
-        "QUANT_MIN_SECONDS_LEFT": prompt_text("最少剩余秒数 QUANT_MIN_SECONDS_LEFT", existing.get("QUANT_MIN_SECONDS_LEFT", "45")),
+        "QUANT_MIN_SECONDS_LEFT": prompt_text("最少剩余秒数 QUANT_MIN_SECONDS_LEFT", existing.get("QUANT_MIN_SECONDS_LEFT", DEFAULT_QUANT_MIN_SECONDS_LEFT)),
+        "QUANT_MAX_SECONDS_LEFT": prompt_text("最多剩余秒数 QUANT_MAX_SECONDS_LEFT", existing.get("QUANT_MAX_SECONDS_LEFT", DEFAULT_QUANT_MAX_SECONDS_LEFT)),
         "QUANT_MAX_DRAWDOWN_USDC": prompt_text("最大模拟回撤 QUANT_MAX_DRAWDOWN_USDC，0=不限制", existing.get("QUANT_MAX_DRAWDOWN_USDC", DEFAULT_QUANT_MAX_DRAWDOWN_USDC)),
         "QUANT_COOLDOWN_SEC": prompt_text("量化下单冷却秒数 QUANT_COOLDOWN_SEC", existing.get("QUANT_COOLDOWN_SEC", "60")),
         "QUANT_LOG_INTERVAL_SEC": prompt_text("量化日志间隔秒数 QUANT_LOG_INTERVAL_SEC", existing.get("QUANT_LOG_INTERVAL_SEC", "10")),
@@ -1240,6 +1245,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_quant.add_argument("--lock-stop-on-lock", choices=["0", "1"])
     p_quant.add_argument("--min-edge")
     p_quant.add_argument("--min-seconds-left")
+    p_quant.add_argument("--max-seconds-left")
     p_quant.add_argument("--max-drawdown-usdc")
     p_quant.add_argument("--cooldown-sec")
     p_quant.add_argument("--log-interval-sec")
@@ -1373,6 +1379,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 args.lock_stop_on_lock,
                 args.min_edge,
                 args.min_seconds_left,
+                args.max_seconds_left,
                 args.max_drawdown_usdc,
                 args.cooldown_sec,
                 args.log_interval_sec,
@@ -1456,7 +1463,12 @@ def main(argv: Optional[List[str]] = None) -> None:
             set_env_value(
                 config_path,
                 "QUANT_MIN_SECONDS_LEFT",
-                args.min_seconds_left or existing.get("QUANT_MIN_SECONDS_LEFT", "45"),
+                args.min_seconds_left or existing.get("QUANT_MIN_SECONDS_LEFT", DEFAULT_QUANT_MIN_SECONDS_LEFT),
+            )
+            set_env_value(
+                config_path,
+                "QUANT_MAX_SECONDS_LEFT",
+                args.max_seconds_left or existing.get("QUANT_MAX_SECONDS_LEFT", DEFAULT_QUANT_MAX_SECONDS_LEFT),
             )
             set_env_value(
                 config_path,

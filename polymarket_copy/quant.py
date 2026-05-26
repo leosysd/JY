@@ -460,7 +460,7 @@ class PolymarketQuantBot:
             f"market_cap={self.config.quant_market_max_usdc} "
             f"max_drawdown={self.config.quant_max_drawdown_usdc} "
             f"min_edge={self.config.quant_min_edge} "
-            f"min_seconds_left={self.config.quant_min_seconds_left}"
+            f"entry_window={self.config.quant_min_seconds_left}-{self.config.quant_max_seconds_left}s"
         )
         if self.config.quant_record_signals:
             print(f"[AI QUANT DATA] signals={self.config.quant_signal_file}")
@@ -617,6 +617,12 @@ class PolymarketQuantBot:
                 f"[AI QUANT] {market.title} 剩余 {market.seconds_left}s，低于最小剩余时间，跳过。"
             )
             self.record_signal(market, snapshot, "skip", "low_seconds_left", [])
+            return None
+        if market.seconds_left > self.config.quant_max_seconds_left:
+            self.log_throttled(
+                f"[AI QUANT] {market.title} remaining={market.seconds_left}s above entry window, wait."
+            )
+            self.record_signal(market, snapshot, "skip", "too_early", [])
             return None
 
         candidates: List[QuantDecision] = []
@@ -899,6 +905,22 @@ class PolymarketQuantBot:
                 snapshot,
                 action="skip",
                 reason="low_seconds_left",
+                candidates=[],
+                position_before=position_before,
+                position_after=position_before,
+                bankroll_before=bankroll_before,
+                bankroll_after=bankroll_before,
+            )
+            return None
+        if market.seconds_left > self.config.quant_max_seconds_left:
+            self.log_throttled(
+                f"[AI LOCK] {market.title} remaining={market.seconds_left}s above entry window, wait."
+            )
+            self.record_lock_signal(
+                market,
+                snapshot,
+                action="skip",
+                reason="too_early",
                 candidates=[],
                 position_before=position_before,
                 position_after=position_before,
@@ -1191,11 +1213,6 @@ class PolymarketQuantBot:
                 "initial_probe",
                 (Decimal("2"), decision.edge, decision.probability, -position_after["total_cost"]),
             )
-        if decision.edge >= self.config.quant_min_edge * Decimal("1.5"):
-            return (
-                "add_same_side_edge",
-                (Decimal("1"), decision.edge, decision.probability, -position_after["total_cost"]),
-            )
         return (
             "weak_candidate",
             (Decimal("0"), decision.edge, improvement, -position_after["total_cost"]),
@@ -1273,6 +1290,7 @@ class PolymarketQuantBot:
                 "lock_stop_on_lock": self.config.quant_lock_stop_on_lock,
                 "min_edge": self.config.quant_min_edge,
                 "min_seconds_left": self.config.quant_min_seconds_left,
+                "max_seconds_left": self.config.quant_max_seconds_left,
                 "max_drawdown_usdc": self.config.quant_max_drawdown_usdc,
                 "max_slippage": self.config.max_slippage,
             },
@@ -1328,6 +1346,7 @@ class PolymarketQuantBot:
                 "order_shares": self.config.quant_order_shares,
                 "min_edge": self.config.quant_min_edge,
                 "min_seconds_left": self.config.quant_min_seconds_left,
+                "max_seconds_left": self.config.quant_max_seconds_left,
                 "max_slippage": self.config.max_slippage,
             },
             "candidates": candidates,

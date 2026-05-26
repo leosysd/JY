@@ -20,9 +20,11 @@ DEFAULT_QUANT_CHAINLINK_MAX_AGE_SEC = "240"
 DEFAULT_QUANT_CHAINLINK_START_TOLERANCE_SEC = "180"
 DEFAULT_QUANT_ORDER_SHARES = "5"
 DEFAULT_QUANT_MARKET_MAX_USDC = "60"
-DEFAULT_QUANT_MAX_TRADES_PER_MARKET = "8"
+DEFAULT_QUANT_MAX_TRADES_PER_MARKET = "2"
 DEFAULT_QUANT_REBUY_COOLDOWN_SEC = "15"
 DEFAULT_QUANT_MAX_DRAWDOWN_USDC = "0"
+DEFAULT_QUANT_MIN_SECONDS_LEFT = "10"
+DEFAULT_QUANT_MAX_SECONDS_LEFT = "60"
 
 
 def parse_bool(value: object, default: bool = False) -> bool:
@@ -112,7 +114,8 @@ class CopyBotConfig:
     quant_lock_min_profit: Decimal = Decimal("0.50")
     quant_lock_stop_on_lock: bool = True
     quant_min_edge: Decimal = Decimal("0.04")
-    quant_min_seconds_left: int = 45
+    quant_min_seconds_left: int = int(DEFAULT_QUANT_MIN_SECONDS_LEFT)
+    quant_max_seconds_left: int = int(DEFAULT_QUANT_MAX_SECONDS_LEFT)
     quant_max_drawdown_usdc: Decimal = Decimal(DEFAULT_QUANT_MAX_DRAWDOWN_USDC)
     quant_cooldown_sec: float = 60.0
     quant_log_interval_sec: float = 10.0
@@ -226,7 +229,8 @@ def load_config(config_path: Optional[Path] = None) -> CopyBotConfig:
         quant_lock_min_profit=Decimal(_env("QUANT_LOCK_MIN_PROFIT", "0.50")),
         quant_lock_stop_on_lock=parse_bool(_env("QUANT_LOCK_STOP_ON_LOCK", "1"), default=True),
         quant_min_edge=Decimal(_env("QUANT_MIN_EDGE", "0.04")),
-        quant_min_seconds_left=int(_env("QUANT_MIN_SECONDS_LEFT", "45")),
+        quant_min_seconds_left=int(_env("QUANT_MIN_SECONDS_LEFT", DEFAULT_QUANT_MIN_SECONDS_LEFT)),
+        quant_max_seconds_left=int(_env("QUANT_MAX_SECONDS_LEFT", DEFAULT_QUANT_MAX_SECONDS_LEFT)),
         quant_max_drawdown_usdc=Decimal(_env("QUANT_MAX_DRAWDOWN_USDC", DEFAULT_QUANT_MAX_DRAWDOWN_USDC)),
         quant_cooldown_sec=float(_env("QUANT_COOLDOWN_SEC", "60")),
         quant_log_interval_sec=float(_env("QUANT_LOG_INTERVAL_SEC", "10")),
@@ -327,6 +331,8 @@ def validate_config(config: CopyBotConfig, require_private_key: bool = False) ->
         errors.append("QUANT_MIN_EDGE 必须大于等于 0")
     if config.quant_min_seconds_left < 0:
         errors.append("QUANT_MIN_SECONDS_LEFT 必须大于等于 0")
+    if config.quant_max_seconds_left < config.quant_min_seconds_left:
+        errors.append("QUANT_MAX_SECONDS_LEFT 必须大于等于 QUANT_MIN_SECONDS_LEFT")
     if config.quant_max_drawdown_usdc < 0:
         errors.append("QUANT_MAX_DRAWDOWN_USDC 必须大于等于 0")
     if config.quant_cooldown_sec < 0:
@@ -391,6 +397,7 @@ def env_lines(values: Dict[str, str]) -> List[str]:
         "QUANT_LOCK_STOP_ON_LOCK",
         "QUANT_MIN_EDGE",
         "QUANT_MIN_SECONDS_LEFT",
+        "QUANT_MAX_SECONDS_LEFT",
         "QUANT_MAX_DRAWDOWN_USDC",
         "QUANT_COOLDOWN_SEC",
         "QUANT_LOG_INTERVAL_SEC",
