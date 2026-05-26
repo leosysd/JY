@@ -1725,7 +1725,7 @@ class PolymarketQuantBot:
         gap_improvement = pnl_gap_before - pnl_gap
         favorite_outcome = "Up" if p_up >= Decimal("0.5") else "Down"
         is_favorite = decision.outcome == favorite_outcome
-        strong_market_momentum = decision.best_ask >= Decimal("0.65") and is_favorite
+        strong_market_momentum = decision.best_ask >= Decimal("0.65")
         cheap_inventory_hedge = decision.best_ask <= Decimal("0.35") and improvement > 0
         expected_positive = expected_gain > Decimal("0")
         if decision.best_ask <= Decimal("0.05") and not self.is_rebalance_side(position_before, decision.outcome):
@@ -1755,6 +1755,18 @@ class PolymarketQuantBot:
                 ),
             )
         if position_before["trade_count"] == 0:
+            if strong_market_momentum:
+                return (
+                    "initial_market_momentum",
+                    (
+                        Decimal("4.5"),
+                        decision.best_ask,
+                        expected_after,
+                        decision.edge,
+                        -pnl_gap,
+                        -position_after["total_cost"],
+                    ),
+                )
             if not is_favorite and decision.edge < Decimal("0"):
                 return (
                     "initial_wrong_side",
@@ -1771,6 +1783,19 @@ class PolymarketQuantBot:
                     -position_after["total_cost"],
                 ),
             )
+        if strong_market_momentum:
+            return (
+                "momentum_follow",
+                (
+                    Decimal("4.5"),
+                    decision.best_ask,
+                    expected_after,
+                    decision.probability,
+                    decision.edge,
+                    -pnl_gap,
+                    -position_after["total_cost"],
+                ),
+            )
         if expected_positive and (is_favorite or decision.edge >= self.config.quant_min_edge):
             return (
                 "expected_value_add",
@@ -1778,19 +1803,6 @@ class PolymarketQuantBot:
                     Decimal("4"),
                     expected_after,
                     expected_efficiency,
-                    decision.edge,
-                    -pnl_gap,
-                    -position_after["total_cost"],
-                ),
-            )
-        if strong_market_momentum:
-            return (
-                "momentum_follow",
-                (
-                    Decimal("3"),
-                    expected_after,
-                    decision.probability,
-                    decision.best_ask,
                     decision.edge,
                     -pnl_gap,
                     -position_after["total_cost"],
