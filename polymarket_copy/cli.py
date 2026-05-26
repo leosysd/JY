@@ -862,6 +862,8 @@ def summarize_quant_data(config_path: Path) -> None:
     first_ts = ""
     last_ts = ""
     latest: Optional[Dict[str, object]] = None
+    latest_bankroll: Optional[Dict[str, object]] = None
+    latest_position: Optional[Dict[str, object]] = None
     invalid_lines = 0
 
     for line in data_file.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -889,6 +891,12 @@ def summarize_quant_data(config_path: Path) -> None:
         selected = record.get("selected")
         if isinstance(selected, dict) and selected.get("outcome"):
             outcome_counts[str(selected["outcome"])] += 1
+        bankroll = record.get("bankroll_after")
+        if isinstance(bankroll, dict):
+            latest_bankroll = bankroll
+        position = record.get("position_after")
+        if isinstance(position, dict):
+            latest_position = position
 
     total = sum(action_counts.values())
     print(f"总记录: {total}")
@@ -907,6 +915,32 @@ def summarize_quant_data(config_path: Path) -> None:
         print("选择方向:")
         for outcome, count in outcome_counts.most_common():
             print(f"  {outcome}: {count}")
+    if latest_bankroll:
+        print("当前模拟资金:")
+        print(f"  已结算盈亏 realized_pnl={latest_bankroll.get('realized_pnl')}")
+        print(f"  当前权益 equity={latest_bankroll.get('equity')}")
+        print(f"  可继续下单 available_to_add={latest_bankroll.get('available_to_add')}")
+        print(f"  当前市场成本 current_market_cost={latest_bankroll.get('current_market_cost')}")
+        print(f"  其他未结算成本 other_unsettled_cost={latest_bankroll.get('other_unsettled_cost')}")
+        print(
+            "  "
+            f"已结算/未结算市场 settled={latest_bankroll.get('settled_markets')} "
+            f"unsettled={latest_bankroll.get('unsettled_markets')}"
+        )
+    if latest_position:
+        print("最新市场仓位:")
+        print(
+            "  "
+            f"up_shares={latest_position.get('up_shares')} "
+            f"down_shares={latest_position.get('down_shares')} "
+            f"total_cost={latest_position.get('total_cost')}"
+        )
+        print(
+            "  "
+            f"up_pnl={latest_position.get('up_pnl')} "
+            f"down_pnl={latest_position.get('down_pnl')} "
+            f"worst_pnl={latest_position.get('worst_pnl')}"
+        )
     if latest:
         market = latest.get("market") if isinstance(latest.get("market"), dict) else {}
         selected = latest.get("selected") if isinstance(latest.get("selected"), dict) else {}
