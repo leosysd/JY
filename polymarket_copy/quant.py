@@ -791,6 +791,8 @@ class PolymarketQuantBot:
         self.chainlink_feed = ChainlinkRtdsPriceFeed(config)
         self.binance_feed = BinanceTradePriceFeed(config)
         self.last_log_ts = 0.0
+        self.started_at_ts = int(time.time())
+        self.first_allowed_market_start_ts = next_market_boundary(self.started_at_ts)
 
     def run_forever(self) -> None:
         errors, warnings = validate_config(self.config, require_private_key=not self.config.dry_run)
@@ -824,6 +826,12 @@ class PolymarketQuantBot:
         )
         if self.config.quant_record_signals:
             print(f"[AI QUANT DATA] signals={self.config.quant_signal_file}")
+        if self.first_allowed_market_start_ts > self.started_at_ts:
+            gate_time = datetime.fromtimestamp(
+                self.first_allowed_market_start_ts,
+                tz=timezone.utc,
+            ).isoformat(timespec="seconds")
+            print(f"[AI QUANT] 启动时间校验：等待新 5 分钟盘口，最早入场 UTC={gate_time}")
         if self.config.quant_price_source == "chainlink":
             self.chainlink_feed.start()
         if self.config.quant_direction_source == "binance":
@@ -852,6 +860,17 @@ class PolymarketQuantBot:
             return None
 
         self.market_ws.start(market.token_ids)
+        if self.is_startup_market_blocked(market):
+            gate_time = datetime.fromtimestamp(
+                self.first_allowed_market_start_ts,
+                tz=timezone.utc,
+            ).isoformat(timespec="seconds")
+            self.log_throttled(
+                "[AI QUANT] "
+                f"启动后等待新盘口：current_start={market.start_ts} "
+                f"first_allowed_start={self.first_allowed_market_start_ts} UTC={gate_time}"
+            )
+            return None
         try:
             snapshot = self.fetch_btc_snapshot(market.start_ts)
         except RuntimeError as exc:
@@ -927,6 +946,9 @@ class PolymarketQuantBot:
             if market.start_ts <= now < market.end_ts:
                 return market
         return None
+
+    def is_startup_market_blocked(self, market: QuantMarket) -> bool:
+        return market.start_ts < self.first_allowed_market_start_ts
 
     def fetch_market_by_start(self, start_ts: int) -> Optional[QuantMarket]:
         slug = f"{self.config.quant_market_slug_prefix}-{start_ts}"
@@ -1613,7 +1635,8 @@ class PolymarketQuantBot:
             position_after["total_cost"],
             position_after["worst_pnl"],
         )
-        locked_after = position_after["worst_pnl"] >= self.config.quant_lock_min_profit
+        locked_after = bool(selected.get("arbitrage_lock"))
+        hedge_locked_after = position_after["worst_pnl"] >= self.config.quant_lock_min_profit
         reason = str(selected["reason"])
         print(
             "[AI LOCK BUY] "
@@ -1625,7 +1648,7 @@ class PolymarketQuantBot:
             f"total_cost={position_after['total_cost']} trades={position_after['trade_count']} "
             f"up_trades={position_after['up_trade_count']} down_trades={position_after['down_trade_count']} "
             f"available={bankroll_after['available_to_add']} "
-            f"locked={1 if locked_after else 0} reason={reason}"
+            f"locked={1 if locked_after else 0} hedge_locked={1 if hedge_locked_after else 0} reason={reason}"
         )
         self.record_lock_signal(
             market,
@@ -1702,7 +1725,8 @@ class PolymarketQuantBot:
             position_after["total_cost"],
             position_after["worst_pnl"],
         )
-        locked_after = position_after["worst_pnl"] >= self.config.quant_lock_min_profit
+        locked_after = bool(reviewed.get("arbitrage_lock"))
+        hedge_locked_after = position_after["worst_pnl"] >= self.config.quant_lock_min_profit
         running_position = position_before
         posted_legs = 0
         for index, leg in enumerate(legs):
@@ -1770,7 +1794,7 @@ class PolymarketQuantBot:
             "[AI LOCK BUY] "
             f"mode=LIVE market={market.title} legs={len(legs)} cost={reviewed['notional']} "
             f"up_pnl={position_after['up_pnl']} down_pnl={position_after['down_pnl']} "
-            f"locked={1 if locked_after else 0} reason={reason}"
+            f"locked={1 if locked_after else 0} hedge_locked={1 if hedge_locked_after else 0} reason={reason}"
         )
         self.record_lock_signal(
             market,
@@ -1885,6 +1909,9 @@ class PolymarketQuantBot:
         reviewed["fee"] = fee.quantize(MONEY_QUANT)
         reviewed["total_cost"] = notional.quantize(MONEY_QUANT)
         reviewed["improvement_worst_pnl"] = position_after["worst_pnl"] - position_before["worst_pnl"]
+        reviewed["hedge_locked"] = position_after["worst_pnl"] >= self.config.quant_lock_min_profit
+        reviewed["arbitrage_lock"] = str(reviewed.get("reason")) == "pure_arbitrage"
+        reviewed["would_lock"] = bool(reviewed["arbitrage_lock"])
         return reviewed, review_records
 
     def fresh_pair_execution_payload(self, market: QuantMarket) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -2258,7 +2285,9 @@ class PolymarketQuantBot:
                 "improvement_worst_pnl": improvement,
                 "expected_pnl_before": expected_before,
                 "expected_pnl_after": expected_after,
-                "would_lock": would_lock,
+                "would_lock": False,
+                "hedge_locked": would_lock,
+                "arbitrage_lock": False,
                 "rule_learning": rule_learning,
                 "dry_run_rejections": dry_run_rejections + model_rejections,
                 "side_trade_count_before": side_trade_count_before,
@@ -2302,8 +2331,9 @@ class PolymarketQuantBot:
             if skip_reason not in rejections:
                 rejections.append(skip_reason)
             item["dry_run_rejections"] = rejections
-            item["reason"] = skip_reason
+            item["reason"] = f"lock_profit_rejected:{skip_reason}"
             item["would_lock"] = False
+            item["arbitrage_lock"] = False
             item["score"] = (
                 Decimal("0"),
                 state_decimal(pair_payload.get("locked_profit")),
@@ -2470,7 +2500,9 @@ class PolymarketQuantBot:
             "max_notional": max_notional,
             "position_after": position_after,
             "improvement_worst_pnl": expected_worst_profit,
-            "would_lock": position_after["worst_pnl"] >= self.config.quant_lock_min_profit,
+            "would_lock": True,
+            "hedge_locked": position_after["worst_pnl"] >= self.config.quant_lock_min_profit,
+            "arbitrage_lock": True,
             "sum_ask": sum_ask,
             "arbitrage_edge": arb_edge,
             "gross_arbitrage_edge": gross_arb_edge,
@@ -2600,19 +2632,6 @@ class PolymarketQuantBot:
                     -position_after["total_cost"],
                 ),
             )
-        if would_lock:
-            return (
-                "lock_profit",
-                (
-                    Decimal("5"),
-                    position_after["worst_pnl"],
-                    expected_after,
-                    -pnl_gap,
-                    improvement,
-                    decision.edge,
-                    -position_after["total_cost"],
-                ),
-            )
         if position_before["trade_count"] == 0:
             if strong_market_momentum and decision.edge < Decimal("0"):
                 return (
@@ -2651,6 +2670,19 @@ class PolymarketQuantBot:
                     gap_improvement,
                     expected_after,
                     -pnl_gap,
+                    decision.edge,
+                    -position_after["total_cost"],
+                ),
+            )
+        if would_lock:
+            return (
+                "hedge_profit",
+                (
+                    Decimal("2.5"),
+                    position_after["worst_pnl"],
+                    expected_after,
+                    -pnl_gap,
+                    improvement,
                     decision.edge,
                     -position_after["total_cost"],
                 ),
@@ -2966,6 +2998,11 @@ def state_decimal(value: Any, default: str = "0") -> Decimal:
 
 def quantize_money(value: Decimal) -> Decimal:
     return value.quantize(MONEY_QUANT)
+
+
+def next_market_boundary(ts: int) -> int:
+    remainder = ts % 300
+    return ts if remainder == 0 else ts + (300 - remainder)
 
 
 def decision_cost_components(decision: QuantDecision) -> Tuple[Decimal, Decimal, Decimal]:
@@ -3440,6 +3477,8 @@ def lock_candidate_payload(item: Dict[str, Any]) -> Dict[str, Any]:
         "expected_pnl_after": item.get("expected_pnl_after"),
         "rule_learning": item.get("rule_learning"),
         "would_lock": bool(item.get("would_lock")),
+        "hedge_locked": bool(item.get("hedge_locked")),
+        "arbitrage_lock": bool(item.get("arbitrage_lock")),
         "score": list(score) if isinstance(score, tuple) else score,
         "position_after": lock_position_payload(item.get("position_after", base_lock_position())),
         "legs": leg_payloads,
