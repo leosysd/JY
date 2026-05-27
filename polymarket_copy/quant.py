@@ -86,6 +86,27 @@ class QuantDecision:
     limit_price: Decimal
     size: Decimal
     reason: str
+    vwap_price: Decimal = Decimal("0")
+    effective_price: Decimal = Decimal("0")
+    notional: Decimal = Decimal("0")
+    fee: Decimal = Decimal("0")
+    total_cost: Decimal = Decimal("0")
+    liquidity_levels: int = 0
+
+
+@dataclass(frozen=True)
+class BookFill:
+    requested_size: Decimal
+    filled_size: Decimal
+    best_price: Decimal
+    limit_price: Decimal
+    vwap_price: Decimal
+    notional: Decimal
+    fee: Decimal
+    total_cost: Decimal
+    effective_price: Decimal
+    levels_used: int
+    complete: bool
 
 
 class QuantSignalRecorder:
@@ -571,17 +592,51 @@ class QuantStateStore:
         markets = self.state.get("markets")
         return isinstance(markets, dict) and slug in markets
 
+    def market_trade_count(self, slug: str) -> int:
+        markets = self.state.get("markets")
+        if not isinstance(markets, dict):
+            return 0
+        entry = markets.get(slug)
+        if not isinstance(entry, dict):
+            return 1 if entry is not None else 0
+        try:
+            return int(entry.get("trade_count") or 0)
+        except Exception:
+            pass
+        trades = entry.get("trades")
+        if isinstance(trades, list):
+            return len(trades)
+        return 1
+
     def mark_market(self, decision: QuantDecision, mode: str) -> None:
         markets = self.state.setdefault("markets", {})
-        markets[decision.market.slug] = {
+        entry = markets.get(decision.market.slug)
+        if not isinstance(entry, dict):
+            entry = {}
+        trades = entry.setdefault("trades", [])
+        if not isinstance(trades, list):
+            trades = []
+            entry["trades"] = trades
+        trade = {
             "mode": mode,
             "outcome": decision.outcome,
             "raw_edge": str(decision.raw_edge),
             "edge": str(decision.edge),
             "limit_price": str(decision.limit_price),
+            "vwap_price": str(decision.vwap_price),
+            "effective_price": str(decision.effective_price),
             "size": str(decision.size),
+            "notional": str(decision.notional),
+            "fee": str(decision.fee),
+            "fee_rate": str(POLYMARKET_CRYPTO_TAKER_FEE_RATE),
+            "total_cost": str(decision.total_cost),
+            "liquidity_levels": decision.liquidity_levels,
             "ts": int(time.time()),
         }
+        trades.append(trade)
+        entry.update(trade)
+        entry["trade_count"] = len(trades)
+        markets[decision.market.slug] = entry
         self.state["last_order_ts"] = int(time.time())
         self.save()
 
@@ -792,32 +847,43 @@ class PolymarketQuantBot:
         if decision is None:
             return None
 
-        mode = "DRY_RUN" if self.config.dry_run else "LIVE"
-        print(
-            "[AI QUANT BUY] "
-            f"mode={mode} market={decision.market.title} outcome={decision.outcome} "
-            f"prob={decision.probability} best_ask={decision.best_ask} "
-            f"edge={decision.edge} price={decision.best_ask} size={decision.size} "
-            f"ret_start={snapshot.ret_from_start} ret_1m={snapshot.ret_1m} "
-            f"seconds_left={market.seconds_left} reason={decision.reason}"
-        )
-        if self.config.dry_run:
-            self.state.mark_market(decision, mode="dry_run")
-            return decision
-
         reviewed, review = self.second_review_buy(decision)
         if reviewed is None:
             print(f"[AI QUANT SKIP] second_review_failed market={market.title} review={review}")
             self.record_signal(
                 market,
                 snapshot,
-                "skip",
+                "would_skip" if self.config.dry_run else "skip",
                 "second_review_failed",
                 [review],
                 selected=decision,
                 force=True,
             )
             return None
+
+        mode = "DRY_RUN" if self.config.dry_run else "LIVE"
+        print(
+            "[AI QUANT BUY] "
+            f"mode={mode} market={reviewed.market.title} outcome={reviewed.outcome} "
+            f"prob={reviewed.probability} best_ask={reviewed.best_ask} "
+            f"edge={reviewed.edge} limit={reviewed.limit_price} "
+            f"vwap={reviewed.vwap_price} effective={reviewed.effective_price} "
+            f"fee={reviewed.fee} size={reviewed.size} "
+            f"ret_start={snapshot.ret_from_start} ret_1m={snapshot.ret_1m} "
+            f"seconds_left={market.seconds_left} reason={reviewed.reason}"
+        )
+        self.record_signal(
+            market,
+            snapshot,
+            "would_buy" if self.config.dry_run else "live_buy",
+            "second_review_passed",
+            [review],
+            selected=reviewed,
+            force=True,
+        )
+        if self.config.dry_run:
+            self.state.mark_market(reviewed, mode="dry_run")
+            return reviewed
 
         book = self.fetch_fresh_book(reviewed.token_id)
         tick_size = decimal_value(book.get("tick_size", "0.01"))
@@ -956,17 +1022,43 @@ class PolymarketQuantBot:
                 review["valid"] = False
                 review["skip_reason"] = "size_below_min_order"
                 return None, review
+            max_price = min(best_ask + self.config.max_slippage, Decimal("0.99"))
+            fill = estimate_buy_fill_for_size(book, decision.size, max_price=max_price)
+            review["max_price"] = max_price
+            review["fill"] = fill_payload(fill)
+            if not fill.complete:
+                review["valid"] = False
+                review["skip_reason"] = "insufficient_depth"
+                return None, review
+            if fill.filled_size < min_order_size:
+                review["valid"] = False
+                review["skip_reason"] = "filled_size_below_min_order"
+                return None, review
+            raw_edge = (decision.probability - best_ask).quantize(Decimal("0.0001"))
+            edge = (decision.probability - fill.effective_price).quantize(Decimal("0.0001"))
+            review["raw_edge"] = raw_edge
+            review["edge"] = edge
+            if edge < self.config.quant_min_edge:
+                review["valid"] = False
+                review["skip_reason"] = "edge_below_min_after_review"
+                return None, review
             reviewed = QuantDecision(
                 market=decision.market,
                 outcome=decision.outcome,
                 token_id=decision.token_id,
                 probability=decision.probability,
                 best_ask=best_ask,
-                raw_edge=(decision.probability - best_ask).quantize(Decimal("0.0001")),
-                edge=(decision.probability - best_ask).quantize(Decimal("0.0001")),
-                limit_price=best_ask,
-                size=decision.size,
+                raw_edge=raw_edge,
+                edge=edge,
+                limit_price=fill.limit_price,
+                size=fill.filled_size,
                 reason=f"{decision.reason} | second_review",
+                vwap_price=fill.vwap_price,
+                effective_price=fill.effective_price,
+                notional=fill.notional,
+                fee=fill.fee,
+                total_cost=fill.total_cost,
+                liquidity_levels=fill.levels_used,
             )
             review["valid"] = True
             return reviewed, review
@@ -977,35 +1069,41 @@ class PolymarketQuantBot:
             return None, review
 
     def make_decision(self, market: QuantMarket, snapshot: BtcSnapshot) -> Optional[QuantDecision]:
-        dry_run_rejections: List[str] = []
+        candidate_records: List[Dict[str, Any]] = []
+        action_skip = "would_skip" if self.config.dry_run else "skip"
+
         if not self.state.cooldown_ready(self.config.quant_cooldown_sec):
             self.log_throttled("[AI QUANT] 冷却中，暂不下单。")
-            if self.config.dry_run:
-                dry_run_rejections.append("cooldown")
-            else:
-                self.record_signal(market, snapshot, "skip", "cooldown", [], force=True)
-                return None
+            self.record_signal(market, snapshot, action_skip, "cooldown", candidate_records, force=True)
+            return None
         if market.seconds_left < self.config.quant_min_seconds_left:
             self.log_throttled(
                 f"[AI QUANT] {market.title} 剩余 {market.seconds_left}s，低于最小剩余时间，跳过。"
             )
-            if self.config.dry_run:
-                dry_run_rejections.append("low_seconds_left")
-            else:
-                self.record_signal(market, snapshot, "skip", "low_seconds_left", [], force=True)
-                return None
+            self.record_signal(market, snapshot, action_skip, "low_seconds_left", candidate_records, force=True)
+            return None
         if market.seconds_left > self.config.quant_max_seconds_left:
             self.log_throttled(
                 f"[AI QUANT] {market.title} remaining={market.seconds_left}s above entry window, wait."
             )
-            if self.config.dry_run:
-                dry_run_rejections.append("too_early")
-            else:
-                self.record_signal(market, snapshot, "skip", "too_early", [], force=True)
-                return None
+            self.record_signal(market, snapshot, action_skip, "too_early", candidate_records, force=True)
+            return None
+
+        trade_count = self.state.market_trade_count(market.slug)
+        max_trades = max(1, self.config.quant_max_trades_per_market)
+        if trade_count >= max_trades:
+            self.record_signal(
+                market,
+                snapshot,
+                action_skip,
+                "max_trades_per_market",
+                candidate_records,
+                force=True,
+            )
+            return None
 
         candidates: List[QuantDecision] = []
-        candidate_records: List[Dict[str, Any]] = []
+        best_asks: Dict[str, Decimal] = {}
         for outcome, token_id in zip(market.outcomes, market.token_ids):
             probability = snapshot.up_probability if outcome == "Up" else Decimal("1") - snapshot.up_probability
             try:
@@ -1033,35 +1131,45 @@ class PolymarketQuantBot:
                     }
                 )
                 continue
-            limit_price = best_ask
+
+            best_asks[outcome] = best_ask
+            max_price = min(best_ask + self.config.max_slippage, Decimal("0.99"))
+            if self.config.quant_size_mode == "shares":
+                requested_size = self.config.quant_order_shares.quantize(Decimal("0.000001"), rounding=ROUND_FLOOR)
+                requested_size = apply_max_order_usdc(requested_size, best_ask, self.config.max_order_usdc)
+                fill = estimate_buy_fill_for_size(book, requested_size, max_price=max_price)
+            else:
+                budget = self.config.quant_order_usdc
+                if self.config.max_order_usdc > 0:
+                    budget = min(budget, self.config.max_order_usdc)
+                fill = estimate_buy_fill_for_budget(book, budget, max_price=max_price)
+
             raw_edge = probability - best_ask
-            edge = raw_edge
-            size = (self.config.quant_order_usdc / best_ask).quantize(
-                Decimal("0.000001"),
-                rounding=ROUND_FLOOR,
-            )
-            size = apply_max_order_usdc(size, best_ask, self.config.max_order_usdc)
+            edge = probability - fill.effective_price if fill.effective_price > 0 else Decimal("-1")
             min_order_size = decimal_value(book.get("min_order_size", "1"))
-            if size < min_order_size:
-                self.log_throttled(
-                    f"[AI QUANT] {outcome} size={size} 小于最小下单 {min_order_size}，跳过。"
-                )
-                candidate_records.append(
-                    {
-                        "outcome": outcome,
-                        "token_id": token_id,
-                        "probability": probability.quantize(Decimal("0.0001")),
-                        "best_ask": best_ask,
-                        "raw_edge": raw_edge.quantize(Decimal("0.0001")),
-                        "edge": edge.quantize(Decimal("0.0001")),
-                        "limit_price": limit_price,
-                        "size": size,
-                        "min_order_size": min_order_size,
-                        "valid": False,
-                        "skip_reason": "size_below_min_order",
-                    }
-                )
+            base_record = {
+                "outcome": outcome,
+                "token_id": token_id,
+                "probability": probability.quantize(Decimal("0.0001")),
+                "best_ask": best_ask,
+                "raw_edge": raw_edge.quantize(Decimal("0.0001")),
+                "edge": edge.quantize(Decimal("0.0001")),
+                "limit_price": fill.limit_price,
+                "size": fill.filled_size,
+                "min_order_size": min_order_size,
+                "max_price": max_price,
+                "fill": fill_payload(fill),
+            }
+            if self.config.quant_size_mode == "shares" and not fill.complete:
+                candidate_records.append(base_record | {"valid": False, "skip_reason": "insufficient_depth"})
                 continue
+            if fill.filled_size < min_order_size:
+                self.log_throttled(
+                    f"[AI QUANT] {outcome} size={fill.filled_size} 小于最小下单 {min_order_size}，跳过。"
+                )
+                candidate_records.append(base_record | {"valid": False, "skip_reason": "size_below_min_order"})
+                continue
+
             decision = QuantDecision(
                 market=market,
                 outcome=outcome,
@@ -1070,12 +1178,18 @@ class PolymarketQuantBot:
                 best_ask=best_ask,
                 raw_edge=raw_edge.quantize(Decimal("0.0001")),
                 edge=edge.quantize(Decimal("0.0001")),
-                limit_price=limit_price,
-                size=size,
+                limit_price=fill.limit_price,
+                size=fill.filled_size,
                 reason=(
                     f"p({outcome})={probability.quantize(Decimal('0.0001'))} "
-                    f"> ask={best_ask} + edge={edge.quantize(Decimal('0.0001'))}"
+                    f"> effective={fill.effective_price} + edge={edge.quantize(Decimal('0.0001'))}"
                 ),
+                vwap_price=fill.vwap_price,
+                effective_price=fill.effective_price,
+                notional=fill.notional,
+                fee=fill.fee,
+                total_cost=fill.total_cost,
+                liquidity_levels=fill.levels_used,
             )
             candidates.append(decision)
             candidate_records.append(self.decision_payload(decision) | {"valid": True})
@@ -1085,24 +1199,29 @@ class PolymarketQuantBot:
             self.record_signal(
                 market,
                 snapshot,
-                "would_skip" if self.config.dry_run else "skip",
+                action_skip,
                 "no_valid_candidates",
                 candidate_records,
                 force=self.config.dry_run,
             )
             return None
 
+        up_ask = best_asks.get("Up")
+        down_ask = best_asks.get("Down")
+        if up_ask is not None and down_ask is not None:
+            sum_ask = up_ask + down_ask
+            if sum_ask < Decimal("0.85") or sum_ask > Decimal("1.15"):
+                self.record_signal(
+                    market,
+                    snapshot,
+                    action_skip,
+                    "market_consensus_filter",
+                    candidate_records,
+                    force=True,
+                )
+                return None
+
         best = max(candidates, key=lambda item: item.edge)
-        if dry_run_rejections:
-            self.record_signal(
-                market,
-                snapshot,
-                "would_skip",
-                ",".join(dry_run_rejections),
-                candidate_records,
-                selected=best,
-                force=True,
-            )
         if best.edge < self.config.quant_min_edge:
             self.log_throttled(
                 "[AI QUANT] "
@@ -1112,18 +1231,17 @@ class PolymarketQuantBot:
             self.record_signal(
                 market,
                 snapshot,
-                "would_skip" if self.config.dry_run else "skip",
+                action_skip,
                 "edge_below_min",
                 candidate_records,
                 selected=best,
                 force=self.config.dry_run,
             )
-            if not self.config.dry_run:
-                return None
+            return None
         self.record_signal(
             market,
             snapshot,
-            "would_buy" if self.config.dry_run else "live_buy",
+            "candidate_passed",
             "edge_passed",
             candidate_records,
             selected=best,
@@ -2479,6 +2597,13 @@ class PolymarketQuantBot:
             "edge": decision.edge,
             "limit_price": decision.limit_price,
             "size": decision.size,
+            "vwap_price": decision.vwap_price,
+            "effective_price": decision.effective_price,
+            "notional": decision.notional,
+            "fee": decision.fee,
+            "fee_rate": POLYMARKET_CRYPTO_TAKER_FEE_RATE,
+            "total_cost": decision.total_cost,
+            "liquidity_levels": decision.liquidity_levels,
             "reason": decision.reason,
         }
 
@@ -2497,6 +2622,165 @@ def state_decimal(value: Any, default: str = "0") -> Decimal:
 
 def quantize_money(value: Decimal) -> Decimal:
     return value.quantize(MONEY_QUANT)
+
+
+def book_levels(book: Dict[str, Any], side: str) -> List[Tuple[Decimal, Decimal]]:
+    raw_levels = book.get("asks") if side == "BUY" else book.get("bids")
+    if not isinstance(raw_levels, list):
+        return []
+    levels: List[Tuple[Decimal, Decimal]] = []
+    for level in raw_levels:
+        if not isinstance(level, dict):
+            continue
+        price_raw = level.get("price")
+        size_raw = level.get("size", level.get("quantity", level.get("shares")))
+        if price_raw in {None, ""} or size_raw in {None, ""}:
+            continue
+        try:
+            price = decimal_value(price_raw)
+            size = decimal_value(size_raw)
+        except Exception:
+            continue
+        if price <= 0 or size <= 0:
+            continue
+        levels.append((price, size))
+    reverse = side != "BUY"
+    return sorted(levels, key=lambda item: item[0], reverse=reverse)
+
+
+def empty_book_fill(requested_size: Decimal, best_price: Decimal = Decimal("0")) -> BookFill:
+    return BookFill(
+        requested_size=requested_size,
+        filled_size=Decimal("0"),
+        best_price=best_price,
+        limit_price=best_price,
+        vwap_price=Decimal("0"),
+        notional=Decimal("0"),
+        fee=Decimal("0"),
+        total_cost=Decimal("0"),
+        effective_price=Decimal("0"),
+        levels_used=0,
+        complete=False,
+    )
+
+
+def estimate_buy_fill_for_size(
+    book: Dict[str, Any],
+    requested_size: Decimal,
+    max_price: Optional[Decimal] = None,
+) -> BookFill:
+    levels = book_levels(book, "BUY")
+    if requested_size <= 0 or not levels:
+        return empty_book_fill(requested_size)
+    best_price = levels[0][0]
+    max_fill_price = max_price if max_price is not None else best_price
+    remaining = requested_size
+    filled = Decimal("0")
+    notional = Decimal("0")
+    limit_price = best_price
+    levels_used = 0
+    for price, level_size in levels:
+        if price > max_fill_price or remaining <= 0:
+            break
+        take = min(level_size, remaining)
+        if take <= 0:
+            continue
+        filled += take
+        notional += take * price
+        remaining -= take
+        limit_price = price
+        levels_used += 1
+    if filled <= 0:
+        return empty_book_fill(requested_size, best_price)
+    vwap = notional / filled
+    fee = estimate_taker_fee(filled, vwap)
+    total_cost = quantize_money(notional + fee)
+    return BookFill(
+        requested_size=requested_size,
+        filled_size=filled.quantize(Decimal("0.000001"), rounding=ROUND_FLOOR),
+        best_price=best_price,
+        limit_price=limit_price,
+        vwap_price=vwap.quantize(Decimal("0.0001")),
+        notional=quantize_money(notional),
+        fee=fee,
+        total_cost=total_cost,
+        effective_price=(total_cost / filled).quantize(Decimal("0.0001")),
+        levels_used=levels_used,
+        complete=remaining <= Decimal("0.000001"),
+    )
+
+
+def estimate_buy_fill_for_budget(
+    book: Dict[str, Any],
+    budget_usdc: Decimal,
+    max_price: Optional[Decimal] = None,
+) -> BookFill:
+    levels = book_levels(book, "BUY")
+    if budget_usdc <= 0 or not levels:
+        return empty_book_fill(Decimal("0"))
+    best_price = levels[0][0]
+    max_fill_price = max_price if max_price is not None else best_price
+    remaining_budget = budget_usdc
+    filled = Decimal("0")
+    notional = Decimal("0")
+    fee = Decimal("0")
+    limit_price = best_price
+    levels_used = 0
+    for price, level_size in levels:
+        if price > max_fill_price or remaining_budget <= 0:
+            break
+        fee_per_share = POLYMARKET_CRYPTO_TAKER_FEE_RATE * price * (Decimal("1") - price)
+        total_per_share = price + fee_per_share
+        if total_per_share <= 0:
+            continue
+        affordable = remaining_budget / total_per_share
+        take = min(level_size, affordable)
+        take = take.quantize(Decimal("0.000001"), rounding=ROUND_FLOOR)
+        if take <= 0:
+            continue
+        level_notional = take * price
+        level_fee = take * fee_per_share
+        level_cost = level_notional + level_fee
+        filled += take
+        notional += level_notional
+        fee += level_fee
+        remaining_budget -= level_cost
+        limit_price = price
+        levels_used += 1
+    if filled <= 0:
+        return empty_book_fill(Decimal("0"), best_price)
+    total_cost = quantize_money(notional + fee)
+    vwap = notional / filled
+    return BookFill(
+        requested_size=filled.quantize(Decimal("0.000001"), rounding=ROUND_FLOOR),
+        filled_size=filled.quantize(Decimal("0.000001"), rounding=ROUND_FLOOR),
+        best_price=best_price,
+        limit_price=limit_price,
+        vwap_price=vwap.quantize(Decimal("0.0001")),
+        notional=quantize_money(notional),
+        fee=quantize_money(fee),
+        total_cost=total_cost,
+        effective_price=(total_cost / filled).quantize(Decimal("0.0001")),
+        levels_used=levels_used,
+        complete=levels_used > 0,
+    )
+
+
+def fill_payload(fill: BookFill) -> Dict[str, Any]:
+    return {
+        "requested_size": fill.requested_size,
+        "filled_size": fill.filled_size,
+        "best_price": fill.best_price,
+        "limit_price": fill.limit_price,
+        "vwap_price": fill.vwap_price,
+        "notional": fill.notional,
+        "fee": fill.fee,
+        "fee_rate": POLYMARKET_CRYPTO_TAKER_FEE_RATE,
+        "total_cost": fill.total_cost,
+        "effective_price": fill.effective_price,
+        "liquidity_levels": fill.levels_used,
+        "complete": fill.complete,
+    }
 
 
 def estimate_taker_fee(size: Decimal, price: Decimal) -> Decimal:
@@ -2724,6 +3008,13 @@ def decision_payload_from_dataclass(decision: QuantDecision) -> Dict[str, Any]:
         "edge": decision.edge,
         "limit_price": decision.limit_price,
         "size": decision.size,
+        "vwap_price": decision.vwap_price,
+        "effective_price": decision.effective_price,
+        "notional": decision.notional,
+        "fee": decision.fee,
+        "fee_rate": POLYMARKET_CRYPTO_TAKER_FEE_RATE,
+        "total_cost": decision.total_cost,
+        "liquidity_levels": decision.liquidity_levels,
         "reason": decision.reason,
     }
 
