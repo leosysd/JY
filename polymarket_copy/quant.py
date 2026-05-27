@@ -28,6 +28,7 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/history-candles"
 BINANCE_DATA_API = "https://data-api.binance.vision"
 MAX_LOCK_TRADES_PER_SIDE = Decimal("20")
+POSITION_ADJUSTMENT_MULTIPLIERS = (Decimal("2"), Decimal("3"), Decimal("4"), Decimal("5"))
 SAME_OUTCOME_REPEAT_SEC = 6
 SAME_OUTCOME_MIN_PRICE_MOVE = Decimal("0.01")
 LATE_STAGE_STRICT_SECONDS = 60
@@ -2310,6 +2311,245 @@ class PolymarketQuantBot:
             if dry_run_rejections:
                 candidate_record["would_skip_reasons"] = dry_run_rejections
             candidate_records.append(candidate_record)
+        adjustment_candidates, adjustment_records = self.build_multi_round_adjustment_candidates(
+            market,
+            snapshot,
+            position_before,
+            bankroll_before,
+            entry,
+            budget_remaining,
+            market_budget_remaining,
+        )
+        candidates.extend(adjustment_candidates)
+        candidate_records.extend(adjustment_records)
+        return candidates, candidate_records
+
+    def build_multi_round_adjustment_candidates(
+        self,
+        market: QuantMarket,
+        snapshot: BtcSnapshot,
+        position_before: Dict[str, Decimal],
+        bankroll_before: Dict[str, Decimal],
+        entry: Optional[Dict[str, Any]],
+        budget_remaining: Decimal,
+        market_budget_remaining: Decimal,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        if position_before["trade_count"] <= 0 or self.config.quant_size_mode != "shares":
+            return [], []
+        candidates: List[Dict[str, Any]] = []
+        candidate_records: List[Dict[str, Any]] = []
+        base_size = self.config.quant_order_shares.quantize(Decimal("0.000001"), rounding=ROUND_FLOOR)
+        if base_size <= 0:
+            return [], []
+        for outcome, token_id in zip(market.outcomes, market.token_ids):
+            probability = snapshot.up_probability if outcome == "Up" else Decimal("1") - snapshot.up_probability
+            try:
+                book = self.book_cache.get_book(token_id)
+            except Exception as exc:
+                candidate_records.append(
+                    {
+                        "outcome": outcome,
+                        "token_id": token_id,
+                        "valid": False,
+                        "skip_reason": f"multi_adjust_book_error:{type(exc).__name__}",
+                    }
+                )
+                continue
+            best_ask = best_book_price(book, "BUY")
+            if best_ask is None:
+                candidate_records.append(
+                    {
+                        "outcome": outcome,
+                        "token_id": token_id,
+                        "valid": False,
+                        "skip_reason": "multi_adjust_no_best_ask",
+                    }
+                )
+                continue
+            side_count_key = "up_trade_count" if outcome == "Up" else "down_trade_count"
+            side_trade_count_before = position_before[side_count_key]
+            if side_trade_count_before >= MAX_LOCK_TRADES_PER_SIDE:
+                continue
+            max_price = min(best_ask + self.config.max_slippage, Decimal("0.99"))
+            min_order_size = decimal_value(book.get("min_order_size", "1"))
+            for multiplier in POSITION_ADJUSTMENT_MULTIPLIERS:
+                requested_size = (base_size * multiplier).quantize(Decimal("0.000001"), rounding=ROUND_FLOOR)
+                fill = estimate_buy_fill_for_size(book, requested_size, max_price=max_price)
+                if self.config.max_order_usdc > 0 and fill.total_cost > self.config.max_order_usdc:
+                    fill = estimate_buy_fill_for_budget(book, self.config.max_order_usdc, max_price=max_price)
+                size = fill.filled_size
+                fill_notional = fill.notional
+                fee = fill.fee
+                total_cost = fill.total_cost
+                effective_price = fill.effective_price if fill.effective_price > 0 else best_ask
+                raw_edge = probability - best_ask
+                edge = probability - effective_price
+                if not fill.complete:
+                    candidate_records.append(
+                        {
+                            "outcome": outcome,
+                            "token_id": token_id,
+                            "probability": probability.quantize(Decimal("0.0001")),
+                            "best_ask": best_ask,
+                            "raw_edge": raw_edge.quantize(Decimal("0.0001")),
+                            "edge": edge.quantize(Decimal("0.0001")),
+                            "size": size,
+                            "requested_size": requested_size,
+                            "adjustment_multiplier": multiplier,
+                            "fill": fill_payload(fill),
+                            "valid": False,
+                            "skip_reason": "multi_adjust_insufficient_depth",
+                        }
+                    )
+                    continue
+                if size < min_order_size:
+                    candidate_records.append(
+                        {
+                            "outcome": outcome,
+                            "token_id": token_id,
+                            "probability": probability.quantize(Decimal("0.0001")),
+                            "best_ask": best_ask,
+                            "raw_edge": raw_edge.quantize(Decimal("0.0001")),
+                            "edge": edge.quantize(Decimal("0.0001")),
+                            "size": size,
+                            "requested_size": requested_size,
+                            "adjustment_multiplier": multiplier,
+                            "fill": fill_payload(fill),
+                            "valid": False,
+                            "skip_reason": "multi_adjust_size_below_min_order",
+                        }
+                    )
+                    continue
+                dry_run_rejections: List[str] = []
+                repeat_skip_reason = same_outcome_repeat_skip(entry, outcome, best_ask)
+                if repeat_skip_reason:
+                    dry_run_rejections.append(repeat_skip_reason)
+                if total_cost > budget_remaining:
+                    if self.config.dry_run:
+                        dry_run_rejections.append("budget_cap_reached")
+                    else:
+                        continue
+                position_after = lock_position_after_trade(
+                    position_before,
+                    outcome,
+                    size,
+                    fill.limit_price,
+                    fill_notional,
+                    fee,
+                    total_cost,
+                )
+                if position_after["total_cost"] > self.config.quant_market_max_usdc:
+                    if self.config.dry_run:
+                        dry_run_rejections.append("market_cap_reached")
+                    else:
+                        continue
+                open_worst_after = bankroll_before["other_unsettled_worst_pnl"] + position_after["worst_pnl"]
+                risk_equity_after = (
+                    self.config.quant_capital_usdc
+                    + bankroll_before["realized_pnl"]
+                    + open_worst_after
+                )
+                risk_drawdown_after = max(
+                    self.config.quant_capital_usdc - risk_equity_after,
+                    Decimal("0"),
+                )
+                if (
+                    self.config.quant_max_drawdown_usdc > 0
+                    and risk_drawdown_after > self.config.quant_max_drawdown_usdc
+                ):
+                    if self.config.dry_run:
+                        dry_run_rejections.append("max_drawdown_candidate")
+                    else:
+                        continue
+                improvement = position_after["worst_pnl"] - position_before["worst_pnl"]
+                would_lock = position_after["worst_pnl"] >= self.config.quant_lock_min_profit
+                decision = QuantDecision(
+                    market=market,
+                    outcome=outcome,
+                    token_id=token_id,
+                    probability=probability.quantize(Decimal("0.0001")),
+                    best_ask=best_ask,
+                    raw_edge=raw_edge.quantize(Decimal("0.0001")),
+                    edge=edge.quantize(Decimal("0.0001")),
+                    limit_price=fill.limit_price,
+                    size=size,
+                    reason=(
+                        f"multi_round_adjust p({outcome})={probability.quantize(Decimal('0.0001'))} "
+                        f"effective={effective_price} edge={edge.quantize(Decimal('0.0001'))} "
+                        f"multiplier={multiplier}"
+                    ),
+                    vwap_price=fill.vwap_price,
+                    effective_price=effective_price.quantize(Decimal("0.0001")),
+                    notional=fill_notional,
+                    fee=fee,
+                    total_cost=total_cost,
+                    liquidity_levels=fill.levels_used,
+                    depth_available=fill.depth_available,
+                    fill_complete=fill.complete,
+                )
+                reason, score = self.score_lock_candidate(
+                    position_before,
+                    position_after,
+                    decision,
+                    would_lock,
+                    improvement,
+                )
+                if reason not in {"position_adjustment", "inventory_lock", "hedge_profit", "rebalance_worst_side"}:
+                    reason = f"multi_adjust_rejected:{reason}"
+                    score = (
+                        Decimal("0"),
+                        improvement,
+                        position_after["worst_pnl"],
+                        -position_after["total_cost"],
+                    )
+                model_rejections: List[str] = []
+                if score and score[0] <= 0:
+                    model_rejections.append(reason)
+                p_up_for_expected = probability if outcome == "Up" else Decimal("1") - probability
+                expected_before = expected_lock_pnl(position_before, p_up_for_expected)
+                expected_after = expected_lock_pnl(position_after, p_up_for_expected)
+                rule_learning = lock_rule_learning_payload(
+                    position_before,
+                    position_after,
+                    decision,
+                    expected_before,
+                    expected_after,
+                    improvement,
+                    would_lock,
+                )
+                item = {
+                    "decision": decision,
+                    "legs": [decision],
+                    "reason": reason,
+                    "score": score,
+                    "notional": total_cost,
+                    "fill_notional": fill_notional,
+                    "fee": fee,
+                    "total_cost": total_cost,
+                    "max_notional": total_cost,
+                    "fill": fill_payload(fill),
+                    "position_after": position_after,
+                    "improvement_worst_pnl": improvement,
+                    "expected_pnl_before": expected_before,
+                    "expected_pnl_after": expected_after,
+                    "would_lock": False,
+                    "hedge_locked": would_lock,
+                    "arbitrage_lock": False,
+                    "rule_learning": rule_learning,
+                    "dry_run_rejections": dry_run_rejections + model_rejections,
+                    "side_trade_count_before": side_trade_count_before,
+                    "side_trade_count_after": position_after[side_count_key],
+                    "side_trade_limit": MAX_LOCK_TRADES_PER_SIDE,
+                    "adjustment_multiplier": multiplier,
+                    "market_budget_remaining": market_budget_remaining,
+                    "budget_remaining": budget_remaining,
+                }
+                candidates.append(item)
+                all_rejections = item.get("dry_run_rejections") or []
+                candidate_record = lock_candidate_payload(item) | {"valid": not all_rejections}
+                if all_rejections:
+                    candidate_record["would_skip_reasons"] = all_rejections
+                candidate_records.append(candidate_record)
         return candidates, candidate_records
 
     def apply_pair_execution_guard(
@@ -2554,6 +2794,20 @@ class PolymarketQuantBot:
             and position_after["worst_pnl"] < position_before["worst_pnl"]
         )
         late_stage = decision.market.seconds_left <= LATE_STAGE_STRICT_SECONDS
+        if position_before["trade_count"] > 0 and is_rebalance and improvement > 0:
+            return (
+                "position_adjustment",
+                (
+                    Decimal("4"),
+                    improvement,
+                    position_after["worst_pnl"],
+                    gap_improvement,
+                    expected_after,
+                    -pnl_gap,
+                    decision.edge,
+                    -position_after["total_cost"],
+                ),
+            )
         if negative_near_lock and not would_lock:
             return (
                 "negative_lock",
@@ -3490,6 +3744,7 @@ def lock_candidate_payload(item: Dict[str, Any]) -> Dict[str, Any]:
         "side_trade_count_before": item.get("side_trade_count_before"),
         "side_trade_count_after": item.get("side_trade_count_after"),
         "side_trade_limit": item.get("side_trade_limit"),
+        "adjustment_multiplier": item.get("adjustment_multiplier"),
     }
 
 
