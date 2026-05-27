@@ -37,14 +37,14 @@ POLYMARKET_CRYPTO_TAKER_FEE_RATE = Decimal("0.07")
 MONEY_QUANT = Decimal("0.0001")
 MARKET_MOMENTUM_FOLLOW_MIN_ASK = Decimal("0.60")
 RULE_SIGNAL_WEIGHTS: Dict[str, Decimal] = {
-    "edge": Decimal("1.0"),
-    "expected_efficiency": Decimal("1.5"),
-    "worst_pnl_improvement": Decimal("1.0"),
-    "gap_improvement": Decimal("0.4"),
-    "lock_bonus": Decimal("3.0"),
-    "rebalance_bonus": Decimal("0.8"),
-    "momentum_bonus": Decimal("0.6"),
-    "price_impact_penalty": Decimal("-0.8"),
+    "edge": Decimal("0.8"),
+    "expected_efficiency": Decimal("1.0"),
+    "worst_pnl_improvement": Decimal("2.0"),
+    "gap_improvement": Decimal("1.0"),
+    "lock_bonus": Decimal("4.0"),
+    "rebalance_bonus": Decimal("2.0"),
+    "momentum_bonus": Decimal("-1.2"),
+    "price_impact_penalty": Decimal("-1.2"),
 }
 
 
@@ -2265,6 +2265,7 @@ class PolymarketQuantBot:
         selected_pnl_after = pnl_for_outcome(position_after, decision.outcome)
         min_side_size_after = min(position_after["up_size"], position_after["down_size"])
         inventory_gap_after = abs(position_after["up_size"] - position_after["down_size"])
+        inventory_lock = self.detect_inventory_lock(position_before, position_after)
         near_equal_size = (
             min_side_size_after > 0
             and inventory_gap_after <= max(decision.size, Decimal("1"))
@@ -2374,11 +2375,11 @@ class PolymarketQuantBot:
                 ),
             )
         if position_before["trade_count"] == 0:
-            if strong_market_momentum:
+            if strong_market_momentum and decision.edge < Decimal("0"):
                 return (
-                    "initial_market_momentum",
+                    "initial_expensive_momentum",
                     (
-                        Decimal("4.5"),
+                        Decimal("0"),
                         decision.best_ask,
                         expected_after,
                         decision.edge,
@@ -2394,7 +2395,7 @@ class PolymarketQuantBot:
             return (
                 "initial_momentum_probe",
                 (
-                    Decimal("3"),
+                    Decimal("1.2"),
                     expected_after,
                     decision.edge,
                     decision.probability,
@@ -2402,11 +2403,41 @@ class PolymarketQuantBot:
                     -position_after["total_cost"],
                 ),
             )
+        if inventory_lock and is_rebalance and gap_improvement > 0:
+            return (
+                "inventory_lock",
+                (
+                    Decimal("3.5"),
+                    improvement,
+                    gap_improvement,
+                    expected_after,
+                    -pnl_gap,
+                    decision.edge,
+                    -position_after["total_cost"],
+                ),
+            )
+        if (
+            is_rebalance
+            and improvement > 0
+            and gap_improvement > 0
+            and expected_gain >= -(notional * Decimal("0.20"))
+        ):
+            return (
+                "rebalance_worst_side",
+                (
+                    Decimal("2"),
+                    improvement,
+                    gap_improvement,
+                    expected_after,
+                    -pnl_gap,
+                    -position_after["total_cost"],
+                ),
+            )
         if strong_market_momentum:
             return (
-                "momentum_follow",
+                "momentum_follow_disabled",
                 (
-                    Decimal("4.5"),
+                    Decimal("0"),
                     decision.best_ask,
                     expected_after,
                     decision.probability,
@@ -2424,23 +2455,6 @@ class PolymarketQuantBot:
                     expected_efficiency,
                     decision.edge,
                     decision.best_ask,
-                    -pnl_gap,
-                    -position_after["total_cost"],
-                ),
-            )
-        if (
-            is_rebalance
-            and improvement > 0
-            and gap_improvement > 0
-            and expected_gain >= -(notional * Decimal("0.20"))
-        ):
-            return (
-                "rebalance_worst_side",
-                (
-                    Decimal("2"),
-                    improvement,
-                    gap_improvement,
-                    expected_after,
                     -pnl_gap,
                     -position_after["total_cost"],
                 ),
