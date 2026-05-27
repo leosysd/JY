@@ -36,6 +36,16 @@ MAX_WORST_LOSS_ORDER_MULTIPLIER = Decimal("2")
 POLYMARKET_CRYPTO_TAKER_FEE_RATE = Decimal("0.07")
 MONEY_QUANT = Decimal("0.0001")
 MARKET_MOMENTUM_FOLLOW_MIN_ASK = Decimal("0.60")
+RULE_SIGNAL_WEIGHTS: Dict[str, Decimal] = {
+    "edge": Decimal("1.0"),
+    "expected_efficiency": Decimal("1.5"),
+    "worst_pnl_improvement": Decimal("1.0"),
+    "gap_improvement": Decimal("0.4"),
+    "lock_bonus": Decimal("3.0"),
+    "rebalance_bonus": Decimal("0.8"),
+    "momentum_bonus": Decimal("0.6"),
+    "price_impact_penalty": Decimal("-0.8"),
+}
 
 
 @dataclass(frozen=True)
@@ -693,7 +703,7 @@ class QuantStateStore:
     ) -> None:
         entry = self.lock_market_entry(market)
         now = int(time.time())
-        notional, fee, cost = trade_cost_components(decision.size, decision.limit_price)
+        notional, fee, cost = decision_cost_components(decision)
         entry["trades"].append(
             {
                 "ts": now,
@@ -705,10 +715,14 @@ class QuantStateStore:
                 "raw_edge": str(decision.raw_edge),
                 "edge": str(decision.edge),
                 "limit_price": str(decision.limit_price),
+                "vwap_price": str(decision.vwap_price),
+                "effective_price": str(decision_effective_price(decision)),
                 "size": str(decision.size),
                 "notional": str(notional),
                 "fee": str(fee),
                 "fee_rate": str(POLYMARKET_CRYPTO_TAKER_FEE_RATE),
+                "total_cost": str(cost),
+                "liquidity_levels": decision.liquidity_levels,
                 "cost": str(cost),
                 "reason": reason,
                 "status": status,
@@ -1550,7 +1564,8 @@ class PolymarketQuantBot:
         print(
             "[AI LOCK BUY] "
             f"mode=DRY_RUN market={decision.market.title} legs={len(legs)} "
-            f"outcome={decision.outcome} size={decision.size} price={decision.best_ask} "
+            f"outcome={decision.outcome} size={decision.size} "
+            f"best={decision.best_ask} effective={decision_effective_price(decision)} "
             f"cost={selected['notional']} edge={decision.edge} "
             f"up_pnl={position_after['up_pnl']} down_pnl={position_after['down_pnl']} "
             f"total_cost={position_after['total_cost']} trades={position_after['trade_count']} "
@@ -1579,6 +1594,9 @@ class PolymarketQuantBot:
                 leg.outcome,
                 leg.size,
                 leg.limit_price,
+                leg.notional,
+                leg.fee,
+                leg.total_cost,
             )
             self.state.append_lock_trade(
                 market,
@@ -1652,6 +1670,9 @@ class PolymarketQuantBot:
                     leg.outcome,
                     leg.size,
                     leg.limit_price,
+                    leg.notional,
+                    leg.fee,
+                    leg.total_cost,
                 )
                 self.state.append_lock_trade(
                     market,
@@ -1732,7 +1753,7 @@ class PolymarketQuantBot:
         if str(selected.get("reason")) == "pure_arbitrage" and len(reviewed_legs) == 2:
             sum_ask = reviewed_legs[0].best_ask + reviewed_legs[1].best_ask
             review_size = min(reviewed_legs[0].size, reviewed_legs[1].size)
-            reviewed_cost = sum(trade_cost_components(leg.size, leg.limit_price)[2] for leg in reviewed_legs)
+            reviewed_cost = sum(decision_cost_components(leg)[2] for leg in reviewed_legs)
             fee_adjusted_edge = Decimal("1") - (reviewed_cost / review_size) if review_size > 0 else Decimal("-1")
             review_records.append(
                 {
@@ -1751,8 +1772,16 @@ class PolymarketQuantBot:
         fill_notional = Decimal("0")
         fee = Decimal("0")
         for leg in reviewed_legs:
-            position_after = lock_position_after_trade(position_after, leg.outcome, leg.size, leg.limit_price)
-            leg_notional, leg_fee, leg_total_cost = trade_cost_components(leg.size, leg.limit_price)
+            leg_notional, leg_fee, leg_total_cost = decision_cost_components(leg)
+            position_after = lock_position_after_trade(
+                position_after,
+                leg.outcome,
+                leg.size,
+                leg.limit_price,
+                leg_notional,
+                leg_fee,
+                leg_total_cost,
+            )
             fill_notional += leg_notional
             fee += leg_fee
             notional += leg_total_cost
@@ -1817,9 +1846,15 @@ class PolymarketQuantBot:
                     best_ask=leg.best_ask,
                     raw_edge=leg.raw_edge,
                     edge=leg.edge,
-                    limit_price=leg.best_ask,
+                    limit_price=leg.limit_price,
                     size=leg.size,
-                    reason=f"{leg.reason} | paper_price={leg.best_ask}",
+                    reason=f"{leg.reason} | paper_fill={decision_effective_price(leg)}",
+                    vwap_price=leg.vwap_price,
+                    effective_price=decision_effective_price(leg),
+                    notional=decision_cost_components(leg)[0],
+                    fee=decision_cost_components(leg)[1],
+                    total_cost=decision_cost_components(leg)[2],
+                    liquidity_levels=leg.liquidity_levels,
                 )
             )
         return paper_legs
@@ -1864,17 +1899,23 @@ class PolymarketQuantBot:
                     }
                 )
                 continue
-            limit_price = best_ask
+            max_price = min(best_ask + self.config.max_slippage, Decimal("0.99"))
             if self.config.quant_size_mode == "shares":
-                size = self.config.quant_order_shares.quantize(Decimal("0.000001"), rounding=ROUND_FLOOR)
+                requested_size = self.config.quant_order_shares.quantize(Decimal("0.000001"), rounding=ROUND_FLOOR)
+                fill = estimate_buy_fill_for_size(book, requested_size, max_price=max_price)
+                if self.config.max_order_usdc > 0 and fill.total_cost > self.config.max_order_usdc:
+                    fill = estimate_buy_fill_for_budget(book, self.config.max_order_usdc, max_price=max_price)
             else:
-                size = (self.config.quant_order_usdc / best_ask).quantize(
-                    Decimal("0.000001"),
-                    rounding=ROUND_FLOOR,
-                )
-            size = apply_max_order_usdc(size, best_ask, self.config.max_order_usdc)
-            fill_notional, fee, total_cost = trade_cost_components(size, best_ask)
-            effective_price = total_cost / size if size > 0 else best_ask
+                budget = self.config.quant_order_usdc
+                if self.config.max_order_usdc > 0:
+                    budget = min(budget, self.config.max_order_usdc)
+                fill = estimate_buy_fill_for_budget(book, budget, max_price=max_price)
+            limit_price = fill.limit_price
+            size = fill.filled_size
+            fill_notional = fill.notional
+            fee = fill.fee
+            total_cost = fill.total_cost
+            effective_price = fill.effective_price if fill.effective_price > 0 else best_ask
             raw_edge = probability - best_ask
             edge = probability - effective_price
             min_order_size = decimal_value(book.get("min_order_size", "1"))
@@ -1892,6 +1933,8 @@ class PolymarketQuantBot:
                         "notional": fill_notional,
                         "fee": fee,
                         "total_cost": total_cost,
+                        "max_price": max_price,
+                        "fill": fill_payload(fill),
                         "min_order_size": min_order_size,
                         "valid": False,
                         "skip_reason": "size_below_min_order",
@@ -1914,6 +1957,10 @@ class PolymarketQuantBot:
                         "notional": fill_notional,
                         "fee": fee,
                         "total_cost": total_cost,
+                        "vwap_price": fill.vwap_price,
+                        "effective_price": effective_price,
+                        "max_price": max_price,
+                        "fill": fill_payload(fill),
                         "side_trade_count_before": int(side_trade_count_before),
                         "side_trade_limit": int(MAX_LOCK_TRADES_PER_SIDE),
                         "valid": False,
@@ -1944,6 +1991,10 @@ class PolymarketQuantBot:
                             "notional": fill_notional,
                             "fee": fee,
                             "total_cost": total_cost,
+                            "vwap_price": fill.vwap_price,
+                            "effective_price": effective_price,
+                            "max_price": max_price,
+                            "fill": fill_payload(fill),
                             "max_notional": max_notional,
                             "budget_remaining": budget_remaining,
                             "market_budget_remaining": market_budget_remaining,
@@ -1955,7 +2006,15 @@ class PolymarketQuantBot:
                     )
                     continue
 
-            position_after = lock_position_after_trade(position_before, outcome, size, best_ask)
+            position_after = lock_position_after_trade(
+                position_before,
+                outcome,
+                size,
+                limit_price,
+                fill_notional,
+                fee,
+                total_cost,
+            )
             improvement = position_after["worst_pnl"] - position_before["worst_pnl"]
             would_lock = position_after["worst_pnl"] >= self.config.quant_lock_min_profit
             open_worst_after = bankroll_before["other_unsettled_worst_pnl"] + position_after["worst_pnl"]
@@ -1988,6 +2047,10 @@ class PolymarketQuantBot:
                             "notional": fill_notional,
                             "fee": fee,
                             "total_cost": total_cost,
+                            "vwap_price": fill.vwap_price,
+                            "effective_price": effective_price,
+                            "max_price": max_price,
+                            "fill": fill_payload(fill),
                             "max_notional": max_notional,
                             "risk_drawdown_after": risk_drawdown_after.quantize(Decimal("0.0001")),
                             "max_drawdown_usdc": self.config.quant_max_drawdown_usdc,
@@ -2010,8 +2073,14 @@ class PolymarketQuantBot:
                 size=size,
                 reason=(
                     f"lock_model p({outcome})={probability.quantize(Decimal('0.0001'))} "
-                    f"ask={best_ask} edge={edge.quantize(Decimal('0.0001'))}"
+                    f"effective={effective_price} edge={edge.quantize(Decimal('0.0001'))}"
                 ),
+                vwap_price=fill.vwap_price,
+                effective_price=effective_price.quantize(Decimal("0.0001")),
+                notional=fill_notional,
+                fee=fee,
+                total_cost=total_cost,
+                liquidity_levels=fill.levels_used,
             )
             reason, score = self.score_lock_candidate(
                 position_before,
@@ -2023,6 +2092,18 @@ class PolymarketQuantBot:
             model_rejections: List[str] = []
             if score and score[0] <= 0:
                 model_rejections.append(reason)
+            p_up_for_expected = probability if outcome == "Up" else Decimal("1") - probability
+            expected_before = expected_lock_pnl(position_before, p_up_for_expected)
+            expected_after = expected_lock_pnl(position_after, p_up_for_expected)
+            rule_learning = lock_rule_learning_payload(
+                position_before,
+                position_after,
+                decision,
+                expected_before,
+                expected_after,
+                improvement,
+                would_lock,
+            )
             item = {
                 "decision": decision,
                 "legs": [decision],
@@ -2033,11 +2114,13 @@ class PolymarketQuantBot:
                 "fee": fee,
                 "total_cost": total_cost,
                 "max_notional": max_notional,
+                "fill": fill_payload(fill),
                 "position_after": position_after,
                 "improvement_worst_pnl": improvement,
-                "expected_pnl_before": expected_lock_pnl(position_before, probability if outcome == "Up" else Decimal("1") - probability),
-                "expected_pnl_after": expected_lock_pnl(position_after, probability if outcome == "Up" else Decimal("1") - probability),
+                "expected_pnl_before": expected_before,
+                "expected_pnl_after": expected_after,
                 "would_lock": would_lock,
+                "rule_learning": rule_learning,
                 "dry_run_rejections": dry_run_rejections + model_rejections,
                 "side_trade_count_before": side_trade_count_before,
                 "side_trade_count_after": position_after[side_count_key],
@@ -2083,9 +2166,10 @@ class PolymarketQuantBot:
         size = min(up_decision.size, down_decision.size).quantize(Decimal("0.000001"), rounding=ROUND_FLOOR)
         if size <= 0:
             return None
-        sum_fill = up_decision.best_ask + down_decision.best_ask
-        up_notional, up_fee, up_total_cost = trade_cost_components(size, up_decision.best_ask)
-        down_notional, down_fee, down_total_cost = trade_cost_components(size, down_decision.best_ask)
+        up_leg = scale_decision_to_size(up_decision, size, "pure_arbitrage_up_leg")
+        down_leg = scale_decision_to_size(down_decision, size, "pure_arbitrage_down_leg")
+        up_notional, up_fee, up_total_cost = decision_cost_components(up_leg)
+        down_notional, down_fee, down_total_cost = decision_cost_components(down_leg)
         fill_notional = (up_notional + down_notional).quantize(MONEY_QUANT)
         fee = (up_fee + down_fee).quantize(MONEY_QUANT)
         notional = (up_total_cost + down_total_cost).quantize(MONEY_QUANT)
@@ -2106,33 +2190,36 @@ class PolymarketQuantBot:
                 dry_run_rejections.append("bankroll_cap_reached")
             else:
                 return None
-        up_leg = QuantDecision(
-            market=up_decision.market,
-            outcome=up_decision.outcome,
-            token_id=up_decision.token_id,
-            probability=up_decision.probability,
-            best_ask=up_decision.best_ask,
-            raw_edge=up_decision.raw_edge,
-            edge=up_decision.edge,
-            limit_price=up_decision.best_ask,
-            size=size,
-            reason="pure_arbitrage_up_leg",
+        position_after_up = lock_position_after_trade(
+            position_before,
+            "Up",
+            size,
+            up_leg.limit_price,
+            up_notional,
+            up_fee,
+            up_total_cost,
         )
-        down_leg = QuantDecision(
-            market=down_decision.market,
-            outcome=down_decision.outcome,
-            token_id=down_decision.token_id,
-            probability=down_decision.probability,
-            best_ask=down_decision.best_ask,
-            raw_edge=down_decision.raw_edge,
-            edge=down_decision.edge,
-            limit_price=down_decision.best_ask,
-            size=size,
-            reason="pure_arbitrage_down_leg",
+        position_after = lock_position_after_trade(
+            position_after_up,
+            "Down",
+            size,
+            down_leg.limit_price,
+            down_notional,
+            down_fee,
+            down_total_cost,
         )
-        position_after_up = lock_position_after_trade(position_before, "Up", size, up_leg.best_ask)
-        position_after = lock_position_after_trade(position_after_up, "Down", size, down_leg.best_ask)
         expected_worst_profit = position_after["worst_pnl"] - position_before["worst_pnl"]
+        expected_before = expected_lock_pnl(position_before, up_decision.probability)
+        expected_after = expected_lock_pnl(position_after, up_decision.probability)
+        rule_learning = lock_rule_learning_payload(
+            position_before,
+            position_after,
+            up_leg,
+            expected_before,
+            expected_after,
+            expected_worst_profit,
+            position_after["worst_pnl"] >= self.config.quant_lock_min_profit,
+        )
         return {
             "decision": up_leg,
             "legs": [up_leg, down_leg],
@@ -2149,6 +2236,7 @@ class PolymarketQuantBot:
             "sum_ask": sum_ask,
             "arbitrage_edge": arb_edge,
             "gross_arbitrage_edge": gross_arb_edge,
+            "rule_learning": rule_learning,
             "dry_run_rejections": dry_run_rejections,
         }
 
@@ -2624,6 +2712,58 @@ def quantize_money(value: Decimal) -> Decimal:
     return value.quantize(MONEY_QUANT)
 
 
+def decision_cost_components(decision: QuantDecision) -> Tuple[Decimal, Decimal, Decimal]:
+    notional = decision.notional
+    fee = decision.fee
+    total_cost = decision.total_cost
+    if notional <= 0:
+        notional = quantize_money(decision.size * decision.limit_price)
+    if fee <= 0:
+        fee = estimate_taker_fee(decision.size, decision.vwap_price or decision.limit_price)
+    if total_cost <= 0:
+        total_cost = quantize_money(notional + fee)
+    return quantize_money(notional), quantize_money(fee), quantize_money(total_cost)
+
+
+def decision_effective_price(decision: QuantDecision) -> Decimal:
+    if decision.effective_price > 0:
+        return decision.effective_price
+    if decision.size <= 0:
+        return Decimal("0")
+    _notional, _fee, total_cost = decision_cost_components(decision)
+    return (total_cost / decision.size).quantize(Decimal("0.0001"))
+
+
+def scale_decision_to_size(decision: QuantDecision, size: Decimal, reason: str) -> QuantDecision:
+    if decision.size <= 0 or size <= 0:
+        ratio = Decimal("0")
+    else:
+        ratio = size / decision.size
+    notional, fee, total_cost = decision_cost_components(decision)
+    scaled_notional = quantize_money(notional * ratio)
+    scaled_fee = quantize_money(fee * ratio)
+    scaled_total = quantize_money(total_cost * ratio)
+    effective_price = (scaled_total / size).quantize(Decimal("0.0001")) if size > 0 else Decimal("0")
+    return QuantDecision(
+        market=decision.market,
+        outcome=decision.outcome,
+        token_id=decision.token_id,
+        probability=decision.probability,
+        best_ask=decision.best_ask,
+        raw_edge=decision.raw_edge,
+        edge=(decision.probability - effective_price).quantize(Decimal("0.0001")),
+        limit_price=decision.limit_price,
+        size=size,
+        reason=reason,
+        vwap_price=decision.vwap_price,
+        effective_price=effective_price,
+        notional=scaled_notional,
+        fee=scaled_fee,
+        total_cost=scaled_total,
+        liquidity_levels=decision.liquidity_levels,
+    )
+
+
 def book_levels(book: Dict[str, Any], side: str) -> List[Tuple[Decimal, Decimal]]:
     raw_levels = book.get("asks") if side == "BUY" else book.get("bids")
     if not isinstance(raw_levels, list):
@@ -2846,6 +2986,46 @@ def pnl_for_outcome(position: Dict[str, Decimal], outcome: str) -> Decimal:
     return position["up_pnl"] if outcome == "Up" else position["down_pnl"]
 
 
+def lock_rule_learning_payload(
+    position_before: Dict[str, Decimal],
+    position_after: Dict[str, Decimal],
+    decision: QuantDecision,
+    expected_before: Decimal,
+    expected_after: Decimal,
+    improvement: Decimal,
+    would_lock: bool,
+) -> Dict[str, Any]:
+    _notional, _fee, total_cost = decision_cost_components(decision)
+    cost = max(total_cost, Decimal("0.000001"))
+    pnl_gap_before = abs(position_before["up_pnl"] - position_before["down_pnl"])
+    pnl_gap_after = abs(position_after["up_pnl"] - position_after["down_pnl"])
+    gap_improvement = pnl_gap_before - pnl_gap_after
+    expected_gain = expected_after - expected_before
+    price_impact = max(decision_effective_price(decision) - decision.best_ask, Decimal("0"))
+    is_rebalance = (
+        (decision.outcome == "Up" and position_before["up_size"] < position_before["down_size"])
+        or (decision.outcome == "Down" and position_before["down_size"] < position_before["up_size"])
+    )
+    momentum = decision.best_ask >= MARKET_MOMENTUM_FOLLOW_MIN_ASK
+    signals: Dict[str, Decimal] = {
+        "edge": decision.edge,
+        "expected_efficiency": expected_gain / cost,
+        "worst_pnl_improvement": improvement / cost,
+        "gap_improvement": gap_improvement / max(decision.size, Decimal("1")),
+        "lock_bonus": Decimal("1") if would_lock else Decimal("0"),
+        "rebalance_bonus": Decimal("1") if is_rebalance else Decimal("0"),
+        "momentum_bonus": Decimal("1") if momentum else Decimal("0"),
+        "price_impact_penalty": price_impact,
+    }
+    weighted_score = sum(signals[key] * RULE_SIGNAL_WEIGHTS[key] for key in RULE_SIGNAL_WEIGHTS)
+    return {
+        "signals": {key: value.quantize(Decimal("0.0001")) for key, value in signals.items()},
+        "weights": RULE_SIGNAL_WEIGHTS,
+        "weighted_score": weighted_score.quantize(Decimal("0.0001")),
+        "label_pending": True,
+    }
+
+
 def lock_position_from_entry(entry: Dict[str, Any]) -> Dict[str, Decimal]:
     position = base_lock_position()
     trades = entry.get("trades")
@@ -2861,7 +3041,9 @@ def lock_position_from_entry(entry: Dict[str, Any]) -> Dict[str, Decimal]:
         notional = state_decimal(trade.get("notional"))
         fee_field_present = "fee" in trade
         fee = state_decimal(trade.get("fee"))
-        cost = state_decimal(trade.get("cost"))
+        cost = state_decimal(trade.get("total_cost"))
+        if cost <= 0:
+            cost = state_decimal(trade.get("cost"))
         if notional <= 0:
             notional = quantize_money(size * price)
         if not fee_field_present:
@@ -2892,10 +3074,16 @@ def lock_position_after_trade(
     outcome: str,
     size: Decimal,
     price: Decimal,
+    notional: Optional[Decimal] = None,
+    fee: Optional[Decimal] = None,
+    cost: Optional[Decimal] = None,
 ) -> Dict[str, Decimal]:
     position = base_lock_position()
     position.update({key: Decimal(value) for key, value in position_before.items()})
-    _notional, fee, cost = trade_cost_components(size, price)
+    calc_notional, calc_fee, calc_cost = trade_cost_components(size, price)
+    notional = quantize_money(notional if notional is not None and notional > 0 else calc_notional)
+    fee = quantize_money(fee if fee is not None and fee > 0 else calc_fee)
+    cost = quantize_money(cost if cost is not None and cost > 0 else calc_cost)
     if outcome == "Up":
         position["up_size"] += size
         position["up_fee"] += fee
@@ -2980,10 +3168,12 @@ def lock_candidate_payload(item: Dict[str, Any]) -> Dict[str, Any]:
         "fee_rate": POLYMARKET_CRYPTO_TAKER_FEE_RATE,
         "total_cost": item.get("total_cost", item.get("notional")),
         "max_notional": item.get("max_notional"),
+        "fill": item.get("fill"),
         "reason": item.get("reason"),
         "improvement_worst_pnl": item.get("improvement_worst_pnl"),
         "expected_pnl_before": item.get("expected_pnl_before"),
         "expected_pnl_after": item.get("expected_pnl_after"),
+        "rule_learning": item.get("rule_learning"),
         "would_lock": bool(item.get("would_lock")),
         "score": list(score) if isinstance(score, tuple) else score,
         "position_after": lock_position_payload(item.get("position_after", base_lock_position())),
