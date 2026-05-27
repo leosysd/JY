@@ -15,9 +15,12 @@ DEFAULT_TARGET_WALLET = "0xe0229e10a858860218b6132f4234602c47bd6603"
 DEFAULT_CLOB_API_URL = "https://clob.polymarket.com"
 DEFAULT_MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 DEFAULT_POLYMARKET_RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
+DEFAULT_BINANCE_WS_URL = "wss://data-stream.binance.vision/ws/{symbol}@aggTrade"
 DEFAULT_QUANT_CHAINLINK_TIMEOUT_SEC = "20"
 DEFAULT_QUANT_CHAINLINK_MAX_AGE_SEC = "240"
 DEFAULT_QUANT_CHAINLINK_START_TOLERANCE_SEC = "180"
+DEFAULT_QUANT_BINANCE_MAX_AGE_SEC = "20"
+DEFAULT_QUANT_BINANCE_START_TOLERANCE_SEC = "30"
 DEFAULT_QUANT_ORDER_SHARES = "5"
 DEFAULT_QUANT_MARKET_MAX_USDC = "60"
 DEFAULT_QUANT_MAX_TRADES_PER_MARKET = "2"
@@ -99,6 +102,11 @@ class CopyBotConfig:
     quant_symbol: str = "BTC-USDT"
     quant_market_slug_prefix: str = "btc-updown-5m"
     quant_price_source: str = "chainlink"
+    quant_direction_source: str = "binance"
+    quant_binance_symbol: str = "btcusdt"
+    quant_binance_ws_url: str = DEFAULT_BINANCE_WS_URL
+    quant_binance_max_age_sec: float = float(DEFAULT_QUANT_BINANCE_MAX_AGE_SEC)
+    quant_binance_start_tolerance_sec: float = float(DEFAULT_QUANT_BINANCE_START_TOLERANCE_SEC)
     quant_chainlink_symbol: str = "btc/usd"
     quant_chainlink_ws_url: str = DEFAULT_POLYMARKET_RTDS_WS_URL
     quant_chainlink_timeout_sec: float = float(DEFAULT_QUANT_CHAINLINK_TIMEOUT_SEC)
@@ -197,6 +205,13 @@ def load_config(config_path: Optional[Path] = None) -> CopyBotConfig:
         quant_symbol=_env("QUANT_SYMBOL", "BTC-USDT"),
         quant_market_slug_prefix=_env("QUANT_MARKET_SLUG_PREFIX", "btc-updown-5m"),
         quant_price_source=_env("QUANT_PRICE_SOURCE", "chainlink").lower(),
+        quant_direction_source=_env("QUANT_DIRECTION_SOURCE", "binance").lower(),
+        quant_binance_symbol=_env("QUANT_BINANCE_SYMBOL", "btcusdt").lower(),
+        quant_binance_ws_url=_env("QUANT_BINANCE_WS_URL", DEFAULT_BINANCE_WS_URL),
+        quant_binance_max_age_sec=float(_env("QUANT_BINANCE_MAX_AGE_SEC", DEFAULT_QUANT_BINANCE_MAX_AGE_SEC)),
+        quant_binance_start_tolerance_sec=float(
+            _env("QUANT_BINANCE_START_TOLERANCE_SEC", DEFAULT_QUANT_BINANCE_START_TOLERANCE_SEC)
+        ),
         quant_chainlink_symbol=_env("QUANT_CHAINLINK_SYMBOL", "btc/usd").lower(),
         quant_chainlink_ws_url=_env("QUANT_CHAINLINK_WS_URL", DEFAULT_POLYMARKET_RTDS_WS_URL),
         quant_chainlink_timeout_sec=float(
@@ -300,6 +315,16 @@ def validate_config(config: CopyBotConfig, require_private_key: bool = False) ->
         errors.append("MARKET_WS_HEARTBEAT_SEC 必须大于 0")
     if config.quant_price_source not in {"chainlink", "okx"}:
         errors.append("QUANT_PRICE_SOURCE 必须是 chainlink 或 okx")
+    if config.quant_direction_source not in {"binance", "chainlink", "okx"}:
+        errors.append("QUANT_DIRECTION_SOURCE 必须是 binance、chainlink 或 okx")
+    if config.quant_direction_source == "binance" and not config.quant_binance_symbol:
+        errors.append("QUANT_BINANCE_SYMBOL 不能为空")
+    if config.quant_direction_source == "binance" and "{symbol}" not in config.quant_binance_ws_url:
+        warnings.append("QUANT_BINANCE_WS_URL 未包含 {symbol}，将按完整 WebSocket URL 使用")
+    if config.quant_binance_max_age_sec <= 0:
+        errors.append("QUANT_BINANCE_MAX_AGE_SEC 必须大于 0")
+    if config.quant_binance_start_tolerance_sec <= 0:
+        errors.append("QUANT_BINANCE_START_TOLERANCE_SEC 必须大于 0")
     if config.quant_price_source == "chainlink" and config.quant_chainlink_symbol != "btc/usd":
         warnings.append("当前 AI量化第一版只验证过 Chainlink btc/usd")
     if config.quant_chainlink_timeout_sec <= 0:
@@ -385,6 +410,11 @@ def env_lines(values: Dict[str, str]) -> List[str]:
         "QUANT_SYMBOL",
         "QUANT_MARKET_SLUG_PREFIX",
         "QUANT_PRICE_SOURCE",
+        "QUANT_DIRECTION_SOURCE",
+        "QUANT_BINANCE_SYMBOL",
+        "QUANT_BINANCE_WS_URL",
+        "QUANT_BINANCE_MAX_AGE_SEC",
+        "QUANT_BINANCE_START_TOLERANCE_SEC",
         "QUANT_CHAINLINK_SYMBOL",
         "QUANT_CHAINLINK_WS_URL",
         "QUANT_CHAINLINK_TIMEOUT_SEC",

@@ -21,9 +21,12 @@ from dotenv import dotenv_values
 from .bot import PolymarketCopyBot, run_configured_bot
 from .config import (
     DEFAULT_CLOB_API_URL,
+    DEFAULT_BINANCE_WS_URL,
     DEFAULT_MARKET_WS_URL,
     DEFAULT_POLYMARKET_RTDS_WS_URL,
     DEFAULT_QUANT_ARBITRAGE_MIN_PROFIT,
+    DEFAULT_QUANT_BINANCE_MAX_AGE_SEC,
+    DEFAULT_QUANT_BINANCE_START_TOLERANCE_SEC,
     DEFAULT_QUANT_CHAINLINK_MAX_AGE_SEC,
     DEFAULT_QUANT_CHAINLINK_START_TOLERANCE_SEC,
     DEFAULT_QUANT_CHAINLINK_TIMEOUT_SEC,
@@ -210,6 +213,14 @@ def init_config(config_path: Path) -> None:
         "QUANT_SYMBOL": existing.get("QUANT_SYMBOL", "BTC-USDT"),
         "QUANT_MARKET_SLUG_PREFIX": existing.get("QUANT_MARKET_SLUG_PREFIX", "btc-updown-5m"),
         "QUANT_PRICE_SOURCE": existing.get("QUANT_PRICE_SOURCE", "chainlink"),
+        "QUANT_DIRECTION_SOURCE": existing.get("QUANT_DIRECTION_SOURCE", "binance"),
+        "QUANT_BINANCE_SYMBOL": existing.get("QUANT_BINANCE_SYMBOL", "btcusdt"),
+        "QUANT_BINANCE_WS_URL": existing.get("QUANT_BINANCE_WS_URL", DEFAULT_BINANCE_WS_URL),
+        "QUANT_BINANCE_MAX_AGE_SEC": existing.get("QUANT_BINANCE_MAX_AGE_SEC", DEFAULT_QUANT_BINANCE_MAX_AGE_SEC),
+        "QUANT_BINANCE_START_TOLERANCE_SEC": existing.get(
+            "QUANT_BINANCE_START_TOLERANCE_SEC",
+            DEFAULT_QUANT_BINANCE_START_TOLERANCE_SEC,
+        ),
         "QUANT_CHAINLINK_SYMBOL": existing.get("QUANT_CHAINLINK_SYMBOL", "btc/usd"),
         "QUANT_CHAINLINK_WS_URL": existing.get("QUANT_CHAINLINK_WS_URL", DEFAULT_POLYMARKET_RTDS_WS_URL),
         "QUANT_CHAINLINK_TIMEOUT_SEC": existing.get("QUANT_CHAINLINK_TIMEOUT_SEC", DEFAULT_QUANT_CHAINLINK_TIMEOUT_SEC),
@@ -265,7 +276,8 @@ def print_config_summary(config_path: Path, require_private_key: Optional[bool] 
         print(f"价格保护: {config.price_mode}, 最大滑点: {config.max_slippage}, 单笔上限: {config.max_order_usdc} USDC")
     print(
         "AI量化: "
-        f"{config.quant_symbol}, strategy={config.quant_strategy}, source={config.quant_price_source}, "
+        f"{config.quant_symbol}, strategy={config.quant_strategy}, "
+        f"settlement={config.quant_price_source}, direction={config.quant_direction_source}, "
         f"size_mode={config.quant_size_mode}, order_usdc={config.quant_order_usdc}, "
         f"order_shares={config.quant_order_shares}, "
         f"min_edge={config.quant_min_edge}, "
@@ -285,6 +297,11 @@ def print_config_summary(config_path: Path, require_private_key: Optional[bool] 
         print(
             "Chainlink RTDS: "
             f"{config.quant_chainlink_symbol} / {config.quant_chainlink_ws_url}"
+        )
+    if config.quant_direction_source == "binance":
+        print(
+            "Binance direction: "
+            f"{config.quant_binance_symbol} / {config.quant_binance_ws_url}"
         )
     print(
         "AI量化数据: "
@@ -784,6 +801,17 @@ def update_quant_config(config_path: Path) -> None:
     values = {
         "QUANT_SYMBOL": prompt_text("量化交易对 QUANT_SYMBOL", existing.get("QUANT_SYMBOL", "BTC-USDT")),
         "QUANT_PRICE_SOURCE": prompt_text("行情源 QUANT_PRICE_SOURCE，chainlink=官方结算源，okx=参考行情", existing.get("QUANT_PRICE_SOURCE", "chainlink")),
+        "QUANT_DIRECTION_SOURCE": prompt_text("方向源 QUANT_DIRECTION_SOURCE，binance=短线方向，chainlink=结算源方向", existing.get("QUANT_DIRECTION_SOURCE", "binance")),
+        "QUANT_BINANCE_SYMBOL": prompt_text("Binance 短线方向交易对 QUANT_BINANCE_SYMBOL", existing.get("QUANT_BINANCE_SYMBOL", "btcusdt")),
+        "QUANT_BINANCE_WS_URL": prompt_text("Binance WebSocket QUANT_BINANCE_WS_URL", existing.get("QUANT_BINANCE_WS_URL", DEFAULT_BINANCE_WS_URL)),
+        "QUANT_BINANCE_MAX_AGE_SEC": prompt_text(
+            "Binance 最新价格最大延迟秒数 QUANT_BINANCE_MAX_AGE_SEC",
+            existing.get("QUANT_BINANCE_MAX_AGE_SEC", DEFAULT_QUANT_BINANCE_MAX_AGE_SEC),
+        ),
+        "QUANT_BINANCE_START_TOLERANCE_SEC": prompt_text(
+            "Binance 开盘价容忍秒数 QUANT_BINANCE_START_TOLERANCE_SEC",
+            existing.get("QUANT_BINANCE_START_TOLERANCE_SEC", DEFAULT_QUANT_BINANCE_START_TOLERANCE_SEC),
+        ),
         "QUANT_CHAINLINK_SYMBOL": prompt_text("Chainlink 交易对 QUANT_CHAINLINK_SYMBOL", existing.get("QUANT_CHAINLINK_SYMBOL", "btc/usd")),
         "QUANT_CHAINLINK_WS_URL": prompt_text("Polymarket RTDS WebSocket QUANT_CHAINLINK_WS_URL", existing.get("QUANT_CHAINLINK_WS_URL", DEFAULT_POLYMARKET_RTDS_WS_URL)),
         "QUANT_CHAINLINK_TIMEOUT_SEC": prompt_text(
@@ -1666,6 +1694,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_quant.add_argument("--config", default=".env")
     p_quant.add_argument("--symbol")
     p_quant.add_argument("--price-source")
+    p_quant.add_argument("--direction-source", choices=["binance", "chainlink", "okx"])
+    p_quant.add_argument("--binance-symbol")
+    p_quant.add_argument("--binance-ws-url")
+    p_quant.add_argument("--binance-max-age-sec")
+    p_quant.add_argument("--binance-start-tolerance-sec")
     p_quant.add_argument("--chainlink-symbol")
     p_quant.add_argument("--chainlink-ws-url")
     p_quant.add_argument("--chainlink-timeout-sec")
@@ -1816,6 +1849,11 @@ def main(argv: Optional[List[str]] = None) -> None:
             [
                 args.symbol,
                 args.price_source,
+                args.direction_source,
+                args.binance_symbol,
+                args.binance_ws_url,
+                args.binance_max_age_sec,
+                args.binance_start_tolerance_sec,
                 args.chainlink_symbol,
                 args.chainlink_ws_url,
                 args.chainlink_timeout_sec,
@@ -1848,6 +1886,33 @@ def main(argv: Optional[List[str]] = None) -> None:
             existing = load_existing_env(config_path)
             set_env_value(config_path, "QUANT_SYMBOL", args.symbol or existing.get("QUANT_SYMBOL", "BTC-USDT"))
             set_env_value(config_path, "QUANT_PRICE_SOURCE", args.price_source or existing.get("QUANT_PRICE_SOURCE", "chainlink"))
+            set_env_value(
+                config_path,
+                "QUANT_DIRECTION_SOURCE",
+                args.direction_source or existing.get("QUANT_DIRECTION_SOURCE", "binance"),
+            )
+            set_env_value(
+                config_path,
+                "QUANT_BINANCE_SYMBOL",
+                args.binance_symbol or existing.get("QUANT_BINANCE_SYMBOL", "btcusdt"),
+            )
+            set_env_value(
+                config_path,
+                "QUANT_BINANCE_WS_URL",
+                args.binance_ws_url or existing.get("QUANT_BINANCE_WS_URL", DEFAULT_BINANCE_WS_URL),
+            )
+            set_env_value(
+                config_path,
+                "QUANT_BINANCE_MAX_AGE_SEC",
+                args.binance_max_age_sec
+                or existing.get("QUANT_BINANCE_MAX_AGE_SEC", DEFAULT_QUANT_BINANCE_MAX_AGE_SEC),
+            )
+            set_env_value(
+                config_path,
+                "QUANT_BINANCE_START_TOLERANCE_SEC",
+                args.binance_start_tolerance_sec
+                or existing.get("QUANT_BINANCE_START_TOLERANCE_SEC", DEFAULT_QUANT_BINANCE_START_TOLERANCE_SEC),
+            )
             set_env_value(
                 config_path,
                 "QUANT_CHAINLINK_SYMBOL",

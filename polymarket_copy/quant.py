@@ -46,6 +46,14 @@ class BtcSnapshot:
     ret_1m: Decimal
     ret_3m: Decimal
     up_probability: Decimal
+    direction_source: str = ""
+    direction_current_ts: int = 0
+    direction_current: Decimal = Decimal("0")
+    direction_start_price_ts: int = 0
+    direction_start_price: Decimal = Decimal("0")
+    direction_ret_from_start: Decimal = Decimal("0")
+    direction_ret_1m: Decimal = Decimal("0")
+    direction_ret_3m: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -188,6 +196,14 @@ class ChainlinkRtdsPriceFeed:
             ret_1m=ret_1m,
             ret_3m=ret_3m,
             up_probability=up_probability,
+            direction_source="chainlink",
+            direction_current_ts=current_ts,
+            direction_current=current,
+            direction_start_price_ts=start_ts,
+            direction_start_price=start_price,
+            direction_ret_from_start=ret_from_start,
+            direction_ret_1m=ret_1m,
+            direction_ret_3m=ret_3m,
         )
 
     def _run(self) -> None:
@@ -293,6 +309,185 @@ class ChainlinkRtdsPriceFeed:
             parsed.append((ts, price))
         if parsed:
             self._add_prices(parsed)
+
+    def _add_prices(self, parsed: List[Tuple[int, Decimal]]) -> None:
+        with self.lock:
+            merged = {ts: price for ts, price in self.prices}
+            merged.update(parsed)
+            cutoff = int(time.time()) - 900
+            self.prices = sorted((ts, price) for ts, price in merged.items() if ts >= cutoff)
+
+
+class BinanceTradePriceFeed:
+    def __init__(self, config: CopyBotConfig) -> None:
+        self.config = config
+        self.prices: List[Tuple[int, Decimal]] = []
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+        self.ws: Any = None
+        self.last_error = ""
+        self.last_refresh_request_ts = 0.0
+
+    def start(self) -> None:
+        if self.thread and self.thread.is_alive():
+            return
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._run, name="binance-direction", daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        ws = self.ws
+        if ws:
+            try:
+                ws.close()
+            except Exception:
+                pass
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=2)
+
+    def wait_direction_snapshot(self, market_start_ts: int, settlement: BtcSnapshot) -> BtcSnapshot:
+        self.start()
+        deadline = time.monotonic() + self.config.quant_chainlink_timeout_sec
+        last_problem = ""
+        while time.monotonic() < deadline:
+            try:
+                return self.direction_snapshot(market_start_ts, settlement)
+            except RuntimeError as exc:
+                last_problem = str(exc)
+                if "stale" in last_problem or "no Binance prices" in last_problem:
+                    self.request_refresh()
+                time.sleep(0.25)
+        if self.last_error:
+            last_problem = f"{last_problem}; last_ws_error={self.last_error}" if last_problem else self.last_error
+        raise RuntimeError(f"Binance direction price unavailable: {last_problem}")
+
+    def direction_snapshot(self, market_start_ts: int, settlement: BtcSnapshot) -> BtcSnapshot:
+        now = int(time.time())
+        with self.lock:
+            prices = list(self.prices)
+        if not prices:
+            raise RuntimeError("no Binance prices received yet")
+
+        current_ts, current = prices[-1]
+        if now - current_ts > self.config.quant_binance_max_age_sec:
+            raise RuntimeError(f"latest Binance price is stale: age={now - current_ts}s")
+
+        start_item = nearest_price(prices, market_start_ts)
+        if start_item is None:
+            raise RuntimeError("missing Binance start price")
+        start_ts, start_price = start_item
+        start_delta = abs(start_ts - market_start_ts)
+        start_tolerance = self.config.quant_binance_start_tolerance_sec
+        if start_delta > start_tolerance:
+            raise RuntimeError(
+                f"Binance start price is too far from market start: "
+                f"start_ts={start_ts} market_start_ts={market_start_ts} "
+                f"delta={start_delta}s tolerance={start_tolerance}s"
+            )
+
+        one_min_item = nearest_price(prices, current_ts - 60)
+        three_min_item = nearest_price(prices, current_ts - 180)
+        one_min_price = one_min_item[1] if one_min_item else start_price
+        three_min_price = three_min_item[1] if three_min_item else start_price
+        ret_from_start = decimal_return(current, start_price)
+        ret_1m = decimal_return(current, one_min_price)
+        ret_3m = decimal_return(current, three_min_price)
+        up_probability = estimate_up_probability(ret_from_start, ret_1m, ret_3m)
+        return BtcSnapshot(
+            source="chainlink_settlement_binance_direction",
+            current_ts=settlement.current_ts,
+            current=settlement.current,
+            start_price_ts=settlement.start_price_ts,
+            start_price=settlement.start_price,
+            ret_from_start=ret_from_start,
+            ret_1m=ret_1m,
+            ret_3m=ret_3m,
+            up_probability=up_probability,
+            direction_source="binance",
+            direction_current_ts=current_ts,
+            direction_current=current,
+            direction_start_price_ts=start_ts,
+            direction_start_price=start_price,
+            direction_ret_from_start=ret_from_start,
+            direction_ret_1m=ret_1m,
+            direction_ret_3m=ret_3m,
+        )
+
+    def _run(self) -> None:
+        try:
+            import websocket  # type: ignore
+        except ImportError:
+            self.last_error = "missing websocket-client"
+            print("[BINANCE WARN] missing websocket-client, Binance direction feed unavailable.")
+            return
+
+        while not self.stop_event.is_set():
+            ws = None
+            try:
+                url = self.stream_url()
+                ws = websocket.create_connection(url, timeout=10)
+                self.ws = ws
+                print(f"[BINANCE] connected BTC direction stream: {url}")
+                ws.settimeout(1)
+                while not self.stop_event.is_set():
+                    try:
+                        message = ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        continue
+                    if not message:
+                        continue
+                    self._handle_message(str(message))
+            except Exception as exc:
+                self.last_error = repr(exc)
+                if not self.stop_event.is_set():
+                    print(f"[BINANCE WARN] direction stream disconnected: {repr(exc)}, reconnecting later.")
+                    time.sleep(max(1.0, self.config.market_ws_reconnect_sec))
+            finally:
+                self.ws = None
+                if ws:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+
+    def request_refresh(self) -> None:
+        now = time.monotonic()
+        if now - self.last_refresh_request_ts < 3:
+            return
+        self.last_refresh_request_ts = now
+        ws = self.ws
+        if ws:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    def stream_url(self) -> str:
+        symbol = self.config.quant_binance_symbol.lower()
+        url = self.config.quant_binance_ws_url
+        return url.format(symbol=symbol) if "{symbol}" in url else url
+
+    def _handle_message(self, message: str) -> None:
+        try:
+            data = json.loads(message)
+        except json.JSONDecodeError:
+            return
+        payload = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
+        if not isinstance(payload, dict):
+            return
+        price_value = payload.get("p") or payload.get("c")
+        ts_value = payload.get("T") or payload.get("E")
+        if price_value is None or ts_value is None:
+            return
+        try:
+            raw_ts = Decimal(str(ts_value))
+            ts = int(raw_ts / Decimal("1000")) if raw_ts > Decimal("10000000000") else int(raw_ts)
+            price = decimal_value(price_value)
+        except Exception:
+            return
+        self._add_prices([(ts, price)])
 
     def _add_prices(self, parsed: List[Tuple[int, Decimal]]) -> None:
         with self.lock:
@@ -476,6 +671,7 @@ class PolymarketQuantBot:
         self.state = QuantStateStore(config.quant_state_file)
         self.signal_recorder = QuantSignalRecorder(config)
         self.chainlink_feed = ChainlinkRtdsPriceFeed(config)
+        self.binance_feed = BinanceTradePriceFeed(config)
         self.last_log_ts = 0.0
 
     def run_forever(self) -> None:
@@ -496,7 +692,8 @@ class PolymarketQuantBot:
             "[AI QUANT] "
             f"symbol={self.config.quant_symbol} "
             f"strategy={self.config.quant_strategy} "
-            f"source={self.config.quant_price_source} "
+            f"settlement_source={self.config.quant_price_source} "
+            f"direction_source={self.config.quant_direction_source} "
             f"size_mode={self.config.quant_size_mode} "
             f"order_usdc={self.config.quant_order_usdc} "
             f"order_shares={self.config.quant_order_shares} "
@@ -511,6 +708,8 @@ class PolymarketQuantBot:
             print(f"[AI QUANT DATA] signals={self.config.quant_signal_file}")
         if self.config.quant_price_source == "chainlink":
             self.chainlink_feed.start()
+        if self.config.quant_direction_source == "binance":
+            self.binance_feed.start()
 
         try:
             while True:
@@ -526,6 +725,7 @@ class PolymarketQuantBot:
         finally:
             self.market_ws.stop()
             self.chainlink_feed.stop()
+            self.binance_feed.stop()
 
     def run_once(self, client: Any = None) -> Optional[QuantDecision]:
         market = self.find_current_market()
@@ -537,7 +737,7 @@ class PolymarketQuantBot:
         try:
             snapshot = self.fetch_btc_snapshot(market.start_ts)
         except RuntimeError as exc:
-            self.log_throttled(f"[AI QUANT] Chainlink 价格暂不可用，跳过本轮: {exc}")
+            self.log_throttled(f"[AI QUANT] price feed unavailable, skip this round: {exc}")
             return None
         if self.config.quant_strategy == "lock":
             return self.make_lock_decision(market, snapshot, client=client)
@@ -631,7 +831,10 @@ class PolymarketQuantBot:
 
     def fetch_btc_snapshot(self, market_start_ts: int) -> BtcSnapshot:
         if self.config.quant_price_source == "chainlink":
-            return self.chainlink_feed.wait_snapshot(market_start_ts)
+            settlement = self.chainlink_feed.wait_snapshot(market_start_ts)
+            if self.config.quant_direction_source == "binance":
+                return self.binance_feed.wait_direction_snapshot(market_start_ts, settlement)
+            return settlement
         if self.config.quant_price_source != "okx":
             raise RuntimeError("AI量化行情源只支持 QUANT_PRICE_SOURCE=chainlink 或 okx")
 
@@ -660,6 +863,14 @@ class PolymarketQuantBot:
             ret_1m=ret_1m,
             ret_3m=ret_3m,
             up_probability=up_probability,
+            direction_source="okx",
+            direction_current_ts=int(candles[-1]["ts"]),
+            direction_current=current,
+            direction_start_price_ts=int(nearest_candle_ts(candles, market_start_ts)),
+            direction_start_price=start_price,
+            direction_ret_from_start=ret_from_start,
+            direction_ret_1m=ret_1m,
+            direction_ret_3m=ret_3m,
         )
 
     def fetch_fresh_book(self, token_id: str) -> Dict[str, Any]:
@@ -2090,6 +2301,23 @@ class PolymarketQuantBot:
                 "ret_1m": snapshot.ret_1m,
                 "ret_3m": snapshot.ret_3m,
                 "up_probability": snapshot.up_probability,
+                "settlement": {
+                    "source": self.config.quant_price_source,
+                    "current_ts": snapshot.current_ts,
+                    "current": snapshot.current,
+                    "start_price_ts": snapshot.start_price_ts,
+                    "start_price": snapshot.start_price,
+                },
+                "direction": {
+                    "source": snapshot.direction_source or snapshot.source,
+                    "current_ts": snapshot.direction_current_ts or snapshot.current_ts,
+                    "current": snapshot.direction_current or snapshot.current,
+                    "start_price_ts": snapshot.direction_start_price_ts or snapshot.start_price_ts,
+                    "start_price": snapshot.direction_start_price or snapshot.start_price,
+                    "ret_from_start": snapshot.direction_ret_from_start or snapshot.ret_from_start,
+                    "ret_1m": snapshot.direction_ret_1m or snapshot.ret_1m,
+                    "ret_3m": snapshot.direction_ret_3m or snapshot.ret_3m,
+                },
             },
             "position_before": lock_position_payload(position_before),
             "position_after": lock_position_payload(position_after),
@@ -2158,6 +2386,23 @@ class PolymarketQuantBot:
                 "ret_1m": snapshot.ret_1m,
                 "ret_3m": snapshot.ret_3m,
                 "up_probability": snapshot.up_probability,
+                "settlement": {
+                    "source": self.config.quant_price_source,
+                    "current_ts": snapshot.current_ts,
+                    "current": snapshot.current,
+                    "start_price_ts": snapshot.start_price_ts,
+                    "start_price": snapshot.start_price,
+                },
+                "direction": {
+                    "source": snapshot.direction_source or snapshot.source,
+                    "current_ts": snapshot.direction_current_ts or snapshot.current_ts,
+                    "current": snapshot.direction_current or snapshot.current,
+                    "start_price_ts": snapshot.direction_start_price_ts or snapshot.start_price_ts,
+                    "start_price": snapshot.direction_start_price or snapshot.start_price,
+                    "ret_from_start": snapshot.direction_ret_from_start or snapshot.ret_from_start,
+                    "ret_1m": snapshot.direction_ret_1m or snapshot.ret_1m,
+                    "ret_3m": snapshot.direction_ret_3m or snapshot.ret_3m,
+                },
             },
             "market_snapshot": self.lock_loop_snapshot(market, base_lock_position()),
             "config": {
