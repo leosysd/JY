@@ -2809,6 +2809,25 @@ class PolymarketQuantBot:
         market_consensus_side = decision.best_ask >= TARGET_STYLE_PROBE_MIN_ASK
         model_confirms_side = decision.probability >= TARGET_STYLE_PROBABILITY_MARGIN
         target_style_follow = is_favorite or market_consensus_side or model_confirms_side
+        would_balance_into_locked_loss = (
+            is_rebalance
+            and both_negative_after
+            and near_equal_size
+            and gap_improvement > 0
+        )
+        if position_before["trade_count"] > 0 and would_balance_into_locked_loss:
+            return (
+                "rebalance_would_lock_loss",
+                (
+                    Decimal("0"),
+                    position_after["worst_pnl"],
+                    position_after["up_pnl"],
+                    position_after["down_pnl"],
+                    gap_improvement,
+                    improvement,
+                    -position_after["total_cost"],
+                ),
+            )
         if position_before["trade_count"] > 0 and is_rebalance and improvement > 0:
             if position_after["worst_pnl"] >= self.config.quant_lock_min_profit:
                 return (
