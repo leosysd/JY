@@ -32,6 +32,7 @@ INVENTORY_GAP_ORDER_MULTIPLIER = Decimal("3")
 MAX_WORST_LOSS_ORDER_MULTIPLIER = Decimal("2")
 POLYMARKET_CRYPTO_TAKER_FEE_RATE = Decimal("0.07")
 MONEY_QUANT = Decimal("0.0001")
+MARKET_MOMENTUM_FOLLOW_MIN_ASK = Decimal("0.60")
 
 
 @dataclass(frozen=True)
@@ -1795,7 +1796,7 @@ class PolymarketQuantBot:
         gap_improvement = pnl_gap_before - pnl_gap
         favorite_outcome = "Up" if p_up >= Decimal("0.5") else "Down"
         is_favorite = decision.outcome == favorite_outcome
-        strong_market_momentum = decision.best_ask >= Decimal("0.65")
+        strong_market_momentum = decision.best_ask >= MARKET_MOMENTUM_FOLLOW_MIN_ASK
         cheap_inventory_hedge = decision.best_ask <= Decimal("0.35") and improvement > 0
         expected_positive = expected_gain > Decimal("0")
         selected_pnl_after = pnl_for_outcome(position_after, decision.outcome)
@@ -1953,12 +1954,13 @@ class PolymarketQuantBot:
             )
         if expected_positive and (is_favorite or decision.edge >= self.config.quant_min_edge):
             return (
-                "expected_value_add",
+                "value_model_needs_market_confirmation",
                 (
-                    Decimal("4"),
+                    Decimal("0"),
                     expected_after,
                     expected_efficiency,
                     decision.edge,
+                    decision.best_ask,
                     -pnl_gap,
                     -position_after["total_cost"],
                 ),
