@@ -40,6 +40,7 @@ MARKET_MOMENTUM_FOLLOW_MIN_ASK = Decimal("0.60")
 TARGET_STYLE_PROBE_MIN_ASK = Decimal("0.50")
 TARGET_STYLE_FOLLOW_MIN_ASK = Decimal("0.55")
 TARGET_STYLE_PROBABILITY_MARGIN = Decimal("0.52")
+TARGET_STYLE_SAME_SIDE_MIN_PRICE_MOVE = Decimal("0.03")
 RULE_SIGNAL_WEIGHTS: Dict[str, Decimal] = {
     "edge": Decimal("0.8"),
     "expected_efficiency": Decimal("1.0"),
@@ -2144,6 +2145,9 @@ class PolymarketQuantBot:
             notional = total_cost
             max_notional = total_cost
             dry_run_rejections: List[str] = []
+            ladder_skip_reason = same_outcome_price_ladder_skip(entry, outcome, best_ask)
+            if ladder_skip_reason:
+                dry_run_rejections.append(ladder_skip_reason)
             if max_notional > budget_remaining:
                 if not self.config.dry_run:
                     candidate_records.append(
@@ -2428,6 +2432,9 @@ class PolymarketQuantBot:
                     )
                     continue
                 dry_run_rejections: List[str] = []
+                ladder_skip_reason = same_outcome_price_ladder_skip(entry, outcome, best_ask)
+                if ladder_skip_reason:
+                    dry_run_rejections.append(ladder_skip_reason)
                 if total_cost > budget_remaining:
                     if not self.config.dry_run:
                         continue
@@ -3791,6 +3798,28 @@ def same_outcome_repeat_skip(
         if abs(best_ask - last_price) >= SAME_OUTCOME_MIN_PRICE_MOVE:
             return ""
         return "same_outcome_no_price_move"
+    return ""
+
+
+def same_outcome_price_ladder_skip(
+    entry: Optional[Dict[str, Any]],
+    outcome: str,
+    best_ask: Decimal,
+) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    trades = entry.get("trades")
+    if not isinstance(trades, list) or not trades:
+        return ""
+    for trade in reversed(trades):
+        if not isinstance(trade, dict):
+            continue
+        if str(trade.get("outcome") or "") != outcome:
+            continue
+        last_price = state_decimal(trade.get("best_ask") or trade.get("limit_price"))
+        if abs(best_ask - last_price) < TARGET_STYLE_SAME_SIDE_MIN_PRICE_MOVE:
+            return "same_outcome_price_ladder_wait"
+        return ""
     return ""
 
 
