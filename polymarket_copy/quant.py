@@ -102,6 +102,8 @@ class QuantDecision:
     fee: Decimal = Decimal("0")
     total_cost: Decimal = Decimal("0")
     liquidity_levels: int = 0
+    depth_available: Decimal = Decimal("0")
+    fill_complete: bool = False
 
 
 @dataclass(frozen=True)
@@ -116,6 +118,7 @@ class BookFill:
     total_cost: Decimal
     effective_price: Decimal
     levels_used: int
+    depth_available: Decimal
     complete: bool
 
 
@@ -1073,6 +1076,8 @@ class PolymarketQuantBot:
                 fee=fill.fee,
                 total_cost=fill.total_cost,
                 liquidity_levels=fill.levels_used,
+                depth_available=fill.depth_available,
+                fill_complete=fill.complete,
             )
             review["valid"] = True
             return reviewed, review
@@ -1204,6 +1209,8 @@ class PolymarketQuantBot:
                 fee=fill.fee,
                 total_cost=fill.total_cost,
                 liquidity_levels=fill.levels_used,
+                depth_available=fill.depth_available,
+                fill_complete=fill.complete,
             )
             candidates.append(decision)
             candidate_records.append(self.decision_payload(decision) | {"valid": True})
@@ -1366,12 +1373,16 @@ class PolymarketQuantBot:
     def lock_loop_snapshot(self, market: QuantMarket, position: Dict[str, Decimal]) -> Dict[str, Any]:
         asks: Dict[str, Any] = {
             "up_ask": None,
+            "up_ask_price": None,
             "down_ask": None,
+            "down_ask_price": None,
             "sum_ask": None,
             "worst_pnl": position["worst_pnl"],
             "up_pnl": position["up_pnl"],
             "down_pnl": position["down_pnl"],
+            "price_source": "orderbook_asks",
         }
+        fills: Dict[str, BookFill] = {}
         for outcome, token_id in zip(market.outcomes, market.token_ids):
             key = "up_ask" if outcome == "Up" else "down_ask" if outcome == "Down" else ""
             if not key:
@@ -1380,6 +1391,20 @@ class PolymarketQuantBot:
                 book = self.book_cache.get_book(token_id)
                 best_ask = best_book_price(book, "BUY")
                 asks[key] = best_ask
+                asks[f"{key}_price"] = best_ask
+                if best_ask is not None:
+                    max_price = min(best_ask + self.config.max_slippage, Decimal("0.99"))
+                    requested_size = self.config.quant_order_shares.quantize(
+                        Decimal("0.000001"),
+                        rounding=ROUND_FLOOR,
+                    )
+                    fill = estimate_buy_fill_for_size(book, requested_size, max_price=max_price)
+                    fills[outcome] = fill
+                    depth_key = "up_depth" if outcome == "Up" else "down_depth"
+                    fee_key = "up_fee" if outcome == "Up" else "down_fee"
+                    asks[depth_key] = fill.depth_available
+                    asks[fee_key] = fill.fee
+                    asks[f"{key}_fill"] = fill_payload(fill)
             except Exception as exc:
                 asks[f"{key}_error"] = f"{type(exc).__name__}:{exc}"
         up_ask = asks.get("up_ask")
@@ -1387,6 +1412,35 @@ class PolymarketQuantBot:
         if isinstance(up_ask, Decimal) and isinstance(down_ask, Decimal):
             asks["sum_ask"] = up_ask + down_ask
             asks["pure_arb_edge"] = Decimal("1") - asks["sum_ask"]
+        up_fill = fills.get("Up")
+        down_fill = fills.get("Down")
+        if up_fill is not None and down_fill is not None:
+            size = min(up_fill.filled_size, down_fill.filled_size)
+            guaranteed_payout = size
+            if size > 0 and (up_fill.filled_size != size or down_fill.filled_size != size):
+                up_cost = quantize_money(up_fill.total_cost * (size / up_fill.filled_size))
+                down_cost = quantize_money(down_fill.total_cost * (size / down_fill.filled_size))
+                up_fee = quantize_money(up_fill.fee * (size / up_fill.filled_size))
+                down_fee = quantize_money(down_fill.fee * (size / down_fill.filled_size))
+            else:
+                up_cost = up_fill.total_cost
+                down_cost = down_fill.total_cost
+                up_fee = up_fill.fee
+                down_fee = down_fill.fee
+            total_cost = quantize_money(up_cost + down_cost)
+            locked_profit = quantize_money(guaranteed_payout - total_cost)
+            both_complete = up_fill.complete and down_fill.complete and size > 0
+            asks["up_fee"] = up_fee
+            asks["down_fee"] = down_fee
+            asks["total_cost"] = total_cost
+            asks["guaranteed_payout"] = guaranteed_payout
+            asks["locked_profit"] = locked_profit
+            asks["pair_fill_complete"] = both_complete
+            asks["pair_executable"] = both_complete and total_cost < guaranteed_payout
+            if not both_complete:
+                asks["pair_skip_reason"] = "insufficient_depth"
+            elif total_cost >= guaranteed_payout:
+                asks["pair_skip_reason"] = "ask_plus_fee_not_profitable"
         return asks
 
     def make_lock_decision(
@@ -1810,6 +1864,12 @@ class PolymarketQuantBot:
             selected = dict(selected)
             selected["reason"] = reviewed_reason
             selected["score"] = reviewed_score
+            if reviewed_reason == "lock_profit":
+                pair_payload, pair_review = self.fresh_pair_execution_payload(reviewed_leg.market)
+                review_records.append(pair_review)
+                if not pair_payload or not bool(pair_payload.get("pair_executable")):
+                    return None, review_records
+                selected["pair_execution"] = pair_payload
         if position_after["total_cost"] > self.config.quant_market_max_usdc:
             review_records.append({"review_type": "budget", "valid": False, "skip_reason": "market_cap_reached"})
             return None, review_records
@@ -1826,6 +1886,57 @@ class PolymarketQuantBot:
         reviewed["total_cost"] = notional.quantize(MONEY_QUANT)
         reviewed["improvement_worst_pnl"] = position_after["worst_pnl"] - position_before["worst_pnl"]
         return reviewed, review_records
+
+    def fresh_pair_execution_payload(self, market: QuantMarket) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        outcome_items: Dict[str, Dict[str, Any]] = {}
+        review: Dict[str, Any] = {"review_type": "fresh_pair_execution", "valid": False}
+        requested_size = self.config.quant_order_shares.quantize(Decimal("0.000001"), rounding=ROUND_FLOOR)
+        for outcome, token_id in zip(market.outcomes, market.token_ids):
+            try:
+                book = self.fetch_fresh_book(token_id)
+                best_ask = best_book_price(book, "BUY")
+                if best_ask is None:
+                    review["skip_reason"] = "no_best_ask"
+                    review["outcome"] = outcome
+                    return {}, review
+                max_price = min(best_ask + self.config.max_slippage, Decimal("0.99"))
+                fill = estimate_buy_fill_for_size(book, requested_size, max_price=max_price)
+                if not fill.complete:
+                    review["skip_reason"] = "insufficient_depth"
+                    review["outcome"] = outcome
+                    review["fill"] = fill_payload(fill)
+                    return {}, review
+                decision = QuantDecision(
+                    market=market,
+                    outcome=outcome,
+                    token_id=token_id,
+                    probability=Decimal("0"),
+                    best_ask=best_ask,
+                    raw_edge=Decimal("0"),
+                    edge=Decimal("0"),
+                    limit_price=fill.limit_price,
+                    size=fill.filled_size,
+                    reason="fresh_pair_execution",
+                    vwap_price=fill.vwap_price,
+                    effective_price=fill.effective_price,
+                    notional=fill.notional,
+                    fee=fill.fee,
+                    total_cost=fill.total_cost,
+                    liquidity_levels=fill.levels_used,
+                    depth_available=fill.depth_available,
+                    fill_complete=fill.complete,
+                )
+                outcome_items[outcome] = {"decision": decision}
+            except Exception as exc:
+                review["skip_reason"] = f"fresh_pair_error:{type(exc).__name__}"
+                review["error"] = repr(exc)
+                return {}, review
+        pair_payload = self.current_pair_execution_payload(outcome_items)
+        review.update(pair_payload)
+        review["valid"] = bool(pair_payload.get("pair_executable"))
+        if not review["valid"] and not review.get("skip_reason"):
+            review["skip_reason"] = pair_payload.get("pair_skip_reason") or "pair_not_executable"
+        return pair_payload, review
 
     def lock_plan_legs(self, selected: Dict[str, Any]) -> List[QuantDecision]:
         legs = selected.get("legs")
@@ -1855,6 +1966,8 @@ class PolymarketQuantBot:
                     fee=decision_cost_components(leg)[1],
                     total_cost=decision_cost_components(leg)[2],
                     liquidity_levels=leg.liquidity_levels,
+                    depth_available=leg.depth_available,
+                    fill_complete=leg.fill_complete,
                 )
             )
         return paper_legs
@@ -1919,6 +2032,30 @@ class PolymarketQuantBot:
             raw_edge = probability - best_ask
             edge = probability - effective_price
             min_order_size = decimal_value(book.get("min_order_size", "1"))
+            if self.config.quant_size_mode == "shares" and not fill.complete:
+                candidate_records.append(
+                    {
+                        "outcome": outcome,
+                        "token_id": token_id,
+                        "probability": probability.quantize(Decimal("0.0001")),
+                        "best_ask": best_ask,
+                        "raw_edge": raw_edge.quantize(Decimal("0.0001")),
+                        "edge": edge.quantize(Decimal("0.0001")),
+                        "limit_price": limit_price,
+                        "size": size,
+                        "notional": fill_notional,
+                        "fee": fee,
+                        "total_cost": total_cost,
+                        "vwap_price": fill.vwap_price,
+                        "effective_price": effective_price,
+                        "max_price": max_price,
+                        "fill": fill_payload(fill),
+                        "min_order_size": min_order_size,
+                        "valid": False,
+                        "skip_reason": "insufficient_depth",
+                    }
+                )
+                continue
             if size < min_order_size:
                 candidate_records.append(
                     {
@@ -2081,6 +2218,8 @@ class PolymarketQuantBot:
                 fee=fee,
                 total_cost=total_cost,
                 liquidity_levels=fill.levels_used,
+                depth_available=fill.depth_available,
+                fill_complete=fill.complete,
             )
             reason, score = self.score_lock_candidate(
                 position_before,
@@ -2133,6 +2272,7 @@ class PolymarketQuantBot:
             if all_rejections:
                 candidate_record["would_skip_reasons"] = all_rejections
             candidate_records.append(candidate_record)
+        self.apply_pair_execution_guard(outcome_items, candidate_records)
         arb_item = self.detect_pure_arbitrage(position_before, bankroll_before, outcome_items)
         if arb_item is not None:
             candidates.append(arb_item)
@@ -2142,6 +2282,101 @@ class PolymarketQuantBot:
                 candidate_record["would_skip_reasons"] = dry_run_rejections
             candidate_records.append(candidate_record)
         return candidates, candidate_records
+
+    def apply_pair_execution_guard(
+        self,
+        outcome_items: Dict[str, Dict[str, Any]],
+        candidate_records: List[Dict[str, Any]],
+    ) -> None:
+        pair_payload = self.current_pair_execution_payload(outcome_items)
+        if not pair_payload:
+            return
+        for item in outcome_items.values():
+            item["pair_execution"] = pair_payload
+            if item.get("reason") != "lock_profit":
+                continue
+            if bool(pair_payload.get("pair_executable")):
+                continue
+            skip_reason = str(pair_payload.get("pair_skip_reason") or "pair_not_executable")
+            rejections = list(item.get("dry_run_rejections") or [])
+            if skip_reason not in rejections:
+                rejections.append(skip_reason)
+            item["dry_run_rejections"] = rejections
+            item["reason"] = skip_reason
+            item["would_lock"] = False
+            item["score"] = (
+                Decimal("0"),
+                state_decimal(pair_payload.get("locked_profit")),
+                -state_decimal(pair_payload.get("total_cost")),
+            )
+        for index, record in enumerate(candidate_records):
+            token_id = record.get("token_id")
+            for item in outcome_items.values():
+                decision = item.get("decision")
+                if isinstance(decision, QuantDecision) and decision.token_id == token_id:
+                    all_rejections = item.get("dry_run_rejections") or []
+                    candidate_record = lock_candidate_payload(item) | {"valid": not all_rejections}
+                    if all_rejections:
+                        candidate_record["would_skip_reasons"] = all_rejections
+                    candidate_records[index] = candidate_record
+                    break
+
+    def current_pair_execution_payload(self, outcome_items: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        up_item = outcome_items.get("Up")
+        down_item = outcome_items.get("Down")
+        if up_item is None or down_item is None:
+            return {}
+        up_decision = up_item.get("decision")
+        down_decision = down_item.get("decision")
+        if not isinstance(up_decision, QuantDecision) or not isinstance(down_decision, QuantDecision):
+            return {}
+        size = min(up_decision.size, down_decision.size).quantize(Decimal("0.000001"), rounding=ROUND_FLOOR)
+        if size <= 0:
+            return {
+                "pair_executable": False,
+                "pair_skip_reason": "no_pair_depth",
+                "up_ask_price": up_decision.best_ask,
+                "down_ask_price": down_decision.best_ask,
+                "up_depth": up_decision.depth_available,
+                "down_depth": down_decision.depth_available,
+            }
+        up_leg = scale_decision_to_size(up_decision, size, "pair_execution_up_leg")
+        down_leg = scale_decision_to_size(down_decision, size, "pair_execution_down_leg")
+        up_notional, up_fee, up_total_cost = decision_cost_components(up_leg)
+        down_notional, down_fee, down_total_cost = decision_cost_components(down_leg)
+        total_cost = quantize_money(up_total_cost + down_total_cost)
+        guaranteed_payout = size
+        locked_profit = quantize_money(guaranteed_payout - total_cost)
+        complete = up_decision.fill_complete and down_decision.fill_complete
+        executable = complete and total_cost < guaranteed_payout
+        skip_reason = ""
+        if not complete:
+            skip_reason = "insufficient_depth"
+        elif total_cost >= guaranteed_payout:
+            skip_reason = "ask_plus_fee_not_profitable"
+        return {
+            "price_source": "orderbook_asks",
+            "up_ask_price": up_decision.best_ask,
+            "down_ask_price": down_decision.best_ask,
+            "sum_ask": up_decision.best_ask + down_decision.best_ask,
+            "up_fee": up_fee,
+            "down_fee": down_fee,
+            "total_fee": quantize_money(up_fee + down_fee),
+            "up_depth": up_decision.depth_available,
+            "down_depth": down_decision.depth_available,
+            "up_fill_complete": up_decision.fill_complete,
+            "down_fill_complete": down_decision.fill_complete,
+            "up_notional": up_notional,
+            "down_notional": down_notional,
+            "up_total_cost": up_total_cost,
+            "down_total_cost": down_total_cost,
+            "total_cost": total_cost,
+            "guaranteed_payout": guaranteed_payout,
+            "locked_profit": locked_profit,
+            "pair_size": size,
+            "pair_executable": executable,
+            "pair_skip_reason": skip_reason,
+        }
 
     def detect_pure_arbitrage(
         self,
@@ -2156,6 +2391,9 @@ class PolymarketQuantBot:
         up_decision = up_item.get("decision")
         down_decision = down_item.get("decision")
         if not isinstance(up_decision, QuantDecision) or not isinstance(down_decision, QuantDecision):
+            return None
+        pair_payload = self.current_pair_execution_payload(outcome_items)
+        if not pair_payload or not bool(pair_payload.get("pair_executable")):
             return None
         if (
             position_before["up_trade_count"] >= MAX_LOCK_TRADES_PER_SIDE
@@ -2236,6 +2474,7 @@ class PolymarketQuantBot:
             "sum_ask": sum_ask,
             "arbitrage_edge": arb_edge,
             "gross_arbitrage_edge": gross_arb_edge,
+            "pair_execution": pair_payload,
             "rule_learning": rule_learning,
             "dry_run_rejections": dry_run_rejections,
         }
@@ -2706,6 +2945,9 @@ class PolymarketQuantBot:
             "fee_rate": POLYMARKET_CRYPTO_TAKER_FEE_RATE,
             "total_cost": decision.total_cost,
             "liquidity_levels": decision.liquidity_levels,
+            "depth_available": decision.depth_available,
+            "fill_complete": decision.fill_complete,
+            "price_source": "orderbook_asks",
             "reason": decision.reason,
         }
 
@@ -2775,6 +3017,8 @@ def scale_decision_to_size(decision: QuantDecision, size: Decimal, reason: str) 
         fee=scaled_fee,
         total_cost=scaled_total,
         liquidity_levels=decision.liquidity_levels,
+        depth_available=decision.depth_available,
+        fill_complete=decision.fill_complete and size <= decision.size,
     )
 
 
@@ -2814,6 +3058,7 @@ def empty_book_fill(requested_size: Decimal, best_price: Decimal = Decimal("0"))
         total_cost=Decimal("0"),
         effective_price=Decimal("0"),
         levels_used=0,
+        depth_available=Decimal("0"),
         complete=False,
     )
 
@@ -2828,6 +3073,7 @@ def estimate_buy_fill_for_size(
         return empty_book_fill(requested_size)
     best_price = levels[0][0]
     max_fill_price = max_price if max_price is not None else best_price
+    depth_available = sum(size for price, size in levels if price <= max_fill_price)
     remaining = requested_size
     filled = Decimal("0")
     notional = Decimal("0")
@@ -2860,6 +3106,7 @@ def estimate_buy_fill_for_size(
         total_cost=total_cost,
         effective_price=(total_cost / filled).quantize(Decimal("0.0001")),
         levels_used=levels_used,
+        depth_available=depth_available.quantize(Decimal("0.000001"), rounding=ROUND_FLOOR),
         complete=remaining <= Decimal("0.000001"),
     )
 
@@ -2874,6 +3121,7 @@ def estimate_buy_fill_for_budget(
         return empty_book_fill(Decimal("0"))
     best_price = levels[0][0]
     max_fill_price = max_price if max_price is not None else best_price
+    depth_available = sum(size for price, size in levels if price <= max_fill_price)
     remaining_budget = budget_usdc
     filled = Decimal("0")
     notional = Decimal("0")
@@ -2916,6 +3164,7 @@ def estimate_buy_fill_for_budget(
         total_cost=total_cost,
         effective_price=(total_cost / filled).quantize(Decimal("0.0001")),
         levels_used=levels_used,
+        depth_available=depth_available.quantize(Decimal("0.000001"), rounding=ROUND_FLOOR),
         complete=levels_used > 0,
     )
 
@@ -2933,6 +3182,8 @@ def fill_payload(fill: BookFill) -> Dict[str, Any]:
         "total_cost": fill.total_cost,
         "effective_price": fill.effective_price,
         "liquidity_levels": fill.levels_used,
+        "depth_available": fill.depth_available,
+        "price_source": "orderbook_asks",
         "complete": fill.complete,
     }
 
@@ -3195,6 +3446,7 @@ def lock_candidate_payload(item: Dict[str, Any]) -> Dict[str, Any]:
         "sum_ask": item.get("sum_ask"),
         "arbitrage_edge": item.get("arbitrage_edge"),
         "gross_arbitrage_edge": item.get("gross_arbitrage_edge"),
+        "pair_execution": item.get("pair_execution"),
         "dry_run_rejections": item.get("dry_run_rejections", []),
         "side_trade_count_before": item.get("side_trade_count_before"),
         "side_trade_count_after": item.get("side_trade_count_after"),
@@ -3219,6 +3471,9 @@ def decision_payload_from_dataclass(decision: QuantDecision) -> Dict[str, Any]:
         "fee_rate": POLYMARKET_CRYPTO_TAKER_FEE_RATE,
         "total_cost": decision.total_cost,
         "liquidity_levels": decision.liquidity_levels,
+        "depth_available": decision.depth_available,
+        "fill_complete": decision.fill_complete,
+        "price_source": "orderbook_asks",
         "reason": decision.reason,
     }
 
