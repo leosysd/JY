@@ -28,7 +28,7 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/history-candles"
 BINANCE_DATA_API = "https://data-api.binance.vision"
 MAX_LOCK_TRADES_PER_SIDE = Decimal("20")
-POSITION_ADJUSTMENT_MULTIPLIERS = (Decimal("2"), Decimal("3"), Decimal("4"), Decimal("5"))
+POSITION_ADJUSTMENT_MULTIPLIERS: Tuple[Decimal, ...] = ()
 SAME_OUTCOME_REPEAT_SEC = 6
 SAME_OUTCOME_MIN_PRICE_MOVE = Decimal("0.01")
 LATE_STAGE_STRICT_SECONDS = 60
@@ -37,6 +37,9 @@ MAX_WORST_LOSS_ORDER_MULTIPLIER = Decimal("2")
 POLYMARKET_CRYPTO_TAKER_FEE_RATE = Decimal("0.07")
 MONEY_QUANT = Decimal("0.0001")
 MARKET_MOMENTUM_FOLLOW_MIN_ASK = Decimal("0.60")
+TARGET_STYLE_PROBE_MIN_ASK = Decimal("0.50")
+TARGET_STYLE_FOLLOW_MIN_ASK = Decimal("0.55")
+TARGET_STYLE_PROBABILITY_MARGIN = Decimal("0.52")
 RULE_SIGNAL_WEIGHTS: Dict[str, Decimal] = {
     "edge": Decimal("0.8"),
     "expected_efficiency": Decimal("1.0"),
@@ -1528,14 +1531,19 @@ class PolymarketQuantBot:
             f"[AI LOCK] {market.title} remaining={market.seconds_left}s above entry window, wait.",
         ):
             return None
-        if position_before["trade_count"] >= Decimal(str(self.config.quant_max_trades_per_market)) and block_or_record(
-            "max_trades_reached",
-            f"[AI LOCK] {market.slug} 已达到单市场最多笔数，跳过。",
+        if (
+            not self.config.dry_run
+            and position_before["trade_count"] >= Decimal(str(self.config.quant_max_trades_per_market))
+            and block_or_record(
+                "max_trades_reached",
+                f"[AI LOCK] {market.slug} 已达到单市场最多笔数，跳过。",
+            )
         ):
             return None
         last_trade_ts = float(entry.get("last_trade_ts") or 0)
         if (
-            last_trade_ts
+            not self.config.dry_run
+            and last_trade_ts
             and time.time() - last_trade_ts < self.config.quant_rebuy_cooldown_sec
             and block_or_record("rebuy_cooldown")
         ):
@@ -2136,13 +2144,8 @@ class PolymarketQuantBot:
             notional = total_cost
             max_notional = total_cost
             dry_run_rejections: List[str] = []
-            repeat_skip_reason = same_outcome_repeat_skip(entry, outcome, best_ask)
-            if repeat_skip_reason:
-                dry_run_rejections.append(repeat_skip_reason)
             if max_notional > budget_remaining:
-                if self.config.dry_run:
-                    dry_run_rejections.append("budget_cap_reached")
-                else:
+                if not self.config.dry_run:
                     candidate_records.append(
                         {
                             "outcome": outcome,
@@ -2196,9 +2199,7 @@ class PolymarketQuantBot:
                 self.config.quant_max_drawdown_usdc > 0
                 and risk_drawdown_after > self.config.quant_max_drawdown_usdc
             ):
-                if self.config.dry_run:
-                    dry_run_rejections.append("max_drawdown_candidate")
-                else:
+                if not self.config.dry_run:
                     candidate_records.append(
                         {
                             "outcome": outcome,
@@ -2427,13 +2428,8 @@ class PolymarketQuantBot:
                     )
                     continue
                 dry_run_rejections: List[str] = []
-                repeat_skip_reason = same_outcome_repeat_skip(entry, outcome, best_ask)
-                if repeat_skip_reason:
-                    dry_run_rejections.append(repeat_skip_reason)
                 if total_cost > budget_remaining:
-                    if self.config.dry_run:
-                        dry_run_rejections.append("budget_cap_reached")
-                    else:
+                    if not self.config.dry_run:
                         continue
                 position_after = lock_position_after_trade(
                     position_before,
@@ -2445,9 +2441,7 @@ class PolymarketQuantBot:
                     total_cost,
                 )
                 if position_after["total_cost"] > self.config.quant_market_max_usdc:
-                    if self.config.dry_run:
-                        dry_run_rejections.append("market_cap_reached")
-                    else:
+                    if not self.config.dry_run:
                         continue
                 open_worst_after = bankroll_before["other_unsettled_worst_pnl"] + position_after["worst_pnl"]
                 risk_equity_after = (
@@ -2463,9 +2457,7 @@ class PolymarketQuantBot:
                     self.config.quant_max_drawdown_usdc > 0
                     and risk_drawdown_after > self.config.quant_max_drawdown_usdc
                 ):
-                    if self.config.dry_run:
-                        dry_run_rejections.append("max_drawdown_candidate")
-                    else:
+                    if not self.config.dry_run:
                         continue
                 improvement = position_after["worst_pnl"] - position_before["worst_pnl"]
                 would_lock = position_after["worst_pnl"] >= self.config.quant_lock_min_profit
@@ -2814,18 +2806,9 @@ class PolymarketQuantBot:
         )
         late_stage = decision.market.seconds_left <= LATE_STAGE_STRICT_SECONDS
         both_negative_after = position_after["up_pnl"] < 0 and position_after["down_pnl"] < 0
-        if position_before["trade_count"] > 0 and both_negative_after:
-            return (
-                "matrix_locked_loss",
-                (
-                    Decimal("0"),
-                    position_after["worst_pnl"],
-                    position_after["up_pnl"],
-                    position_after["down_pnl"],
-                    improvement,
-                    -position_after["total_cost"],
-                ),
-            )
+        market_consensus_side = decision.best_ask >= TARGET_STYLE_PROBE_MIN_ASK
+        model_confirms_side = decision.probability >= TARGET_STYLE_PROBABILITY_MARGIN
+        target_style_follow = is_favorite or market_consensus_side or model_confirms_side
         if position_before["trade_count"] > 0 and is_rebalance and improvement > 0:
             if position_after["worst_pnl"] >= self.config.quant_lock_min_profit:
                 return (
@@ -2868,13 +2851,14 @@ class PolymarketQuantBot:
                     ),
                 )
             return (
-                "matrix_no_positive_structure",
+                "target_rebalance_ladder",
                 (
-                    Decimal("0"),
-                    expected_gain,
+                    Decimal("3"),
                     improvement,
+                    gap_improvement,
                     position_after["worst_pnl"],
                     position_after["best_pnl"],
+                    expected_gain,
                     position_after["up_pnl"],
                     position_after["down_pnl"],
                     -position_after["total_cost"],
@@ -2892,7 +2876,7 @@ class PolymarketQuantBot:
                     -position_after["total_cost"],
                 ),
             )
-        if late_stage and not would_lock and improvement <= 0:
+        if late_stage and not would_lock and improvement <= 0 and not target_style_follow:
             return (
                 "late_stage_requires_lock_or_rebalance",
                 (
@@ -2904,7 +2888,7 @@ class PolymarketQuantBot:
                     -position_after["total_cost"],
                 ),
             )
-        if large_inventory_gap_before and not is_rebalance and improvement <= 0:
+        if large_inventory_gap_before and not is_rebalance and improvement <= 0 and not target_style_follow:
             return (
                 "inventory_gap_would_widen",
                 (
@@ -2916,7 +2900,12 @@ class PolymarketQuantBot:
                     -position_after["total_cost"],
                 ),
             )
-        if creates_deep_tail_loss and not would_lock and not (is_rebalance and improvement > 0):
+        if (
+            creates_deep_tail_loss
+            and not would_lock
+            and not (is_rebalance and improvement > 0)
+            and not target_style_follow
+        ):
             return (
                 "tail_risk_would_worsen",
                 (
@@ -2933,6 +2922,7 @@ class PolymarketQuantBot:
             and selected_pnl_after < 0
             and improvement <= 0
             and not would_lock
+            and not target_style_follow
         ):
             return (
                 "expensive_negative_win_pnl",
@@ -2959,27 +2949,17 @@ class PolymarketQuantBot:
                 ),
             )
         if position_before["trade_count"] == 0:
-            if strong_market_momentum and decision.edge < Decimal("0"):
-                return (
-                    "initial_expensive_momentum",
-                    (
-                        Decimal("0"),
-                        decision.best_ask,
-                        expected_after,
-                        decision.edge,
-                        -pnl_gap,
-                        -position_after["total_cost"],
-                    ),
-                )
-            if not is_favorite and decision.edge < Decimal("0"):
+            if not target_style_follow and decision.edge < Decimal("0"):
                 return (
                     "initial_wrong_side",
                     (Decimal("0"), expected_after, decision.edge, -pnl_gap, -position_after["total_cost"]),
                 )
             return (
-                "initial_momentum_probe",
+                "initial_target_probe",
                 (
-                    Decimal("1.2"),
+                    Decimal("2"),
+                    Decimal("1") if market_consensus_side else Decimal("0"),
+                    Decimal("1") if is_favorite else Decimal("0"),
                     expected_after,
                     decision.edge,
                     decision.probability,
@@ -3030,24 +3010,30 @@ class PolymarketQuantBot:
                     -position_after["total_cost"],
                 ),
             )
-        if strong_market_momentum:
+        if target_style_follow and (
+            decision.best_ask >= TARGET_STYLE_FOLLOW_MIN_ASK
+            or expected_positive
+            or decision.edge >= Decimal("-0.20")
+        ):
             return (
-                "momentum_follow_disabled",
+                "target_momentum_ladder",
                 (
-                    Decimal("0"),
+                    Decimal("2.2"),
+                    Decimal("1") if both_negative_after else Decimal("0"),
                     decision.best_ask,
                     expected_after,
                     decision.probability,
                     decision.edge,
+                    improvement,
                     -pnl_gap,
                     -position_after["total_cost"],
                 ),
             )
         if expected_positive and (is_favorite or decision.edge >= self.config.quant_min_edge):
             return (
-                "value_model_needs_market_confirmation",
+                "value_model_follow",
                 (
-                    Decimal("0"),
+                    Decimal("1.6"),
                     expected_after,
                     expected_efficiency,
                     decision.edge,
