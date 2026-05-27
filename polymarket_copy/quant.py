@@ -2286,6 +2286,12 @@ class PolymarketQuantBot:
                 "improvement_worst_pnl": improvement,
                 "expected_pnl_before": expected_before,
                 "expected_pnl_after": expected_after,
+                "payoff_matrix": payoff_matrix_payload(
+                    position_before,
+                    position_after,
+                    expected_before,
+                    expected_after,
+                ),
                 "would_lock": False,
                 "hedge_locked": would_lock,
                 "arbitrage_lock": False,
@@ -2494,7 +2500,14 @@ class PolymarketQuantBot:
                     would_lock,
                     improvement,
                 )
-                if reason not in {"position_adjustment", "inventory_lock", "hedge_profit", "rebalance_worst_side"}:
+                if reason not in {
+                    "matrix_guaranteed_profit",
+                    "matrix_no_loss",
+                    "matrix_risk_reduction",
+                    "inventory_lock",
+                    "hedge_profit",
+                    "rebalance_worst_side",
+                }:
                     reason = f"multi_adjust_rejected:{reason}"
                     score = (
                         Decimal("0"),
@@ -2532,6 +2545,12 @@ class PolymarketQuantBot:
                     "improvement_worst_pnl": improvement,
                     "expected_pnl_before": expected_before,
                     "expected_pnl_after": expected_after,
+                    "payoff_matrix": payoff_matrix_payload(
+                        position_before,
+                        position_after,
+                        expected_before,
+                        expected_after,
+                    ),
                     "would_lock": False,
                     "hedge_locked": would_lock,
                     "arbitrage_lock": False,
@@ -2794,17 +2813,70 @@ class PolymarketQuantBot:
             and position_after["worst_pnl"] < position_before["worst_pnl"]
         )
         late_stage = decision.market.seconds_left <= LATE_STAGE_STRICT_SECONDS
-        if position_before["trade_count"] > 0 and is_rebalance and improvement > 0:
+        both_negative_after = position_after["up_pnl"] < 0 and position_after["down_pnl"] < 0
+        if position_before["trade_count"] > 0 and both_negative_after:
             return (
-                "position_adjustment",
+                "matrix_locked_loss",
                 (
-                    Decimal("4"),
+                    Decimal("0"),
+                    position_after["worst_pnl"],
+                    position_after["up_pnl"],
+                    position_after["down_pnl"],
+                    improvement,
+                    -position_after["total_cost"],
+                ),
+            )
+        if position_before["trade_count"] > 0 and is_rebalance and improvement > 0:
+            if position_after["worst_pnl"] >= self.config.quant_lock_min_profit:
+                return (
+                    "matrix_guaranteed_profit",
+                    (
+                        Decimal("6"),
+                        position_after["worst_pnl"],
+                        improvement,
+                        expected_after,
+                        gap_improvement,
+                        -pnl_gap,
+                        -position_after["total_cost"],
+                    ),
+                )
+            if position_after["worst_pnl"] >= 0:
+                return (
+                    "matrix_no_loss",
+                    (
+                        Decimal("5"),
+                        position_after["worst_pnl"],
+                        improvement,
+                        expected_after,
+                        gap_improvement,
+                        -pnl_gap,
+                        -position_after["total_cost"],
+                    ),
+                )
+            if expected_gain > 0 and position_after["best_pnl"] > 0:
+                return (
+                    "matrix_risk_reduction",
+                    (
+                        Decimal("2.5"),
+                        improvement,
+                        position_after["worst_pnl"],
+                        expected_gain,
+                        position_after["best_pnl"],
+                        gap_improvement,
+                        decision.edge,
+                        -position_after["total_cost"],
+                    ),
+                )
+            return (
+                "matrix_no_positive_structure",
+                (
+                    Decimal("0"),
+                    expected_gain,
                     improvement,
                     position_after["worst_pnl"],
-                    gap_improvement,
-                    expected_after,
-                    -pnl_gap,
-                    decision.edge,
+                    position_after["best_pnl"],
+                    position_after["up_pnl"],
+                    position_after["down_pnl"],
                     -position_after["total_cost"],
                 ),
             )
@@ -3542,6 +3614,44 @@ def pnl_for_outcome(position: Dict[str, Decimal], outcome: str) -> Decimal:
     return position["up_pnl"] if outcome == "Up" else position["down_pnl"]
 
 
+def payoff_matrix_payload(
+    position_before: Dict[str, Decimal],
+    position_after: Dict[str, Decimal],
+    expected_before: Decimal,
+    expected_after: Decimal,
+) -> Dict[str, Any]:
+    return {
+        "before": {
+            "up_pnl": position_before["up_pnl"],
+            "down_pnl": position_before["down_pnl"],
+            "worst_pnl": position_before["worst_pnl"],
+            "best_pnl": position_before["best_pnl"],
+            "total_cost": position_before["total_cost"],
+            "up_size": position_before["up_size"],
+            "down_size": position_before["down_size"],
+            "expected_pnl": expected_before,
+        },
+        "after": {
+            "up_pnl": position_after["up_pnl"],
+            "down_pnl": position_after["down_pnl"],
+            "worst_pnl": position_after["worst_pnl"],
+            "best_pnl": position_after["best_pnl"],
+            "total_cost": position_after["total_cost"],
+            "up_size": position_after["up_size"],
+            "down_size": position_after["down_size"],
+            "expected_pnl": expected_after,
+        },
+        "delta": {
+            "up_pnl": position_after["up_pnl"] - position_before["up_pnl"],
+            "down_pnl": position_after["down_pnl"] - position_before["down_pnl"],
+            "worst_pnl": position_after["worst_pnl"] - position_before["worst_pnl"],
+            "best_pnl": position_after["best_pnl"] - position_before["best_pnl"],
+            "total_cost": position_after["total_cost"] - position_before["total_cost"],
+            "expected_pnl": expected_after - expected_before,
+        },
+    }
+
+
 def lock_rule_learning_payload(
     position_before: Dict[str, Decimal],
     position_after: Dict[str, Decimal],
@@ -3729,6 +3839,7 @@ def lock_candidate_payload(item: Dict[str, Any]) -> Dict[str, Any]:
         "improvement_worst_pnl": item.get("improvement_worst_pnl"),
         "expected_pnl_before": item.get("expected_pnl_before"),
         "expected_pnl_after": item.get("expected_pnl_after"),
+        "payoff_matrix": item.get("payoff_matrix"),
         "rule_learning": item.get("rule_learning"),
         "would_lock": bool(item.get("would_lock")),
         "hedge_locked": bool(item.get("hedge_locked")),
