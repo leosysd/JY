@@ -10,6 +10,8 @@ from decimal import Decimal, ROUND_FLOOR
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import requests
+
 from .bot import (
     BookCache,
     HttpJsonClient,
@@ -24,6 +26,7 @@ from .config import CopyBotConfig, validate_config
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/history-candles"
+BINANCE_DATA_API = "https://data-api.binance.vision"
 MAX_LOCK_TRADES_PER_SIDE = Decimal("20")
 SAME_OUTCOME_REPEAT_SEC = 6
 SAME_OUTCOME_MIN_PRICE_MOVE = Decimal("0.01")
@@ -328,6 +331,7 @@ class BinanceTradePriceFeed:
         self.ws: Any = None
         self.last_error = ""
         self.last_refresh_request_ts = 0.0
+        self.last_history_refresh_ts = 0.0
 
     def start(self) -> None:
         if self.thread and self.thread.is_alive():
@@ -356,7 +360,13 @@ class BinanceTradePriceFeed:
                 return self.direction_snapshot(market_start_ts, settlement)
             except RuntimeError as exc:
                 last_problem = str(exc)
-                if "stale" in last_problem or "no Binance prices" in last_problem:
+                if (
+                    "stale" in last_problem
+                    or "no Binance prices" in last_problem
+                    or "missing Binance start price" in last_problem
+                    or "too far from market start" in last_problem
+                ):
+                    self.refresh_history(market_start_ts)
                     self.request_refresh()
                 time.sleep(0.25)
         if self.last_error:
@@ -468,6 +478,42 @@ class BinanceTradePriceFeed:
         symbol = self.config.quant_binance_symbol.lower()
         url = self.config.quant_binance_ws_url
         return url.format(symbol=symbol) if "{symbol}" in url else url
+
+    def refresh_history(self, market_start_ts: int) -> None:
+        now_monotonic = time.monotonic()
+        if now_monotonic - self.last_history_refresh_ts < 8:
+            return
+        self.last_history_refresh_ts = now_monotonic
+        end_ts = int(time.time())
+        start_ts = max(0, market_start_ts - 180)
+        params = {
+            "symbol": self.config.quant_binance_symbol.upper(),
+            "interval": "1s",
+            "startTime": start_ts * 1000,
+            "endTime": (end_ts + 1) * 1000,
+            "limit": 1000,
+        }
+        try:
+            response = requests.get(f"{BINANCE_DATA_API}/api/v3/klines", params=params, timeout=10)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:
+            self.last_error = repr(exc)
+            return
+        parsed: List[Tuple[int, Decimal]] = []
+        if not isinstance(payload, list):
+            return
+        for candle in payload:
+            if not isinstance(candle, list) or len(candle) < 5:
+                continue
+            try:
+                open_ts = int(Decimal(str(candle[0])) / Decimal("1000"))
+                close_price = decimal_value(candle[4])
+            except Exception:
+                continue
+            parsed.append((open_ts, close_price))
+        if parsed:
+            self._add_prices(parsed)
 
     def _handle_message(self, message: str) -> None:
         try:
