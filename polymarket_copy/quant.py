@@ -22,6 +22,7 @@ from .bot import (
     decimal_value,
 )
 from .config import CopyBotConfig, validate_config
+from .time_utils import BEIJING_TIMEZONE_NAME, beijing_iso_from_ts, beijing_iso_or_empty, beijing_now
 
 
 GAMMA_API = "https://gamma-api.polymarket.com"
@@ -708,7 +709,9 @@ class BinanceTradePriceFeed:
             "source": "binance",
             "symbol": self.config.quant_binance_symbol.upper(),
             "available": bool(buckets),
+            "market_start_time_bj": beijing_iso_from_ts(market_start_ts),
             "current_ts": current_ts,
+            "current_time_bj": beijing_iso_from_ts(current_ts),
             "windows_sec": list(BINANCE_VOLUME_WINDOWS_SEC),
         }
         if not buckets:
@@ -787,6 +790,7 @@ class QuantStateStore:
         if not isinstance(trades, list):
             trades = []
             entry["trades"] = trades
+        now = int(time.time())
         trade = {
             "mode": mode,
             "outcome": decision.outcome,
@@ -801,13 +805,14 @@ class QuantStateStore:
             "fee_rate": str(POLYMARKET_CRYPTO_TAKER_FEE_RATE),
             "total_cost": str(decision.total_cost),
             "liquidity_levels": decision.liquidity_levels,
-            "ts": int(time.time()),
+            "ts": now,
+            "time_bj": beijing_iso_from_ts(now),
         }
         trades.append(trade)
         entry.update(trade)
         entry["trade_count"] = len(trades)
         markets[decision.market.slug] = entry
-        self.state["last_order_ts"] = int(time.time())
+        self.state["last_order_ts"] = now
         self.save()
 
     def cooldown_ready(self, cooldown_sec: float) -> bool:
@@ -828,7 +833,9 @@ class QuantStateStore:
             {
                 "title": market.title,
                 "start_ts": market.start_ts,
+                "start_time_bj": beijing_iso_from_ts(market.start_ts),
                 "end_ts": market.end_ts,
+                "end_time_bj": beijing_iso_from_ts(market.end_ts),
                 "locked": False,
                 "trades": [],
             },
@@ -837,14 +844,18 @@ class QuantStateStore:
             entry = {
                 "title": market.title,
                 "start_ts": market.start_ts,
+                "start_time_bj": beijing_iso_from_ts(market.start_ts),
                 "end_ts": market.end_ts,
+                "end_time_bj": beijing_iso_from_ts(market.end_ts),
                 "locked": False,
                 "trades": [],
             }
             markets[market.slug] = entry
         entry.setdefault("title", market.title)
         entry.setdefault("start_ts", market.start_ts)
+        entry.setdefault("start_time_bj", beijing_iso_from_ts(market.start_ts))
         entry.setdefault("end_ts", market.end_ts)
+        entry.setdefault("end_time_bj", beijing_iso_from_ts(market.end_ts))
         entry.setdefault("locked", False)
         if not isinstance(entry.get("trades"), list):
             entry["trades"] = []
@@ -867,6 +878,7 @@ class QuantStateStore:
         entry["trades"].append(
             {
                 "ts": now,
+                "time_bj": beijing_iso_from_ts(now),
                 "mode": mode,
                 "outcome": decision.outcome,
                 "token_id": decision.token_id,
@@ -910,9 +922,11 @@ class QuantStateStore:
         if not isinstance(errors, list):
             errors = []
             entry["order_errors"] = errors
+        now = int(time.time())
         errors.append(
             {
-                "ts": int(time.time()),
+                "ts": now,
+                "time_bj": beijing_iso_from_ts(now),
                 "reason": reason,
                 "error": error,
                 "leg_index": leg_index,
@@ -933,7 +947,9 @@ class QuantStateStore:
         entry["settled"] = True
         entry["winning_outcome"] = winning_outcome
         entry["realized_pnl"] = str(realized_pnl.quantize(Decimal("0.0001")))
-        entry["settled_ts"] = int(time.time())
+        settled_ts = int(time.time())
+        entry["settled_ts"] = settled_ts
+        entry["settled_time_bj"] = beijing_iso_from_ts(settled_ts)
 
 
 class PolymarketQuantBot:
@@ -986,11 +1002,8 @@ class PolymarketQuantBot:
         if self.config.quant_record_signals:
             print(f"[AI QUANT DATA] signals={self.config.quant_signal_file}")
         if self.first_allowed_market_start_ts > self.started_at_ts:
-            gate_time = datetime.fromtimestamp(
-                self.first_allowed_market_start_ts,
-                tz=timezone.utc,
-            ).isoformat(timespec="seconds")
-            print(f"[AI QUANT] 启动时间校验：等待新 5 分钟盘口，最早入场 UTC={gate_time}")
+            gate_time = beijing_iso_from_ts(self.first_allowed_market_start_ts)
+            print(f"[AI QUANT] 启动时间校验：等待新 5 分钟盘口，最早入场 北京时间={gate_time}")
         if self.config.quant_price_source == "chainlink":
             self.chainlink_feed.start()
         if self.config.quant_direction_source == "binance":
@@ -1020,14 +1033,11 @@ class PolymarketQuantBot:
 
         self.market_ws.start(market.token_ids)
         if self.is_startup_market_blocked(market):
-            gate_time = datetime.fromtimestamp(
-                self.first_allowed_market_start_ts,
-                tz=timezone.utc,
-            ).isoformat(timespec="seconds")
+            gate_time = beijing_iso_from_ts(self.first_allowed_market_start_ts)
             self.log_throttled(
                 "[AI QUANT] "
                 f"启动后等待新盘口：current_start={market.start_ts} "
-                f"first_allowed_start={self.first_allowed_market_start_ts} UTC={gate_time}"
+                f"first_allowed_start={self.first_allowed_market_start_ts} 北京时间={gate_time}"
             )
             return None
         try:
@@ -1676,8 +1686,12 @@ class PolymarketQuantBot:
             "btc": {
                 "direction_source": snapshot.direction_source or snapshot.source,
                 "direction_current_ts": snapshot.direction_current_ts or snapshot.current_ts,
+                "direction_current_time_bj": beijing_iso_or_empty(snapshot.direction_current_ts or snapshot.current_ts),
                 "direction_current": direction_current,
                 "direction_start_ts": snapshot.direction_start_price_ts or snapshot.start_price_ts,
+                "direction_start_time_bj": beijing_iso_or_empty(
+                    snapshot.direction_start_price_ts or snapshot.start_price_ts
+                ),
                 "direction_start": direction_start,
                 "direction_delta_from_start": price_delta,
                 "direction_return_from_start": price_return,
@@ -1687,6 +1701,7 @@ class PolymarketQuantBot:
             },
             "polymarket": {
                 "open_recorded_ts": open_snapshot.get("recorded_ts"),
+                "open_recorded_time_bj": open_snapshot.get("recorded_time_bj"),
                 "open_seconds_left": open_snapshot.get("seconds_left"),
                 "up_ask": up_ask,
                 "down_ask": down_ask,
@@ -1734,6 +1749,7 @@ class PolymarketQuantBot:
             "up_ask": up_ask,
             "down_ask": down_ask,
         }
+        snapshot["recorded_time_bj"] = beijing_iso_from_ts(snapshot["recorded_ts"])
         if up_ask is not None or down_ask is not None:
             self.market_open_snapshots[market.slug] = snapshot
             if len(self.market_open_snapshots) > 200:
@@ -3500,12 +3516,13 @@ class PolymarketQuantBot:
         market_snapshot: Optional[Dict[str, Any]] = None,
         force: bool = False,
     ) -> None:
-        now = datetime.now(timezone.utc)
+        now = beijing_now()
         if market_snapshot is None:
             market_snapshot = self.lock_loop_snapshot(market, position_before)
         force = force or self.should_force_shadow_window_record(market)
         record: Dict[str, Any] = {
-            "ts": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "ts": now.isoformat(timespec="seconds"),
+            "timezone": BEIJING_TIMEZONE_NAME,
             "unix_ts": int(now.timestamp()),
             "bot_mode": "quant",
             "quant_strategy": "lock",
@@ -3516,7 +3533,9 @@ class PolymarketQuantBot:
                 "slug": market.slug,
                 "title": market.title,
                 "start_ts": market.start_ts,
+                "start_time_bj": beijing_iso_from_ts(market.start_ts),
                 "end_ts": market.end_ts,
+                "end_time_bj": beijing_iso_from_ts(market.end_ts),
                 "seconds_left": market.seconds_left,
                 "outcomes": market.outcomes,
                 "token_ids": market.token_ids,
@@ -3525,8 +3544,10 @@ class PolymarketQuantBot:
                 "source": snapshot.source,
                 "symbol": self.config.quant_symbol,
                 "current_ts": snapshot.current_ts,
+                "current_time_bj": beijing_iso_from_ts(snapshot.current_ts),
                 "current": snapshot.current,
                 "start_price_ts": snapshot.start_price_ts,
+                "start_price_time_bj": beijing_iso_from_ts(snapshot.start_price_ts),
                 "start_price": snapshot.start_price,
                 "ret_from_start": snapshot.ret_from_start,
                 "ret_1m": snapshot.ret_1m,
@@ -3537,15 +3558,21 @@ class PolymarketQuantBot:
                 "settlement": {
                     "source": self.config.quant_price_source,
                     "current_ts": snapshot.current_ts,
+                    "current_time_bj": beijing_iso_from_ts(snapshot.current_ts),
                     "current": snapshot.current,
                     "start_price_ts": snapshot.start_price_ts,
+                    "start_price_time_bj": beijing_iso_from_ts(snapshot.start_price_ts),
                     "start_price": snapshot.start_price,
                 },
                 "direction": {
                     "source": snapshot.direction_source or snapshot.source,
                     "current_ts": snapshot.direction_current_ts or snapshot.current_ts,
+                    "current_time_bj": beijing_iso_from_ts(snapshot.direction_current_ts or snapshot.current_ts),
                     "current": snapshot.direction_current or snapshot.current,
                     "start_price_ts": snapshot.direction_start_price_ts or snapshot.start_price_ts,
+                    "start_price_time_bj": beijing_iso_from_ts(
+                        snapshot.direction_start_price_ts or snapshot.start_price_ts
+                    ),
                     "start_price": snapshot.direction_start_price or snapshot.start_price,
                     "ret_from_start": snapshot.direction_ret_from_start or snapshot.ret_from_start,
                     "ret_1m": snapshot.direction_ret_1m or snapshot.ret_1m,
@@ -3600,12 +3627,13 @@ class PolymarketQuantBot:
         selected: Optional[QuantDecision] = None,
         force: bool = False,
     ) -> None:
-        now = datetime.now(timezone.utc)
+        now = beijing_now()
         base_position = base_lock_position()
         market_snapshot = self.lock_loop_snapshot(market, base_position)
         force = force or self.should_force_shadow_window_record(market)
         record: Dict[str, Any] = {
-            "ts": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "ts": now.isoformat(timespec="seconds"),
+            "timezone": BEIJING_TIMEZONE_NAME,
             "unix_ts": int(now.timestamp()),
             "bot_mode": "quant",
             "dry_run": self.config.dry_run,
@@ -3615,7 +3643,9 @@ class PolymarketQuantBot:
                 "slug": market.slug,
                 "title": market.title,
                 "start_ts": market.start_ts,
+                "start_time_bj": beijing_iso_from_ts(market.start_ts),
                 "end_ts": market.end_ts,
+                "end_time_bj": beijing_iso_from_ts(market.end_ts),
                 "seconds_left": market.seconds_left,
                 "outcomes": market.outcomes,
                 "token_ids": market.token_ids,
@@ -3624,8 +3654,10 @@ class PolymarketQuantBot:
                 "source": snapshot.source,
                 "symbol": self.config.quant_symbol,
                 "current_ts": snapshot.current_ts,
+                "current_time_bj": beijing_iso_from_ts(snapshot.current_ts),
                 "current": snapshot.current,
                 "start_price_ts": snapshot.start_price_ts,
+                "start_price_time_bj": beijing_iso_from_ts(snapshot.start_price_ts),
                 "start_price": snapshot.start_price,
                 "ret_from_start": snapshot.ret_from_start,
                 "ret_1m": snapshot.ret_1m,
@@ -3636,15 +3668,21 @@ class PolymarketQuantBot:
                 "settlement": {
                     "source": self.config.quant_price_source,
                     "current_ts": snapshot.current_ts,
+                    "current_time_bj": beijing_iso_from_ts(snapshot.current_ts),
                     "current": snapshot.current,
                     "start_price_ts": snapshot.start_price_ts,
+                    "start_price_time_bj": beijing_iso_from_ts(snapshot.start_price_ts),
                     "start_price": snapshot.start_price,
                 },
                 "direction": {
                     "source": snapshot.direction_source or snapshot.source,
                     "current_ts": snapshot.direction_current_ts or snapshot.current_ts,
+                    "current_time_bj": beijing_iso_from_ts(snapshot.direction_current_ts or snapshot.current_ts),
                     "current": snapshot.direction_current or snapshot.current,
                     "start_price_ts": snapshot.direction_start_price_ts or snapshot.start_price_ts,
+                    "start_price_time_bj": beijing_iso_from_ts(
+                        snapshot.direction_start_price_ts or snapshot.start_price_ts
+                    ),
                     "start_price": snapshot.direction_start_price or snapshot.start_price,
                     "ret_from_start": snapshot.direction_ret_from_start or snapshot.ret_from_start,
                     "ret_1m": snapshot.direction_ret_1m or snapshot.ret_1m,
@@ -4357,7 +4395,9 @@ def summarize_binance_buckets(
         buy_ratio = taker_buy_volume / volume
     return {
         "start_ts": start_ts,
+        "start_time_bj": beijing_iso_from_ts(start_ts),
         "end_ts": end_ts,
+        "end_time_bj": beijing_iso_from_ts(end_ts),
         "sample_seconds": len(selected),
         "trade_count": trade_count,
         "volume_btc": volume,

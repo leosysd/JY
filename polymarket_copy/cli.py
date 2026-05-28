@@ -12,7 +12,6 @@ import sys
 import tempfile
 from collections import Counter, defaultdict
 from dataclasses import replace
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -43,6 +42,7 @@ from .config import (
     load_config,
     validate_config,
 )
+from .time_utils import BEIJING_TIMEZONE_NAME, beijing_iso_from_ts, beijing_text_from_ts
 
 
 DEFAULT_REMOTE_DIR = "/opt/polymarket-copy"
@@ -984,7 +984,8 @@ def summarize_quant_data(config_path: Path) -> None:
             invalid_lines += 1
             continue
         latest = record
-        ts = str(record.get("ts") or "")
+        unix_ts = _num(record.get("unix_ts"))
+        ts = beijing_iso_from_ts(int(unix_ts)) if unix_ts is not None else str(record.get("ts") or "")
         if ts and not first_ts:
             first_ts = ts
         if ts:
@@ -1022,7 +1023,7 @@ def summarize_quant_data(config_path: Path) -> None:
     print(f"总记录: {total}")
     print(f"市场数: {len(market_slugs)}")
     if first_ts or last_ts:
-        print(f"时间范围: {first_ts or '<unknown>'} -> {last_ts or '<unknown>'}")
+        print(f"时间范围({BEIJING_TIMEZONE_NAME}): {first_ts or '<unknown>'} -> {last_ts or '<unknown>'}")
     if invalid_lines:
         print(f"无效行: {invalid_lines}")
     print("动作统计:")
@@ -1081,7 +1082,9 @@ def summarize_quant_data(config_path: Path) -> None:
         market = latest.get("market") if isinstance(latest.get("market"), dict) else {}
         selected = latest.get("selected") if isinstance(latest.get("selected"), dict) else {}
         print("最新记录:")
-        print(f"  ts={latest.get('ts')} action={latest.get('action')} reason={latest.get('reason')}")
+        latest_unix_ts = _num(latest.get("unix_ts"))
+        latest_ts = beijing_iso_from_ts(int(latest_unix_ts)) if latest_unix_ts is not None else latest.get("ts")
+        print(f"  ts={latest_ts} action={latest.get('action')} reason={latest.get('reason')}")
         if isinstance(market, dict):
             print(f"  market={market.get('slug')} seconds_left={market.get('seconds_left')}")
         if isinstance(selected, dict) and selected:
@@ -1205,7 +1208,7 @@ def print_quant_trades_table(config_path: Path, limit: int = 80) -> None:
         rows = rows[-limit:]
     print(f"[DATA] quant trades: {sum(len(e.get('trades') or []) for e in markets.values())}")
     header = (
-        f"{'#':>3} {'time_utc':<14} {'market':<28} {'mode':<7} {'status':<8} "
+        f"{'#':>3} {'time_bj':<14} {'market':<28} {'mode':<7} {'status':<8} "
         f"{'dir':<5} {'size':>8} {'best':>7} {'eff':>7} {'fee':>8} {'cost':>9} {'left':>5} reason"
     )
     print(header)
@@ -1213,7 +1216,7 @@ def print_quant_trades_table(config_path: Path, limit: int = 80) -> None:
     for idx, row in enumerate(rows, 1):
         time_text = "-"
         if row["ts"]:
-            time_text = datetime.fromtimestamp(row["ts"], tz=timezone.utc).strftime("%m-%d %H:%M:%S")
+            time_text = beijing_text_from_ts(row["ts"])
         print(
             f"{idx:>3} {time_text:<14} {row['slug'][-28:]:<28} {row['mode']:<7} {row['status']:<8} "
             f"{row['outcome']:<5} {_fmt_size(row['size']):>8} {_fmt_price(row['best_ask']):>7} "
@@ -1240,9 +1243,7 @@ def print_quant_hourly_pnl(config_path: Path) -> None:
         if not isinstance(trades, list) or not trades:
             continue
         start_ts = int(_num(entry.get("start_ts")) or 0)
-        hour = datetime.fromtimestamp(start_ts or int(_num(trades[0].get("ts")) or 0), tz=timezone.utc).strftime(
-            "%m-%d %H:00"
-        )
+        hour = beijing_text_from_ts(start_ts or int(_num(trades[0].get("ts")) or 0), "%m-%d %H:00")
         position = _position_from_state_trades(trades)
         bucket = hourly[hour]
         bucket["markets"] += 1
@@ -1255,7 +1256,7 @@ def print_quant_hourly_pnl(config_path: Path) -> None:
         else:
             bucket["settled"] += 1
             bucket["pnl"] += pnl
-    print("[DATA] hourly quant PnL by market start time (UTC)")
+    print(f"[DATA] hourly quant PnL by market start time ({BEIJING_TIMEZONE_NAME})")
     header = f"{'hour':<14} {'markets':>7} {'settled':>7} {'trades':>7} {'cost':>10} {'fee':>9} {'pnl':>10} {'unsettled_worst':>16}"
     print(header)
     print("-" * len(header))
@@ -1307,7 +1308,7 @@ def print_quant_review_table(config_path: Path, limit: int = 80) -> None:
         rows = rows[-limit:]
     print("[DATA] quant market review")
     header = (
-        f"{'#':>3} {'market_utc':<17} {'trades':>6} {'up':>9} {'down':>9} {'cost':>10} "
+        f"{'#':>3} {'market_bj':<17} {'trades':>6} {'up':>9} {'down':>9} {'cost':>10} "
         f"{'fee':>9} {'winner':<6} {'realized':>10} {'up_pnl':>10} {'down_pnl':>10} {'worst':>10} reason"
     )
     print(header)
@@ -1315,10 +1316,8 @@ def print_quant_review_table(config_path: Path, limit: int = 80) -> None:
     for idx, row in enumerate(rows, 1):
         market_time = "-"
         if row["start_ts"]:
-            start = datetime.fromtimestamp(row["start_ts"], tz=timezone.utc)
             end_ts = int(row.get("end_ts") or 0) or (row["start_ts"] + 300)
-            end = datetime.fromtimestamp(end_ts, tz=timezone.utc)
-            market_time = f"{start:%m-%d %H:%M}-{end:%H:%M}"
+            market_time = f"{beijing_text_from_ts(row['start_ts'], '%m-%d %H:%M')}-{beijing_text_from_ts(end_ts, '%H:%M')}"
         print(
             f"{idx:>3} {market_time:<17} {int(row['trade_count']):>6} "
             f"{row['up_size']:>9.2f} {row['down_size']:>9.2f} {row['total_cost']:>10.4f} "
@@ -1361,9 +1360,7 @@ def _json_list(value: object) -> List[Any]:
 
 
 def _format_market_time(start_ts: int, end_ts: int) -> str:
-    start = datetime.fromtimestamp(start_ts, tz=timezone.utc)
-    end = datetime.fromtimestamp(end_ts, tz=timezone.utc)
-    return f"{start:%m-%d %H:%M}-{end:%H:%M}"
+    return f"{beijing_text_from_ts(start_ts, '%m-%d %H:%M')}-{beijing_text_from_ts(end_ts, '%H:%M')}"
 
 
 def _snapshot_value(records: List[Dict[str, Any]], target_elapsed: int, direction: str) -> Optional[float]:
@@ -1556,7 +1553,7 @@ def _trade_time(timestamp: object) -> str:
     numeric = _num(timestamp)
     if numeric is None:
         return "-"
-    return datetime.fromtimestamp(int(numeric), tz=timezone.utc).strftime("%m-%d %H:%M:%S")
+    return beijing_text_from_ts(int(numeric))
 
 
 def _trade_cost(trade: Dict[str, Any]) -> Optional[float]:
@@ -1662,7 +1659,7 @@ def print_target_history_table(config_path: Path, limit: int = 100) -> None:
         )
 
     header = (
-        f"{'#':>3}  {'时间(UTC)':<14} {'市场':<24} {'方向':<4} {'价格':>7} {'份额':>7} "
+        f"{'#':>3}  {'时间(北京)':<14} {'市场':<24} {'方向':<4} {'价格':>7} {'份额':>7} "
         f"{'金额':>8} {'单笔结算':>9} {'Up赢':>8} {'Down赢':>8} {'结果':<8} {'本场盈亏':>9} {'判断':<4}"
     )
     print(header)

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
+
+from .time_utils import beijing_now_iso
 
 
 class TeeStream:
@@ -17,7 +18,7 @@ class TeeStream:
         self.console.write(text)
         for chunk in text.splitlines(keepends=True):
             if self._line_start and chunk:
-                timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                timestamp = beijing_now_iso()
                 self.log_file.write(f"{timestamp} [{self.stream_name}] ")
             self.log_file.write(chunk)
             self._line_start = chunk.endswith("\n")
