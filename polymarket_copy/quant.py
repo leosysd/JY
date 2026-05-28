@@ -46,19 +46,22 @@ TARGET_STYLE_SAME_SIDE_MIN_PRICE_MOVE = Decimal("0.03")
 BTC_FLOW_SCORE_THRESHOLD = Decimal("0.03")
 BTC_FLOW_CONFIDENCE_SCALE = Decimal("2.5")
 BTC_FLOW_MIN_CONFIDENCE = Decimal("0.08")
-BTC_FLOW_INITIAL_SCORE = Decimal("2.4")
-BTC_FLOW_INITIAL_FALLBACK_SCORE = Decimal("1.1")
-BTC_FLOW_LADDER_SCORE = Decimal("2.6")
-BTC_FLOW_UNCONFIRMED_LADDER_SCORE = Decimal("0.9")
-JET_MATRIX_REBALANCE_SCORE = Decimal("3.4")
-JET_MATRIX_TAIL_REPAIR_SCORE = Decimal("2.7")
-JET_DIRECTIONAL_BIAS_SCORE = Decimal("1.5")
+BTC_FLOW_INITIAL_SCORE = Decimal("1.6")
+BTC_FLOW_INITIAL_FALLBACK_SCORE = Decimal("0.6")
+BTC_FLOW_LADDER_SCORE = Decimal("0.8")
+BTC_FLOW_UNCONFIRMED_LADDER_SCORE = Decimal("0.25")
+JET_MATRIX_REBALANCE_SCORE = Decimal("4.2")
+JET_MATRIX_TAIL_REPAIR_SCORE = Decimal("3.2")
+JET_DIRECTIONAL_BIAS_SCORE = Decimal("0.5")
 JET_DIRECTIONAL_OVER_SKEW_SCORE = Decimal("0")
-JET_DIRECTIONAL_SKEW_BASE_ORDERS = Decimal("1.5")
-JET_DIRECTIONAL_SKEW_CONF_ORDERS = Decimal("3.0")
+JET_DIRECTIONAL_SKEW_BASE_ORDERS = Decimal("0.7")
+JET_DIRECTIONAL_SKEW_CONF_ORDERS = Decimal("1.0")
 MATRIX_REBALANCE_MIN_PROBABILITY = Decimal("0.50")
 REBALANCE_MIN_EDGE = Decimal("0")
 MOMENTUM_MAX_NEGATIVE_EDGE = Decimal("-0.18")
+VALUE_MODEL_FOLLOW_SCORE = Decimal("0.45")
+MATRIX_WIDENING_MAX_WORST_LOSS_ORDERS = Decimal("1.0")
+MATRIX_WIDENING_MAX_GAP_ORDERS = Decimal("1.5")
 TAIL_VALUE_MIN_PRICE = Decimal("0.25")
 TAIL_VALUE_MIN_PROBABILITY = Decimal("0.48")
 RULE_SIGNAL_WEIGHTS: Dict[str, Decimal] = {
@@ -3145,6 +3148,16 @@ class PolymarketQuantBot:
             and abs(position_before["up_size"] - position_before["down_size"])
             >= max(decision.size * INVENTORY_GAP_ORDER_MULTIPLIER, decision.size)
         )
+        matrix_widening_after_entry = (
+            position_before["trade_count"] > 0
+            and not is_rebalance
+            and not would_lock
+            and (improvement < 0 or gap_improvement < 0)
+        )
+        matrix_widening_too_large = (
+            position_after["worst_pnl"] < -(decision.size * MATRIX_WIDENING_MAX_WORST_LOSS_ORDERS)
+            or pnl_gap > decision.size * MATRIX_WIDENING_MAX_GAP_ORDERS
+        )
         tail_loss_limit = -(decision.size * MAX_WORST_LOSS_ORDER_MULTIPLIER)
         creates_deep_tail_loss = (
             position_after["worst_pnl"] < tail_loss_limit
@@ -3195,6 +3208,19 @@ class PolymarketQuantBot:
             and near_equal_size
             and gap_improvement > 0
         )
+        if matrix_widening_after_entry and matrix_widening_too_large:
+            return (
+                "matrix_would_widen_loss",
+                (
+                    Decimal("0"),
+                    improvement,
+                    gap_improvement,
+                    position_after["worst_pnl"],
+                    -pnl_gap,
+                    decision.edge,
+                    -position_after["total_cost"],
+                ),
+            )
         if position_before["trade_count"] > 0 and would_balance_into_locked_loss:
             return (
                 "rebalance_would_lock_loss",
@@ -3620,10 +3646,25 @@ class PolymarketQuantBot:
                 ),
             )
         if expected_positive and (is_favorite or decision.edge >= self.config.quant_min_edge):
+            if position_before["trade_count"] > 0 and improvement <= 0 and gap_improvement <= 0:
+                return (
+                    "value_model_no_matrix_improvement",
+                    (
+                        Decimal("0"),
+                        expected_after,
+                        expected_efficiency,
+                        improvement,
+                        gap_improvement,
+                        decision.edge,
+                        -position_after["total_cost"],
+                    ),
+                )
             return (
                 "value_model_follow",
                 (
-                    Decimal("1.6"),
+                    VALUE_MODEL_FOLLOW_SCORE,
+                    improvement,
+                    gap_improvement,
                     expected_after,
                     expected_efficiency,
                     decision.edge,
