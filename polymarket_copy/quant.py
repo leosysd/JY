@@ -82,6 +82,7 @@ class BtcSnapshot:
     direction_ret_1m: Decimal = Decimal("0")
     direction_ret_3m: Decimal = Decimal("0")
     direction_ret_5m: Decimal = Decimal("0")
+    probability_components: Optional[Dict[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -240,7 +241,13 @@ class ChainlinkRtdsPriceFeed:
         ret_1m = decimal_return(current, one_min_price)
         ret_3m = decimal_return(current, three_min_price)
         ret_5m = decimal_return(current, five_min_price)
-        up_probability = estimate_up_probability(ret_from_start, ret_1m, ret_3m)
+        probability_components = estimate_up_probability_components(
+            ret_from_start,
+            ret_1m,
+            ret_3m,
+            ret_5m,
+        )
+        up_probability = state_decimal(probability_components.get("probability"))
         return BtcSnapshot(
             source="polymarket_rtds_chainlink",
             current_ts=current_ts,
@@ -261,6 +268,7 @@ class ChainlinkRtdsPriceFeed:
             direction_ret_1m=ret_1m,
             direction_ret_3m=ret_3m,
             direction_ret_5m=ret_5m,
+            probability_components=probability_components,
         )
 
     def _run(self) -> None:
@@ -462,7 +470,15 @@ class BinanceTradePriceFeed:
         ret_1m = decimal_return(current, one_min_price)
         ret_3m = decimal_return(current, three_min_price)
         ret_5m = decimal_return(current, five_min_price)
-        up_probability = estimate_up_probability(ret_from_start, ret_1m, ret_3m)
+        microstructure = self.factor_payload(market_start_ts, current_ts)
+        probability_components = estimate_up_probability_components(
+            ret_from_start,
+            ret_1m,
+            ret_3m,
+            ret_5m,
+            microstructure=microstructure,
+        )
+        up_probability = state_decimal(probability_components.get("probability"))
         return BtcSnapshot(
             source="chainlink_settlement_binance_direction",
             current_ts=settlement.current_ts,
@@ -483,6 +499,7 @@ class BinanceTradePriceFeed:
             direction_ret_1m=ret_1m,
             direction_ret_3m=ret_3m,
             direction_ret_5m=ret_5m,
+            probability_components=probability_components,
         )
 
     def _run(self) -> None:
@@ -1146,7 +1163,13 @@ class PolymarketQuantBot:
         ret_1m = decimal_return(current, candles[-2]["close"])
         ret_3m = decimal_return(current, candles[-4]["close"])
         ret_5m = decimal_return(current, candles[-6]["close"] if len(candles) >= 6 else start_price)
-        up_probability = estimate_up_probability(ret_from_start, ret_1m, ret_3m)
+        probability_components = estimate_up_probability_components(
+            ret_from_start,
+            ret_1m,
+            ret_3m,
+            ret_5m,
+        )
+        up_probability = state_decimal(probability_components.get("probability"))
         return BtcSnapshot(
             source="okx",
             current_ts=int(candles[-1]["ts"]),
@@ -1167,6 +1190,7 @@ class PolymarketQuantBot:
             direction_ret_1m=ret_1m,
             direction_ret_3m=ret_3m,
             direction_ret_5m=ret_5m,
+            probability_components=probability_components,
         )
 
     def fetch_fresh_book(self, token_id: str) -> Dict[str, Any]:
@@ -1291,7 +1315,8 @@ class PolymarketQuantBot:
         candidates: List[QuantDecision] = []
         best_asks: Dict[str, Decimal] = {}
         for outcome, token_id in zip(market.outcomes, market.token_ids):
-            probability = snapshot.up_probability if outcome == "Up" else Decimal("1") - snapshot.up_probability
+            base_probability = snapshot.up_probability if outcome == "Up" else Decimal("1") - snapshot.up_probability
+            probability = base_probability
             try:
                 book = self.book_cache.get_book(token_id)
             except Exception as exc:
@@ -1890,27 +1915,6 @@ class PolymarketQuantBot:
             )
             return True
 
-        if (
-            not self.config.dry_run
-            and bankroll_before["equity"] <= 0
-            and block_or_record(
-                "equity_depleted",
-                f"[AI LOCK] 模拟本金已耗尽 equity={bankroll_before['equity']}，停止新增模拟单。",
-            )
-        ):
-            return None
-        if (
-            not self.config.dry_run
-            and self.config.quant_max_drawdown_usdc > 0
-            and bankroll_before["risk_drawdown_usdc"] >= self.config.quant_max_drawdown_usdc
-            and block_or_record(
-                "max_drawdown_reached",
-                "[AI LOCK] "
-                f"已达到最大模拟回撤 realized_pnl={bankroll_before['realized_pnl']} "
-                f"limit=-{self.config.quant_max_drawdown_usdc}，停止新增模拟单。",
-            )
-        ):
-            return None
         if self.config.quant_lock_stop_on_lock and bool(entry.get("locked")) and block_or_record(
             "market_locked",
             f"[AI LOCK] {market.slug} 已经锁利，停止本市场。",
@@ -1926,24 +1930,6 @@ class PolymarketQuantBot:
             f"[AI LOCK] {market.title} remaining={market.seconds_left}s above entry window, wait.",
         ):
             return None
-        if (
-            not self.config.dry_run
-            and position_before["trade_count"] >= Decimal(str(self.config.quant_max_trades_per_market))
-            and block_or_record(
-                "max_trades_reached",
-                f"[AI LOCK] {market.slug} 已达到单市场最多笔数，跳过。",
-            )
-        ):
-            return None
-        last_trade_ts = float(entry.get("last_trade_ts") or 0)
-        if (
-            not self.config.dry_run
-            and last_trade_ts
-            and time.time() - last_trade_ts < self.config.quant_rebuy_cooldown_sec
-            and block_or_record("rebuy_cooldown")
-        ):
-            return None
-
         candidates, candidate_records = self.build_lock_candidates(
             market,
             snapshot,
@@ -2102,23 +2088,8 @@ class PolymarketQuantBot:
     ) -> Optional[QuantDecision]:
         if client is None:
             raise RuntimeError("lock live executor requires an initialized CLOB client")
-        reviewed, review_records = self.review_lock_plan(selected, position_before, bankroll_before)
-        if reviewed is None:
-            self.record_lock_signal(
-                market,
-                snapshot,
-                action="skip",
-                reason="second_review_failed",
-                candidates=candidate_records + review_records,
-                position_before=position_before,
-                position_after=position_before,
-                bankroll_before=bankroll_before,
-                bankroll_after=bankroll_before,
-                selected_meta={"review_records": review_records},
-                force=True,
-            )
-            print(f"[AI LOCK SKIP] second_review_failed market={market.title} review={review_records}")
-            return None
+        reviewed = selected
+        review_records: List[Dict[str, Any]] = []
 
         legs = self.lock_plan_legs(reviewed)
         decision = reviewed["decision"]
@@ -2417,7 +2388,8 @@ class PolymarketQuantBot:
         market_budget_remaining = self.config.quant_market_max_usdc - position_before["total_cost"]
         budget_remaining = min(bankroll_before["available_to_add"], market_budget_remaining)
         for outcome, token_id in zip(market.outcomes, market.token_ids):
-            probability = snapshot.up_probability if outcome == "Up" else Decimal("1") - snapshot.up_probability
+            base_probability = snapshot.up_probability if outcome == "Up" else Decimal("1") - snapshot.up_probability
+            probability = base_probability
             try:
                 book = self.book_cache.get_book(token_id)
             except Exception as exc:
@@ -2460,6 +2432,11 @@ class PolymarketQuantBot:
             fee = fill.fee
             total_cost = fill.total_cost
             effective_price = fill.effective_price if fill.effective_price > 0 else best_ask
+            probability_model = {
+                "base_probability": probability.quantize(Decimal("0.0001")),
+                "adjusted_probability": probability.quantize(Decimal("0.0001")),
+                "execution_adjustment": Decimal("0"),
+            }
             raw_edge = probability - best_ask
             edge = probability - effective_price
             min_order_size = decimal_value(book.get("min_order_size", "1"))
@@ -2479,6 +2456,7 @@ class PolymarketQuantBot:
                         "total_cost": total_cost,
                         "vwap_price": fill.vwap_price,
                         "effective_price": effective_price,
+                        "probability_model": probability_model,
                         "max_price": max_price,
                         "fill": fill_payload(fill),
                         "min_order_size": min_order_size,
@@ -2502,6 +2480,7 @@ class PolymarketQuantBot:
                         "fee": fee,
                         "total_cost": total_cost,
                         "max_price": max_price,
+                        "probability_model": probability_model,
                         "fill": fill_payload(fill),
                         "min_order_size": min_order_size,
                         "valid": False,
@@ -2527,6 +2506,7 @@ class PolymarketQuantBot:
                         "total_cost": total_cost,
                         "vwap_price": fill.vwap_price,
                         "effective_price": effective_price,
+                        "probability_model": probability_model,
                         "max_price": max_price,
                         "fill": fill_payload(fill),
                         "side_trade_count_before": int(side_trade_count_before),
@@ -2542,36 +2522,6 @@ class PolymarketQuantBot:
             ladder_skip_reason = same_outcome_price_ladder_skip(entry, outcome, best_ask)
             if ladder_skip_reason:
                 dry_run_rejections.append(ladder_skip_reason)
-            if max_notional > budget_remaining:
-                if not self.config.dry_run:
-                    candidate_records.append(
-                        {
-                            "outcome": outcome,
-                            "token_id": token_id,
-                            "probability": probability.quantize(Decimal("0.0001")),
-                            "best_ask": best_ask,
-                            "raw_edge": raw_edge.quantize(Decimal("0.0001")),
-                            "edge": edge.quantize(Decimal("0.0001")),
-                            "limit_price": limit_price,
-                            "size": size,
-                            "notional": fill_notional,
-                            "fee": fee,
-                            "total_cost": total_cost,
-                            "vwap_price": fill.vwap_price,
-                            "effective_price": effective_price,
-                            "max_price": max_price,
-                            "fill": fill_payload(fill),
-                            "max_notional": max_notional,
-                            "budget_remaining": budget_remaining,
-                            "market_budget_remaining": market_budget_remaining,
-                            "bankroll_before": lock_bankroll_payload(bankroll_before),
-                            "position_before": lock_position_payload(position_before),
-                            "valid": False,
-                            "skip_reason": "budget_cap_reached",
-                        }
-                    )
-                    continue
-
             position_after = lock_position_after_trade(
                 position_before,
                 outcome,
@@ -2593,38 +2543,6 @@ class PolymarketQuantBot:
                 self.config.quant_capital_usdc - risk_equity_after,
                 Decimal("0"),
             )
-            if (
-                self.config.quant_max_drawdown_usdc > 0
-                and risk_drawdown_after > self.config.quant_max_drawdown_usdc
-            ):
-                if not self.config.dry_run:
-                    candidate_records.append(
-                        {
-                            "outcome": outcome,
-                            "token_id": token_id,
-                            "probability": probability.quantize(Decimal("0.0001")),
-                            "best_ask": best_ask,
-                            "raw_edge": raw_edge.quantize(Decimal("0.0001")),
-                            "edge": edge.quantize(Decimal("0.0001")),
-                            "limit_price": limit_price,
-                            "size": size,
-                            "notional": fill_notional,
-                            "fee": fee,
-                            "total_cost": total_cost,
-                            "vwap_price": fill.vwap_price,
-                            "effective_price": effective_price,
-                            "max_price": max_price,
-                            "fill": fill_payload(fill),
-                            "max_notional": max_notional,
-                            "risk_drawdown_after": risk_drawdown_after.quantize(Decimal("0.0001")),
-                            "max_drawdown_usdc": self.config.quant_max_drawdown_usdc,
-                            "position_after": lock_position_payload(position_after),
-                            "bankroll_before": lock_bankroll_payload(bankroll_before),
-                            "valid": False,
-                            "skip_reason": "max_drawdown_candidate",
-                        }
-                    )
-                    continue
             decision = QuantDecision(
                 market=market,
                 outcome=outcome,
@@ -2695,6 +2613,7 @@ class PolymarketQuantBot:
                 "hedge_locked": would_lock,
                 "arbitrage_lock": False,
                 "rule_learning": rule_learning,
+                "probability_model": probability_model,
                 "dry_run_rejections": dry_run_rejections + model_rejections,
                 "side_trade_count_before": side_trade_count_before,
                 "side_trade_count_after": position_after[side_count_key],
@@ -2829,9 +2748,6 @@ class PolymarketQuantBot:
                 ladder_skip_reason = same_outcome_price_ladder_skip(entry, outcome, best_ask)
                 if ladder_skip_reason:
                     dry_run_rejections.append(ladder_skip_reason)
-                if total_cost > budget_remaining:
-                    if not self.config.dry_run:
-                        continue
                 position_after = lock_position_after_trade(
                     position_before,
                     outcome,
@@ -2841,25 +2757,6 @@ class PolymarketQuantBot:
                     fee,
                     total_cost,
                 )
-                if position_after["total_cost"] > self.config.quant_market_max_usdc:
-                    if not self.config.dry_run:
-                        continue
-                open_worst_after = bankroll_before["other_unsettled_worst_pnl"] + position_after["worst_pnl"]
-                risk_equity_after = (
-                    self.config.quant_capital_usdc
-                    + bankroll_before["realized_pnl"]
-                    + open_worst_after
-                )
-                risk_drawdown_after = max(
-                    self.config.quant_capital_usdc - risk_equity_after,
-                    Decimal("0"),
-                )
-                if (
-                    self.config.quant_max_drawdown_usdc > 0
-                    and risk_drawdown_after > self.config.quant_max_drawdown_usdc
-                ):
-                    if not self.config.dry_run:
-                        continue
                 improvement = position_after["worst_pnl"] - position_before["worst_pnl"]
                 would_lock = position_after["worst_pnl"] >= self.config.quant_lock_min_profit
                 decision = QuantDecision(
@@ -3100,10 +2997,6 @@ class PolymarketQuantBot:
         max_notional = notional
         market_cost_after = position_before["total_cost"] + notional
         dry_run_rejections: List[str] = []
-        if market_cost_after > self.config.quant_market_max_usdc and not self.config.dry_run:
-            return None
-        if max_notional > bankroll_before["available_to_add"] and not self.config.dry_run:
-            return None
         position_after_up = lock_position_after_trade(
             position_before,
             "Up",
@@ -3640,6 +3533,7 @@ class PolymarketQuantBot:
                 "ret_3m": snapshot.ret_3m,
                 "ret_5m": snapshot.ret_5m,
                 "up_probability": snapshot.up_probability,
+                "probability_components": snapshot.probability_components,
                 "settlement": {
                     "source": self.config.quant_price_source,
                     "current_ts": snapshot.current_ts,
@@ -3738,6 +3632,7 @@ class PolymarketQuantBot:
                 "ret_3m": snapshot.ret_3m,
                 "ret_5m": snapshot.ret_5m,
                 "up_probability": snapshot.up_probability,
+                "probability_components": snapshot.probability_components,
                 "settlement": {
                     "source": self.config.quant_price_source,
                     "current_ts": snapshot.current_ts,
@@ -4378,6 +4273,7 @@ def lock_candidate_payload(item: Dict[str, Any]) -> Dict[str, Any]:
         "expected_pnl_after": item.get("expected_pnl_after"),
         "payoff_matrix": item.get("payoff_matrix"),
         "rule_learning": item.get("rule_learning"),
+        "probability_model": item.get("probability_model"),
         "would_lock": bool(item.get("would_lock")),
         "hedge_locked": bool(item.get("hedge_locked")),
         "arbitrage_lock": bool(item.get("arbitrage_lock")),
@@ -4541,16 +4437,79 @@ def decimal_return(current: Decimal, previous: Decimal) -> Decimal:
     return (current - previous) / previous
 
 
-def estimate_up_probability(ret_from_start: Decimal, ret_1m: Decimal, ret_3m: Decimal) -> Decimal:
-    score = (
-        float(ret_from_start) * 180.0
-        + float(ret_1m) * 45.0
-        + float(ret_3m) * 25.0
+def estimate_up_probability(
+    ret_from_start: Decimal,
+    ret_1m: Decimal,
+    ret_3m: Decimal,
+    ret_5m: Decimal = Decimal("0"),
+    microstructure: Optional[Dict[str, Any]] = None,
+) -> Decimal:
+    return state_decimal(
+        estimate_up_probability_components(
+            ret_from_start,
+            ret_1m,
+            ret_3m,
+            ret_5m,
+            microstructure=microstructure,
+        ).get("probability")
     )
-    probability = 1.0 / (1.0 + math.exp(-score))
-    probability = min(max(probability, 0.05), 0.95)
-    return Decimal(str(probability)).quantize(Decimal("0.0001"))
 
+
+def estimate_up_probability_components(
+    ret_from_start: Decimal,
+    ret_1m: Decimal,
+    ret_3m: Decimal,
+    ret_5m: Decimal = Decimal("0"),
+    microstructure: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    price_score = (
+        float(ret_from_start) * 160.0
+        + float(ret_1m) * 65.0
+        + float(ret_3m) * 35.0
+        + float(ret_5m) * 15.0
+    )
+    order_flow_score = 0.0
+    volume_score = 0.0
+    if isinstance(microstructure, dict) and microstructure.get("available"):
+        windows = microstructure.get("windows") if isinstance(microstructure.get("windows"), dict) else {}
+        window_60 = windows.get("60s") if isinstance(windows.get("60s"), dict) else {}
+        window_180 = windows.get("180s") if isinstance(windows.get("180s"), dict) else {}
+        from_start = (
+            microstructure.get("from_market_start")
+            if isinstance(microstructure.get("from_market_start"), dict)
+            else {}
+        )
+        imbalance_60 = optional_decimal(window_60.get("taker_imbalance")) or Decimal("0")
+        imbalance_180 = optional_decimal(window_180.get("taker_imbalance")) or Decimal("0")
+        imbalance_start = optional_decimal(from_start.get("taker_imbalance")) or Decimal("0")
+        buy_ratio_60 = optional_decimal(window_60.get("taker_buy_ratio")) or Decimal("0.5")
+        sample_60 = min(max(int(window_60.get("sample_seconds") or 0), 0), 60) / 60.0
+        sample_start = min(max(int(from_start.get("sample_seconds") or 0), 0), 90) / 90.0
+        order_flow_score = (
+            float(imbalance_60) * 0.24 * sample_60
+            + float(imbalance_180) * 0.10
+            + float(imbalance_start) * 0.08 * sample_start
+            + float(buy_ratio_60 - Decimal("0.5")) * 0.18 * sample_60
+        )
+        quote_volume_60 = optional_decimal(window_60.get("quote_volume_usdt")) or Decimal("0")
+        trade_count_60 = Decimal(str(int(window_60.get("trade_count") or 0)))
+        if quote_volume_60 > 0 and trade_count_60 > 0:
+            volume_factor = min(math.log(max(float(quote_volume_60), 1.0)) / 16.0, 1.0)
+            momentum_direction = 1.0 if ret_from_start >= 0 else -1.0
+            volume_score = volume_factor * float(imbalance_60) * momentum_direction * 0.05
+    score = price_score + order_flow_score + volume_score
+    probability = 1.0 / (1.0 + math.exp(-score))
+    probability = min(max(probability, 0.03), 0.97)
+    return {
+        "probability": Decimal(str(probability)).quantize(Decimal("0.0001")),
+        "price_score": Decimal(str(price_score)).quantize(Decimal("0.0001")),
+        "order_flow_score": Decimal(str(order_flow_score)).quantize(Decimal("0.0001")),
+        "volume_score": Decimal(str(volume_score)).quantize(Decimal("0.0001")),
+        "ret_from_start": ret_from_start,
+        "ret_1m": ret_1m,
+        "ret_3m": ret_3m,
+        "ret_5m": ret_5m,
+    }
 
 def iso_to_ts(value: str) -> int:
     clean = value.replace("Z", "+00:00")
