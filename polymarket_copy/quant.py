@@ -27,6 +27,7 @@ from .config import CopyBotConfig, validate_config
 GAMMA_API = "https://gamma-api.polymarket.com"
 OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/history-candles"
 BINANCE_DATA_API = "https://data-api.binance.vision"
+BINANCE_VOLUME_WINDOWS_SEC: Tuple[int, ...] = (60, 180, 300)
 MAX_LOCK_TRADES_PER_SIDE = Decimal("20")
 POSITION_ADJUSTMENT_MULTIPLIERS: Tuple[Decimal, ...] = ()
 SAME_OUTCOME_REPEAT_SEC = 6
@@ -71,6 +72,7 @@ class BtcSnapshot:
     ret_1m: Decimal
     ret_3m: Decimal
     up_probability: Decimal
+    ret_5m: Decimal = Decimal("0")
     direction_source: str = ""
     direction_current_ts: int = 0
     direction_current: Decimal = Decimal("0")
@@ -79,6 +81,7 @@ class BtcSnapshot:
     direction_ret_from_start: Decimal = Decimal("0")
     direction_ret_1m: Decimal = Decimal("0")
     direction_ret_3m: Decimal = Decimal("0")
+    direction_ret_5m: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -229,11 +232,14 @@ class ChainlinkRtdsPriceFeed:
 
         one_min_item = nearest_price(prices, current_ts - 60)
         three_min_item = nearest_price(prices, current_ts - 180)
+        five_min_item = nearest_price(prices, current_ts - 300)
         one_min_price = one_min_item[1] if one_min_item else start_price
         three_min_price = three_min_item[1] if three_min_item else start_price
+        five_min_price = five_min_item[1] if five_min_item else start_price
         ret_from_start = decimal_return(current, start_price)
         ret_1m = decimal_return(current, one_min_price)
         ret_3m = decimal_return(current, three_min_price)
+        ret_5m = decimal_return(current, five_min_price)
         up_probability = estimate_up_probability(ret_from_start, ret_1m, ret_3m)
         return BtcSnapshot(
             source="polymarket_rtds_chainlink",
@@ -245,6 +251,7 @@ class ChainlinkRtdsPriceFeed:
             ret_1m=ret_1m,
             ret_3m=ret_3m,
             up_probability=up_probability,
+            ret_5m=ret_5m,
             direction_source="chainlink",
             direction_current_ts=current_ts,
             direction_current=current,
@@ -253,6 +260,7 @@ class ChainlinkRtdsPriceFeed:
             direction_ret_from_start=ret_from_start,
             direction_ret_1m=ret_1m,
             direction_ret_3m=ret_3m,
+            direction_ret_5m=ret_5m,
         )
 
     def _run(self) -> None:
@@ -371,6 +379,7 @@ class BinanceTradePriceFeed:
     def __init__(self, config: CopyBotConfig) -> None:
         self.config = config
         self.prices: List[Tuple[int, Decimal]] = []
+        self.trade_buckets: Dict[int, Dict[str, Any]] = {}
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
@@ -445,11 +454,14 @@ class BinanceTradePriceFeed:
 
         one_min_item = nearest_price(prices, current_ts - 60)
         three_min_item = nearest_price(prices, current_ts - 180)
+        five_min_item = nearest_price(prices, current_ts - 300)
         one_min_price = one_min_item[1] if one_min_item else start_price
         three_min_price = three_min_item[1] if three_min_item else start_price
+        five_min_price = five_min_item[1] if five_min_item else start_price
         ret_from_start = decimal_return(current, start_price)
         ret_1m = decimal_return(current, one_min_price)
         ret_3m = decimal_return(current, three_min_price)
+        ret_5m = decimal_return(current, five_min_price)
         up_probability = estimate_up_probability(ret_from_start, ret_1m, ret_3m)
         return BtcSnapshot(
             source="chainlink_settlement_binance_direction",
@@ -461,6 +473,7 @@ class BinanceTradePriceFeed:
             ret_1m=ret_1m,
             ret_3m=ret_3m,
             up_probability=up_probability,
+            ret_5m=settlement.ret_5m,
             direction_source="binance",
             direction_current_ts=current_ts,
             direction_current=current,
@@ -469,6 +482,7 @@ class BinanceTradePriceFeed:
             direction_ret_from_start=ret_from_start,
             direction_ret_1m=ret_1m,
             direction_ret_3m=ret_3m,
+            direction_ret_5m=ret_5m,
         )
 
     def _run(self) -> None:
@@ -531,7 +545,7 @@ class BinanceTradePriceFeed:
             return
         self.last_history_refresh_ts = now_monotonic
         end_ts = int(time.time())
-        start_ts = max(0, market_start_ts - 180)
+        start_ts = max(0, market_start_ts - 360)
         params = {
             "symbol": self.config.quant_binance_symbol.upper(),
             "interval": "1s",
@@ -547,6 +561,7 @@ class BinanceTradePriceFeed:
             self.last_error = repr(exc)
             return
         parsed: List[Tuple[int, Decimal]] = []
+        buckets: List[Dict[str, Any]] = []
         if not isinstance(payload, list):
             return
         for candle in payload:
@@ -558,8 +573,30 @@ class BinanceTradePriceFeed:
             except Exception:
                 continue
             parsed.append((open_ts, close_price))
+            volume = optional_decimal(candle[5] if len(candle) > 5 else None) or Decimal("0")
+            quote_volume = optional_decimal(candle[7] if len(candle) > 7 else None) or Decimal("0")
+            taker_buy_volume = optional_decimal(candle[9] if len(candle) > 9 else None) or Decimal("0")
+            taker_buy_quote_volume = optional_decimal(candle[10] if len(candle) > 10 else None) or Decimal("0")
+            trade_count = 0
+            try:
+                trade_count = int(candle[8]) if len(candle) > 8 else 0
+            except Exception:
+                trade_count = 0
+            buckets.append(
+                {
+                    "ts": open_ts,
+                    "close": close_price,
+                    "volume": volume,
+                    "quote_volume": quote_volume,
+                    "taker_buy_volume": taker_buy_volume,
+                    "taker_buy_quote_volume": taker_buy_quote_volume,
+                    "trade_count": trade_count,
+                }
+            )
         if parsed:
             self._add_prices(parsed)
+        if buckets:
+            self._merge_trade_buckets(buckets, replace=True)
 
     def _handle_message(self, message: str) -> None:
         try:
@@ -570,6 +607,7 @@ class BinanceTradePriceFeed:
         if not isinstance(payload, dict):
             return
         price_value = payload.get("p") or payload.get("c")
+        qty_value = payload.get("q") or payload.get("v")
         ts_value = payload.get("T") or payload.get("E")
         if price_value is None or ts_value is None:
             return
@@ -580,6 +618,26 @@ class BinanceTradePriceFeed:
         except Exception:
             return
         self._add_prices([(ts, price)])
+        qty = optional_decimal(qty_value) or Decimal("0")
+        if qty > 0:
+            quote_volume = qty * price
+            maker_flag = payload.get("m")
+            taker_buy_volume = Decimal("0") if maker_flag is True else qty
+            taker_buy_quote_volume = Decimal("0") if maker_flag is True else quote_volume
+            self._merge_trade_buckets(
+                [
+                    {
+                        "ts": ts,
+                        "close": price,
+                        "volume": qty,
+                        "quote_volume": quote_volume,
+                        "taker_buy_volume": taker_buy_volume,
+                        "taker_buy_quote_volume": taker_buy_quote_volume,
+                        "trade_count": 1,
+                    }
+                ],
+                replace=False,
+            )
 
     def _add_prices(self, parsed: List[Tuple[int, Decimal]]) -> None:
         with self.lock:
@@ -587,6 +645,76 @@ class BinanceTradePriceFeed:
             merged.update(parsed)
             cutoff = int(time.time()) - 900
             self.prices = sorted((ts, price) for ts, price in merged.items() if ts >= cutoff)
+
+    def _merge_trade_buckets(self, buckets: List[Dict[str, Any]], replace: bool) -> None:
+        cutoff = int(time.time()) - 900
+        with self.lock:
+            for incoming in buckets:
+                ts = int(incoming.get("ts", 0))
+                if ts <= 0:
+                    continue
+                current = self.trade_buckets.get(ts)
+                if replace or current is None:
+                    self.trade_buckets[ts] = {
+                        "ts": ts,
+                        "close": optional_decimal(incoming.get("close")) or Decimal("0"),
+                        "volume": optional_decimal(incoming.get("volume")) or Decimal("0"),
+                        "quote_volume": optional_decimal(incoming.get("quote_volume")) or Decimal("0"),
+                        "taker_buy_volume": optional_decimal(incoming.get("taker_buy_volume")) or Decimal("0"),
+                        "taker_buy_quote_volume": optional_decimal(incoming.get("taker_buy_quote_volume")) or Decimal("0"),
+                        "trade_count": int(incoming.get("trade_count") or 0),
+                    }
+                    continue
+                current["close"] = optional_decimal(incoming.get("close")) or current.get("close") or Decimal("0")
+                current["volume"] = state_decimal(current.get("volume")) + (
+                    optional_decimal(incoming.get("volume")) or Decimal("0")
+                )
+                current["quote_volume"] = state_decimal(current.get("quote_volume")) + (
+                    optional_decimal(incoming.get("quote_volume")) or Decimal("0")
+                )
+                current["taker_buy_volume"] = state_decimal(current.get("taker_buy_volume")) + (
+                    optional_decimal(incoming.get("taker_buy_volume")) or Decimal("0")
+                )
+                current["taker_buy_quote_volume"] = state_decimal(current.get("taker_buy_quote_volume")) + (
+                    optional_decimal(incoming.get("taker_buy_quote_volume")) or Decimal("0")
+                )
+                current["trade_count"] = int(current.get("trade_count") or 0) + int(incoming.get("trade_count") or 0)
+            self.trade_buckets = {
+                ts: bucket for ts, bucket in self.trade_buckets.items() if ts >= cutoff
+            }
+
+    def factor_payload(self, market_start_ts: int, current_ts: int) -> Dict[str, Any]:
+        with self.lock:
+            buckets = dict(self.trade_buckets)
+            prices = list(self.prices)
+        payload: Dict[str, Any] = {
+            "source": "binance",
+            "symbol": self.config.quant_binance_symbol.upper(),
+            "available": bool(buckets),
+            "current_ts": current_ts,
+            "windows_sec": list(BINANCE_VOLUME_WINDOWS_SEC),
+        }
+        if not buckets:
+            payload["reason"] = "no_trade_buckets"
+            return payload
+        payload["windows"] = {
+            f"{window}s": summarize_binance_buckets(
+                buckets,
+                max(0, current_ts - window + 1),
+                current_ts,
+            )
+            for window in BINANCE_VOLUME_WINDOWS_SEC
+        }
+        payload["from_market_start"] = summarize_binance_buckets(
+            buckets,
+            market_start_ts,
+            current_ts,
+        )
+        five_min_item = nearest_price(prices, current_ts - 300)
+        current_item = nearest_price(prices, current_ts)
+        if current_item is not None and five_min_item is not None:
+            payload["ret_5m"] = decimal_return(current_item[1], five_min_item[1])
+        return payload
 
 
 class QuantStateStore:
@@ -806,6 +934,7 @@ class PolymarketQuantBot:
         self.started_at_ts = int(time.time())
         self.first_allowed_market_start_ts = next_market_boundary(self.started_at_ts)
         self.shadow_window_seen: set[str] = set()
+        self.market_open_snapshots: Dict[str, Dict[str, Any]] = {}
 
     def run_forever(self) -> None:
         errors, warnings = validate_config(self.config, require_private_key=not self.config.dry_run)
@@ -1016,6 +1145,7 @@ class PolymarketQuantBot:
         ret_from_start = decimal_return(current, start_price)
         ret_1m = decimal_return(current, candles[-2]["close"])
         ret_3m = decimal_return(current, candles[-4]["close"])
+        ret_5m = decimal_return(current, candles[-6]["close"] if len(candles) >= 6 else start_price)
         up_probability = estimate_up_probability(ret_from_start, ret_1m, ret_3m)
         return BtcSnapshot(
             source="okx",
@@ -1027,6 +1157,7 @@ class PolymarketQuantBot:
             ret_1m=ret_1m,
             ret_3m=ret_3m,
             up_probability=up_probability,
+            ret_5m=ret_5m,
             direction_source="okx",
             direction_current_ts=int(candles[-1]["ts"]),
             direction_current=current,
@@ -1035,6 +1166,7 @@ class PolymarketQuantBot:
             direction_ret_from_start=ret_from_start,
             direction_ret_1m=ret_1m,
             direction_ret_3m=ret_3m,
+            direction_ret_5m=ret_5m,
         )
 
     def fetch_fresh_book(self, token_id: str) -> Dict[str, Any]:
@@ -1491,6 +1623,98 @@ class PolymarketQuantBot:
             "in_capture_window": in_capture_window,
             "scheduled_windows_sec": list(SHADOW_WINDOWS_SEC),
         }
+
+    def market_factors_payload(
+        self,
+        market: QuantMarket,
+        snapshot: BtcSnapshot,
+        market_snapshot: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        open_snapshot = self.open_market_snapshot(market, market_snapshot)
+        up_ask = optional_decimal(market_snapshot.get("up_ask"))
+        down_ask = optional_decimal(market_snapshot.get("down_ask"))
+        open_up = optional_decimal(open_snapshot.get("up_ask"))
+        open_down = optional_decimal(open_snapshot.get("down_ask"))
+        up_delta, up_return = delta_and_return(up_ask, open_up)
+        down_delta, down_return = delta_and_return(down_ask, open_down)
+        up_fill = market_snapshot.get("up_ask_fill") if isinstance(market_snapshot.get("up_ask_fill"), dict) else {}
+        down_fill = (
+            market_snapshot.get("down_ask_fill") if isinstance(market_snapshot.get("down_ask_fill"), dict) else {}
+        )
+        direction_current = snapshot.direction_current or snapshot.current
+        direction_start = snapshot.direction_start_price or snapshot.start_price
+        price_delta, price_return = delta_and_return(direction_current, direction_start)
+        payload: Dict[str, Any] = {
+            "mode": "shadow_only",
+            "used_for_decision": False,
+            "version": 1,
+            "btc": {
+                "direction_source": snapshot.direction_source or snapshot.source,
+                "direction_current_ts": snapshot.direction_current_ts or snapshot.current_ts,
+                "direction_current": direction_current,
+                "direction_start_ts": snapshot.direction_start_price_ts or snapshot.start_price_ts,
+                "direction_start": direction_start,
+                "direction_delta_from_start": price_delta,
+                "direction_return_from_start": price_return,
+                "ret_1m": snapshot.direction_ret_1m or snapshot.ret_1m,
+                "ret_3m": snapshot.direction_ret_3m or snapshot.ret_3m,
+                "ret_5m": snapshot.direction_ret_5m or snapshot.ret_5m,
+            },
+            "polymarket": {
+                "open_recorded_ts": open_snapshot.get("recorded_ts"),
+                "open_seconds_left": open_snapshot.get("seconds_left"),
+                "up_ask": up_ask,
+                "down_ask": down_ask,
+                "sum_ask": optional_decimal(market_snapshot.get("sum_ask")),
+                "pure_arb_edge": optional_decimal(market_snapshot.get("pure_arb_edge")),
+                "up_open_ask": open_up,
+                "down_open_ask": open_down,
+                "up_ask_delta_from_open": up_delta,
+                "down_ask_delta_from_open": down_delta,
+                "up_ask_return_from_open": up_return,
+                "down_ask_return_from_open": down_return,
+                "up_depth": optional_decimal(market_snapshot.get("up_depth")),
+                "down_depth": optional_decimal(market_snapshot.get("down_depth")),
+                "up_fee": optional_decimal(market_snapshot.get("up_fee")),
+                "down_fee": optional_decimal(market_snapshot.get("down_fee")),
+                "up_effective_price": optional_decimal(up_fill.get("effective_price")),
+                "down_effective_price": optional_decimal(down_fill.get("effective_price")),
+                "up_vwap_price": optional_decimal(up_fill.get("vwap_price")),
+                "down_vwap_price": optional_decimal(down_fill.get("vwap_price")),
+                "up_total_cost": optional_decimal(up_fill.get("total_cost")),
+                "down_total_cost": optional_decimal(down_fill.get("total_cost")),
+                "pair_executable": market_snapshot.get("pair_executable"),
+                "pair_skip_reason": market_snapshot.get("pair_skip_reason"),
+                "pair_total_cost": optional_decimal(market_snapshot.get("total_cost")),
+                "pair_guaranteed_payout": optional_decimal(market_snapshot.get("guaranteed_payout")),
+                "pair_locked_profit": optional_decimal(market_snapshot.get("locked_profit")),
+            },
+        }
+        if self.config.quant_direction_source == "binance":
+            payload["binance_microstructure"] = self.binance_feed.factor_payload(
+                market.start_ts,
+                snapshot.direction_current_ts or snapshot.current_ts,
+            )
+        return payload
+
+    def open_market_snapshot(self, market: QuantMarket, market_snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        existing = self.market_open_snapshots.get(market.slug)
+        if existing:
+            return existing
+        up_ask = optional_decimal(market_snapshot.get("up_ask"))
+        down_ask = optional_decimal(market_snapshot.get("down_ask"))
+        snapshot = {
+            "recorded_ts": int(time.time()),
+            "seconds_left": market.seconds_left,
+            "up_ask": up_ask,
+            "down_ask": down_ask,
+        }
+        if up_ask is not None or down_ask is not None:
+            self.market_open_snapshots[market.slug] = snapshot
+            if len(self.market_open_snapshots) > 200:
+                newest = sorted(self.market_open_snapshots.items(), key=lambda item: item[1].get("recorded_ts", 0))
+                self.market_open_snapshots = dict(newest[-100:])
+        return snapshot
 
     def should_force_shadow_window_record(self, market: QuantMarket) -> bool:
         seconds_left = market.seconds_left
@@ -3414,6 +3638,7 @@ class PolymarketQuantBot:
                 "ret_from_start": snapshot.ret_from_start,
                 "ret_1m": snapshot.ret_1m,
                 "ret_3m": snapshot.ret_3m,
+                "ret_5m": snapshot.ret_5m,
                 "up_probability": snapshot.up_probability,
                 "settlement": {
                     "source": self.config.quant_price_source,
@@ -3431,6 +3656,7 @@ class PolymarketQuantBot:
                     "ret_from_start": snapshot.direction_ret_from_start or snapshot.ret_from_start,
                     "ret_1m": snapshot.direction_ret_1m or snapshot.ret_1m,
                     "ret_3m": snapshot.direction_ret_3m or snapshot.ret_3m,
+                    "ret_5m": snapshot.direction_ret_5m or snapshot.ret_5m,
                 },
             },
             "position_before": lock_position_payload(position_before),
@@ -3439,6 +3665,7 @@ class PolymarketQuantBot:
             "bankroll_after": lock_bankroll_payload(bankroll_after),
             "time_window": self.time_window_payload(market),
             "market_snapshot": market_snapshot,
+            "market_factors": self.market_factors_payload(market, snapshot, market_snapshot),
             "shadow_strategies": self.shadow_strategy_payload(
                 market,
                 snapshot,
@@ -3509,6 +3736,7 @@ class PolymarketQuantBot:
                 "ret_from_start": snapshot.ret_from_start,
                 "ret_1m": snapshot.ret_1m,
                 "ret_3m": snapshot.ret_3m,
+                "ret_5m": snapshot.ret_5m,
                 "up_probability": snapshot.up_probability,
                 "settlement": {
                     "source": self.config.quant_price_source,
@@ -3526,10 +3754,12 @@ class PolymarketQuantBot:
                     "ret_from_start": snapshot.direction_ret_from_start or snapshot.ret_from_start,
                     "ret_1m": snapshot.direction_ret_1m or snapshot.ret_1m,
                     "ret_3m": snapshot.direction_ret_3m or snapshot.ret_3m,
+                    "ret_5m": snapshot.direction_ret_5m or snapshot.ret_5m,
                 },
             },
             "time_window": self.time_window_payload(market),
             "market_snapshot": market_snapshot,
+            "market_factors": self.market_factors_payload(market, snapshot, market_snapshot),
             "shadow_strategies": self.shadow_strategy_payload(
                 market,
                 snapshot,
@@ -4187,6 +4417,62 @@ def decision_payload_from_dataclass(decision: QuantDecision) -> Dict[str, Any]:
         "fill_complete": decision.fill_complete,
         "price_source": "orderbook_asks",
         "reason": decision.reason,
+    }
+
+
+def optional_decimal(value: Any) -> Optional[Decimal]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, Decimal):
+        return value
+    try:
+        return decimal_value(value)
+    except Exception:
+        return None
+
+
+def delta_and_return(current: Optional[Decimal], base: Optional[Decimal]) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+    if current is None or base is None or base <= 0:
+        return None, None
+    delta = current - base
+    return delta, delta / base
+
+
+def summarize_binance_buckets(
+    buckets: Dict[int, Dict[str, Any]],
+    start_ts: int,
+    end_ts: int,
+) -> Dict[str, Any]:
+    selected = [bucket for ts, bucket in buckets.items() if start_ts <= ts <= end_ts]
+    volume = sum((state_decimal(bucket.get("volume")) for bucket in selected), Decimal("0"))
+    quote_volume = sum((state_decimal(bucket.get("quote_volume")) for bucket in selected), Decimal("0"))
+    taker_buy_volume = sum((state_decimal(bucket.get("taker_buy_volume")) for bucket in selected), Decimal("0"))
+    taker_buy_quote_volume = sum(
+        (state_decimal(bucket.get("taker_buy_quote_volume")) for bucket in selected),
+        Decimal("0"),
+    )
+    trade_count = sum((int(bucket.get("trade_count") or 0) for bucket in selected), 0)
+    taker_sell_volume = max(volume - taker_buy_volume, Decimal("0"))
+    taker_sell_quote_volume = max(quote_volume - taker_buy_quote_volume, Decimal("0"))
+    imbalance = Decimal("0")
+    buy_ratio = Decimal("0")
+    if volume > 0:
+        imbalance = (taker_buy_volume - taker_sell_volume) / volume
+        buy_ratio = taker_buy_volume / volume
+    return {
+        "start_ts": start_ts,
+        "end_ts": end_ts,
+        "sample_seconds": len(selected),
+        "trade_count": trade_count,
+        "volume_btc": volume,
+        "quote_volume_usdt": quote_volume,
+        "taker_buy_volume_btc": taker_buy_volume,
+        "taker_sell_volume_btc": taker_sell_volume,
+        "taker_buy_quote_volume_usdt": taker_buy_quote_volume,
+        "taker_sell_quote_volume_usdt": taker_sell_quote_volume,
+        "taker_buy_ratio": buy_ratio,
+        "taker_imbalance": imbalance,
+        "avg_trade_size_btc": volume / Decimal(trade_count) if trade_count > 0 else Decimal("0"),
     }
 
 
