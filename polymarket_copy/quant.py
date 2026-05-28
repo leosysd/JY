@@ -1501,13 +1501,18 @@ class PolymarketQuantBot:
             )
             return True
 
-        if bankroll_before["equity"] <= 0 and block_or_record(
-            "equity_depleted",
-            f"[AI LOCK] 模拟本金已耗尽 equity={bankroll_before['equity']}，停止新增模拟单。",
+        if (
+            not self.config.dry_run
+            and bankroll_before["equity"] <= 0
+            and block_or_record(
+                "equity_depleted",
+                f"[AI LOCK] 模拟本金已耗尽 equity={bankroll_before['equity']}，停止新增模拟单。",
+            )
         ):
             return None
         if (
-            self.config.quant_max_drawdown_usdc > 0
+            not self.config.dry_run
+            and self.config.quant_max_drawdown_usdc > 0
             and bankroll_before["risk_drawdown_usdc"] >= self.config.quant_max_drawdown_usdc
             and block_or_record(
                 "max_drawdown_reached",
@@ -2706,16 +2711,10 @@ class PolymarketQuantBot:
         max_notional = notional
         market_cost_after = position_before["total_cost"] + notional
         dry_run_rejections: List[str] = []
-        if market_cost_after > self.config.quant_market_max_usdc:
-            if self.config.dry_run:
-                dry_run_rejections.append("market_cap_reached")
-            else:
-                return None
-        if max_notional > bankroll_before["available_to_add"]:
-            if self.config.dry_run:
-                dry_run_rejections.append("bankroll_cap_reached")
-            else:
-                return None
+        if market_cost_after > self.config.quant_market_max_usdc and not self.config.dry_run:
+            return None
+        if max_notional > bankroll_before["available_to_add"] and not self.config.dry_run:
+            return None
         position_after_up = lock_position_after_trade(
             position_before,
             "Up",
