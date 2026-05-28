@@ -43,6 +43,13 @@ TARGET_STYLE_PROBE_MIN_ASK = Decimal("0.50")
 TARGET_STYLE_FOLLOW_MIN_ASK = Decimal("0.55")
 TARGET_STYLE_PROBABILITY_MARGIN = Decimal("0.52")
 TARGET_STYLE_SAME_SIDE_MIN_PRICE_MOVE = Decimal("0.03")
+BTC_FLOW_SCORE_THRESHOLD = Decimal("0.03")
+BTC_FLOW_CONFIDENCE_SCALE = Decimal("2.5")
+BTC_FLOW_MIN_CONFIDENCE = Decimal("0.08")
+BTC_FLOW_INITIAL_SCORE = Decimal("2.4")
+BTC_FLOW_INITIAL_FALLBACK_SCORE = Decimal("1.1")
+BTC_FLOW_LADDER_SCORE = Decimal("2.6")
+BTC_FLOW_UNCONFIRMED_LADDER_SCORE = Decimal("0.9")
 MATRIX_REBALANCE_MIN_PROBABILITY = Decimal("0.50")
 REBALANCE_MIN_EDGE = Decimal("0")
 MOMENTUM_MAX_NEGATIVE_EDGE = Decimal("-0.18")
@@ -1731,11 +1738,24 @@ class PolymarketQuantBot:
             },
         }
         if self.config.quant_direction_source == "binance":
-            payload["binance_microstructure"] = self.binance_feed.factor_payload(
+            microstructure = self.binance_feed.factor_payload(
                 market.start_ts,
                 snapshot.direction_current_ts or snapshot.current_ts,
             )
+            payload["binance_microstructure"] = microstructure
+            payload["btc_trade_flow"] = build_btc_trade_flow_payload(microstructure, snapshot)
+        else:
+            payload["btc_trade_flow"] = build_btc_trade_flow_payload({}, snapshot)
         return payload
+
+    def btc_trade_flow_payload(self, market: QuantMarket, snapshot: BtcSnapshot) -> Dict[str, Any]:
+        microstructure: Dict[str, Any] = {}
+        if self.config.quant_direction_source == "binance":
+            microstructure = self.binance_feed.factor_payload(
+                market.start_ts,
+                snapshot.direction_current_ts or snapshot.current_ts,
+            )
+        return build_btc_trade_flow_payload(microstructure, snapshot)
 
     def open_market_snapshot(self, market: QuantMarket, market_snapshot: Dict[str, Any]) -> Dict[str, Any]:
         existing = self.market_open_snapshots.get(market.slug)
@@ -2258,12 +2278,14 @@ class PolymarketQuantBot:
             reviewed_leg = reviewed_legs[0]
             improvement = position_after["worst_pnl"] - position_before["worst_pnl"]
             would_lock = position_after["worst_pnl"] >= self.config.quant_lock_min_profit
+            btc_flow = selected.get("btc_trade_flow") if isinstance(selected.get("btc_trade_flow"), dict) else None
             reviewed_reason, reviewed_score = self.score_lock_candidate(
                 position_before,
                 position_after,
                 reviewed_leg,
                 would_lock,
                 improvement,
+                btc_flow,
             )
             review_records.append(
                 {
@@ -2403,6 +2425,7 @@ class PolymarketQuantBot:
         outcome_items: Dict[str, Dict[str, Any]] = {}
         market_budget_remaining = self.config.quant_market_max_usdc - position_before["total_cost"]
         budget_remaining = min(bankroll_before["available_to_add"], market_budget_remaining)
+        btc_flow = self.btc_trade_flow_payload(market, snapshot)
         for outcome, token_id in zip(market.outcomes, market.token_ids):
             base_probability = snapshot.up_probability if outcome == "Up" else Decimal("1") - snapshot.up_probability
             probability = base_probability
@@ -2588,7 +2611,9 @@ class PolymarketQuantBot:
                 decision,
                 would_lock,
                 improvement,
+                btc_flow,
             )
+            flow_alignment = btc_flow_alignment(outcome, btc_flow)
             model_rejections: List[str] = []
             if score and score[0] <= 0:
                 model_rejections.append(reason)
@@ -2630,6 +2655,8 @@ class PolymarketQuantBot:
                 "arbitrage_lock": False,
                 "rule_learning": rule_learning,
                 "probability_model": probability_model,
+                "btc_trade_flow": btc_flow,
+                "btc_flow_alignment": flow_alignment,
                 "dry_run_rejections": dry_run_rejections + model_rejections,
                 "side_trade_count_before": side_trade_count_before,
                 "side_trade_count_after": position_after[side_count_key],
@@ -2659,6 +2686,7 @@ class PolymarketQuantBot:
             entry,
             budget_remaining,
             market_budget_remaining,
+            btc_flow,
         )
         candidates.extend(adjustment_candidates)
         candidate_records.extend(adjustment_records)
@@ -2673,6 +2701,7 @@ class PolymarketQuantBot:
         entry: Optional[Dict[str, Any]],
         budget_remaining: Decimal,
         market_budget_remaining: Decimal,
+        btc_flow: Dict[str, Any],
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         if position_before["trade_count"] <= 0 or self.config.quant_size_mode != "shares":
             return [], []
@@ -2805,7 +2834,9 @@ class PolymarketQuantBot:
                     decision,
                     would_lock,
                     improvement,
+                    btc_flow,
                 )
+                flow_alignment = btc_flow_alignment(outcome, btc_flow)
                 if reason not in {
                     "matrix_guaranteed_profit",
                     "matrix_no_loss",
@@ -2861,6 +2892,8 @@ class PolymarketQuantBot:
                     "hedge_locked": would_lock,
                     "arbitrage_lock": False,
                     "rule_learning": rule_learning,
+                    "btc_trade_flow": btc_flow,
+                    "btc_flow_alignment": flow_alignment,
                     "dry_run_rejections": dry_run_rejections + model_rejections,
                     "side_trade_count_before": side_trade_count_before,
                     "side_trade_count_after": position_after[side_count_key],
@@ -3073,6 +3106,7 @@ class PolymarketQuantBot:
         decision: QuantDecision,
         would_lock: bool,
         improvement: Decimal,
+        btc_flow: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, Tuple[Decimal, ...]]:
         p_up = decision.probability if decision.outcome == "Up" else Decimal("1") - decision.probability
         expected_before = expected_lock_pnl(position_before, p_up)
@@ -3114,7 +3148,14 @@ class PolymarketQuantBot:
         both_negative_after = position_after["up_pnl"] < 0 and position_after["down_pnl"] < 0
         market_consensus_side = decision.best_ask >= TARGET_STYLE_PROBE_MIN_ASK
         model_confirms_side = decision.probability >= TARGET_STYLE_PROBABILITY_MARGIN
-        target_style_follow = is_favorite or market_consensus_side or model_confirms_side
+        flow_alignment = btc_flow_alignment(decision.outcome, btc_flow)
+        flow_available = bool((btc_flow or {}).get("available"))
+        flow_confidence = state_decimal((btc_flow or {}).get("confidence"))
+        flow_supports_side = flow_available and flow_alignment > 0
+        flow_contrary_side = flow_available and flow_alignment < 0
+        flow_confirms_side = flow_supports_side and flow_confidence >= BTC_FLOW_MIN_CONFIDENCE
+        target_style_follow = is_favorite or model_confirms_side or flow_confirms_side
+        market_hot_fallback = market_consensus_side and not flow_contrary_side
         tail_probability_overfit = (
             effective_price < TAIL_VALUE_MIN_PRICE
             and decision.probability < TAIL_VALUE_MIN_PROBABILITY
@@ -3249,7 +3290,7 @@ class PolymarketQuantBot:
                     -position_after["total_cost"],
                 ),
             )
-        if late_stage and not would_lock and improvement <= 0 and not target_style_follow:
+        if position_before["trade_count"] > 0 and late_stage and not would_lock and improvement <= 0 and not target_style_follow:
             return (
                 "late_stage_requires_lock_or_rebalance",
                 (
@@ -3322,15 +3363,37 @@ class PolymarketQuantBot:
                 ),
             )
         if position_before["trade_count"] == 0:
-            if not target_style_follow and decision.edge < Decimal("0"):
+            if flow_supports_side:
                 return (
-                    "initial_wrong_side",
-                    (Decimal("0"), expected_after, decision.edge, -pnl_gap, -position_after["total_cost"]),
+                    "initial_btc_flow_probe",
+                    (
+                        BTC_FLOW_INITIAL_SCORE,
+                        flow_confidence,
+                        decision.edge,
+                        expected_after,
+                        decision.probability,
+                        -pnl_gap,
+                        -position_after["total_cost"],
+                    ),
+                )
+            if flow_contrary_side and not target_style_follow and decision.edge < Decimal("0"):
+                return (
+                    "initial_against_btc_flow_fallback",
+                    (
+                        BTC_FLOW_INITIAL_FALLBACK_SCORE,
+                        decision.edge,
+                        expected_after,
+                        decision.probability,
+                        -pnl_gap,
+                        -position_after["total_cost"],
+                    ),
                 )
             return (
                 "initial_target_probe",
                 (
                     Decimal("2"),
+                    flow_alignment,
+                    flow_confidence,
                     Decimal("1") if market_consensus_side else Decimal("0"),
                     Decimal("1") if is_favorite else Decimal("0"),
                     expected_after,
@@ -3396,6 +3459,19 @@ class PolymarketQuantBot:
                 ),
             )
         if momentum_too_expensive:
+            if flow_supports_side:
+                return (
+                    "target_btc_flow_overpriced_probe",
+                    (
+                        BTC_FLOW_UNCONFIRMED_LADDER_SCORE,
+                        flow_confidence,
+                        decision.edge,
+                        decision.probability,
+                        effective_price,
+                        expected_gain,
+                        -position_after["total_cost"],
+                    ),
+                )
             return (
                 "momentum_overpriced_negative_ev",
                 (
@@ -3407,15 +3483,32 @@ class PolymarketQuantBot:
                     -position_after["total_cost"],
                 ),
             )
-        if target_style_follow and (
+        if (target_style_follow or market_hot_fallback) and (
             decision.best_ask >= TARGET_STYLE_FOLLOW_MIN_ASK
             or expected_positive
             or decision.edge >= Decimal("-0.20")
         ):
+            if flow_supports_side:
+                return (
+                    "target_btc_flow_ladder",
+                    (
+                        BTC_FLOW_LADDER_SCORE,
+                        flow_confidence,
+                        decision.best_ask,
+                        expected_after,
+                        decision.probability,
+                        decision.edge,
+                        improvement,
+                        -pnl_gap,
+                        -position_after["total_cost"],
+                    ),
+                )
             return (
-                "target_momentum_ladder",
+                "target_momentum_unconfirmed",
                 (
-                    Decimal("2.2"),
+                    BTC_FLOW_UNCONFIRMED_LADDER_SCORE,
+                    flow_alignment,
+                    flow_confidence,
                     Decimal("1") if both_negative_after else Decimal("0"),
                     decision.best_ask,
                     expected_after,
@@ -4312,6 +4405,8 @@ def lock_candidate_payload(item: Dict[str, Any]) -> Dict[str, Any]:
         "payoff_matrix": item.get("payoff_matrix"),
         "rule_learning": item.get("rule_learning"),
         "probability_model": item.get("probability_model"),
+        "btc_trade_flow": item.get("btc_trade_flow"),
+        "btc_flow_alignment": item.get("btc_flow_alignment"),
         "would_lock": bool(item.get("would_lock")),
         "hedge_locked": bool(item.get("hedge_locked")),
         "arbitrage_lock": bool(item.get("arbitrage_lock")),
@@ -4410,6 +4505,99 @@ def summarize_binance_buckets(
         "taker_imbalance": imbalance,
         "avg_trade_size_btc": volume / Decimal(trade_count) if trade_count > 0 else Decimal("0"),
     }
+
+
+def clamp_decimal(value: Decimal, low: Decimal, high: Decimal) -> Decimal:
+    return max(low, min(value, high))
+
+
+def btc_flow_window(microstructure: Dict[str, Any], name: str) -> Dict[str, Any]:
+    windows = microstructure.get("windows") if isinstance(microstructure.get("windows"), dict) else {}
+    window = windows.get(name) if isinstance(windows.get(name), dict) else {}
+    return window
+
+
+def build_btc_trade_flow_payload(
+    microstructure: Dict[str, Any],
+    snapshot: BtcSnapshot,
+) -> Dict[str, Any]:
+    window_60 = btc_flow_window(microstructure, "60s")
+    window_180 = btc_flow_window(microstructure, "180s")
+    from_start = (
+        microstructure.get("from_market_start")
+        if isinstance(microstructure.get("from_market_start"), dict)
+        else {}
+    )
+    sample_60 = int(window_60.get("sample_seconds") or 0)
+    sample_180 = int(window_180.get("sample_seconds") or 0)
+    sample_start = int(from_start.get("sample_seconds") or 0)
+    trade_count = max(
+        int(window_60.get("trade_count") or 0),
+        int(from_start.get("trade_count") or 0),
+    )
+    available = bool(microstructure.get("available")) and trade_count > 0
+    imbalance_60 = optional_decimal(window_60.get("taker_imbalance")) or Decimal("0")
+    imbalance_180 = optional_decimal(window_180.get("taker_imbalance")) or Decimal("0")
+    imbalance_start = optional_decimal(from_start.get("taker_imbalance")) or Decimal("0")
+    buy_ratio_60 = optional_decimal(window_60.get("taker_buy_ratio")) or Decimal("0.5")
+    ret_from_start = snapshot.direction_ret_from_start or snapshot.ret_from_start
+    ret_1m = snapshot.direction_ret_1m or snapshot.ret_1m
+    sample_weight_60 = Decimal(min(max(sample_60, 0), 60)) / Decimal("60")
+    sample_weight_180 = Decimal(min(max(sample_180, 0), 180)) / Decimal("180")
+    sample_weight_start = Decimal(min(max(sample_start, 0), 120)) / Decimal("120")
+    flow_score = (
+        imbalance_60 * Decimal("0.55") * sample_weight_60
+        + imbalance_180 * Decimal("0.25") * sample_weight_180
+        + imbalance_start * Decimal("0.20") * sample_weight_start
+        + (buy_ratio_60 - Decimal("0.5")) * Decimal("0.35") * sample_weight_60
+    )
+    price_score = (
+        clamp_decimal(ret_1m * Decimal("100"), Decimal("-0.12"), Decimal("0.12"))
+        + clamp_decimal(ret_from_start * Decimal("80"), Decimal("-0.12"), Decimal("0.12"))
+    )
+    score = flow_score + price_score
+    if not available:
+        score = (snapshot.up_probability - Decimal("0.5")) * Decimal("0.5")
+    if score >= BTC_FLOW_SCORE_THRESHOLD:
+        outcome = "Up"
+    elif score <= -BTC_FLOW_SCORE_THRESHOLD:
+        outcome = "Down"
+    else:
+        outcome = "Up" if snapshot.up_probability >= Decimal("0.5") else "Down"
+    confidence = clamp_decimal(abs(score) * BTC_FLOW_CONFIDENCE_SCALE, Decimal("0"), Decimal("1"))
+    return {
+        "source": "binance_trade_flow" if available else "probability_fallback",
+        "available": available,
+        "outcome": outcome,
+        "score": score.quantize(Decimal("0.0001")),
+        "confidence": confidence.quantize(Decimal("0.0001")),
+        "threshold": BTC_FLOW_SCORE_THRESHOLD,
+        "supports_up": outcome == "Up",
+        "supports_down": outcome == "Down",
+        "flow_score": flow_score.quantize(Decimal("0.0001")),
+        "price_score": price_score.quantize(Decimal("0.0001")),
+        "sample_seconds_60": sample_60,
+        "sample_seconds_180": sample_180,
+        "sample_seconds_from_start": sample_start,
+        "trade_count": trade_count,
+        "taker_imbalance_60": imbalance_60,
+        "taker_imbalance_180": imbalance_180,
+        "taker_imbalance_from_start": imbalance_start,
+        "taker_buy_ratio_60": buy_ratio_60,
+        "taker_buy_volume_60_btc": optional_decimal(window_60.get("taker_buy_volume_btc")) or Decimal("0"),
+        "taker_sell_volume_60_btc": optional_decimal(window_60.get("taker_sell_volume_btc")) or Decimal("0"),
+        "ret_from_start": ret_from_start,
+        "ret_1m": ret_1m,
+    }
+
+
+def btc_flow_alignment(outcome: str, btc_flow: Optional[Dict[str, Any]]) -> Decimal:
+    flow_outcome = str((btc_flow or {}).get("outcome") or "")
+    if flow_outcome == outcome:
+        return Decimal("1")
+    if flow_outcome in {"Up", "Down"}:
+        return Decimal("-1")
+    return Decimal("0")
 
 
 def json_safe(value: Any) -> Any:
@@ -4524,19 +4712,20 @@ def estimate_up_probability_components(
         imbalance_start = optional_decimal(from_start.get("taker_imbalance")) or Decimal("0")
         buy_ratio_60 = optional_decimal(window_60.get("taker_buy_ratio")) or Decimal("0.5")
         sample_60 = min(max(int(window_60.get("sample_seconds") or 0), 0), 60) / 60.0
+        sample_180 = min(max(int(window_180.get("sample_seconds") or 0), 0), 180) / 180.0
         sample_start = min(max(int(from_start.get("sample_seconds") or 0), 0), 90) / 90.0
         order_flow_score = (
-            float(imbalance_60) * 0.24 * sample_60
-            + float(imbalance_180) * 0.10
-            + float(imbalance_start) * 0.08 * sample_start
-            + float(buy_ratio_60 - Decimal("0.5")) * 0.18 * sample_60
+            float(imbalance_60) * 0.38 * sample_60
+            + float(imbalance_180) * 0.16 * sample_180
+            + float(imbalance_start) * 0.14 * sample_start
+            + float(buy_ratio_60 - Decimal("0.5")) * 0.28 * sample_60
         )
         quote_volume_60 = optional_decimal(window_60.get("quote_volume_usdt")) or Decimal("0")
         trade_count_60 = Decimal(str(int(window_60.get("trade_count") or 0)))
         if quote_volume_60 > 0 and trade_count_60 > 0:
             volume_factor = min(math.log(max(float(quote_volume_60), 1.0)) / 16.0, 1.0)
             momentum_direction = 1.0 if ret_from_start >= 0 else -1.0
-            volume_score = volume_factor * float(imbalance_60) * momentum_direction * 0.05
+            volume_score = volume_factor * float(imbalance_60) * momentum_direction * 0.08
     score = price_score + order_flow_score + volume_score
     probability = 1.0 / (1.0 + math.exp(-score))
     probability = min(max(probability, 0.03), 0.97)
