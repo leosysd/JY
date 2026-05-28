@@ -41,6 +41,11 @@ TARGET_STYLE_PROBE_MIN_ASK = Decimal("0.50")
 TARGET_STYLE_FOLLOW_MIN_ASK = Decimal("0.55")
 TARGET_STYLE_PROBABILITY_MARGIN = Decimal("0.52")
 TARGET_STYLE_SAME_SIDE_MIN_PRICE_MOVE = Decimal("0.03")
+MATRIX_REBALANCE_MIN_PROBABILITY = Decimal("0.50")
+REBALANCE_MIN_EDGE = Decimal("0")
+MOMENTUM_MAX_NEGATIVE_EDGE = Decimal("-0.18")
+TAIL_VALUE_MIN_PRICE = Decimal("0.25")
+TAIL_VALUE_MIN_PROBABILITY = Decimal("0.48")
 RULE_SIGNAL_WEIGHTS: Dict[str, Decimal] = {
     "edge": Decimal("0.8"),
     "expected_efficiency": Decimal("1.0"),
@@ -2782,6 +2787,8 @@ class PolymarketQuantBot:
         expected_gain = expected_after - expected_before
         notional = max(position_after["total_cost"] - position_before["total_cost"], Decimal("0.000001"))
         expected_efficiency = expected_gain / notional
+        effective_price = decision_effective_price(decision)
+        probability_advantage = decision.probability - effective_price
         pnl_gap_before = abs(position_before["up_pnl"] - position_before["down_pnl"])
         pnl_gap = abs(position_after["up_pnl"] - position_after["down_pnl"])
         gap_improvement = pnl_gap_before - pnl_gap
@@ -2815,6 +2822,16 @@ class PolymarketQuantBot:
         market_consensus_side = decision.best_ask >= TARGET_STYLE_PROBE_MIN_ASK
         model_confirms_side = decision.probability >= TARGET_STYLE_PROBABILITY_MARGIN
         target_style_follow = is_favorite or market_consensus_side or model_confirms_side
+        tail_probability_overfit = (
+            effective_price < TAIL_VALUE_MIN_PRICE
+            and decision.probability < TAIL_VALUE_MIN_PROBABILITY
+            and not would_lock
+        )
+        momentum_too_expensive = (
+            target_style_follow
+            and decision.edge < MOMENTUM_MAX_NEGATIVE_EDGE
+            and not would_lock
+        )
         would_balance_into_locked_loss = (
             is_rebalance
             and both_negative_after
@@ -2831,6 +2848,18 @@ class PolymarketQuantBot:
                     position_after["down_pnl"],
                     gap_improvement,
                     improvement,
+                    -position_after["total_cost"],
+                ),
+            )
+        if tail_probability_overfit:
+            return (
+                "tail_probability_overfit",
+                (
+                    Decimal("0"),
+                    decision.probability,
+                    effective_price,
+                    probability_advantage,
+                    expected_gain,
                     -position_after["total_cost"],
                 ),
             )
@@ -2862,6 +2891,19 @@ class PolymarketQuantBot:
                     ),
                 )
             if expected_gain > 0 and position_after["best_pnl"] > 0:
+                if decision.probability < MATRIX_REBALANCE_MIN_PROBABILITY:
+                    return (
+                        "matrix_probability_mismatch",
+                        (
+                            Decimal("0"),
+                            decision.probability,
+                            effective_price,
+                            expected_gain,
+                            improvement,
+                            position_after["worst_pnl"],
+                            -position_after["total_cost"],
+                        ),
+                    )
                 return (
                     "matrix_risk_reduction",
                     (
@@ -2872,6 +2914,19 @@ class PolymarketQuantBot:
                         position_after["best_pnl"],
                         gap_improvement,
                         decision.edge,
+                        -position_after["total_cost"],
+                    ),
+                )
+            if expected_gain < 0 or decision.edge < REBALANCE_MIN_EDGE:
+                return (
+                    "rebalance_negative_ev",
+                    (
+                        Decimal("0"),
+                        expected_gain,
+                        decision.edge,
+                        improvement,
+                        gap_improvement,
+                        position_after["worst_pnl"],
                         -position_after["total_cost"],
                     ),
                 )
@@ -2993,6 +3048,18 @@ class PolymarketQuantBot:
                 ),
             )
         if inventory_lock and is_rebalance and gap_improvement > 0:
+            if expected_gain < 0:
+                return (
+                    "inventory_lock_negative_ev",
+                    (
+                        Decimal("0"),
+                        expected_gain,
+                        improvement,
+                        gap_improvement,
+                        position_after["worst_pnl"],
+                        -position_after["total_cost"],
+                    ),
+                )
             return (
                 "inventory_lock",
                 (
@@ -3022,7 +3089,7 @@ class PolymarketQuantBot:
             is_rebalance
             and improvement > 0
             and gap_improvement > 0
-            and expected_gain >= -(notional * Decimal("0.20"))
+            and expected_gain >= 0
         ):
             return (
                 "rebalance_worst_side",
@@ -3032,6 +3099,18 @@ class PolymarketQuantBot:
                     gap_improvement,
                     expected_after,
                     -pnl_gap,
+                    -position_after["total_cost"],
+                ),
+            )
+        if momentum_too_expensive:
+            return (
+                "momentum_overpriced_negative_ev",
+                (
+                    Decimal("0"),
+                    decision.edge,
+                    decision.probability,
+                    effective_price,
+                    expected_gain,
                     -position_after["total_cost"],
                 ),
             )
@@ -3679,6 +3758,8 @@ def lock_rule_learning_payload(
     gap_improvement = pnl_gap_before - pnl_gap_after
     expected_gain = expected_after - expected_before
     price_impact = max(decision_effective_price(decision) - decision.best_ask, Decimal("0"))
+    effective_price = decision_effective_price(decision)
+    incremental_win_pnl = decision.size - total_cost
     is_rebalance = (
         (decision.outcome == "Up" and position_before["up_size"] < position_before["down_size"])
         or (decision.outcome == "Down" and position_before["down_size"] < position_before["up_size"])
@@ -3693,6 +3774,11 @@ def lock_rule_learning_payload(
         "rebalance_bonus": Decimal("1") if is_rebalance else Decimal("0"),
         "momentum_bonus": Decimal("1") if momentum else Decimal("0"),
         "price_impact_penalty": price_impact,
+        "outcome_probability": decision.probability,
+        "break_even_probability": effective_price,
+        "probability_advantage": decision.probability - effective_price,
+        "incremental_win_pnl": incremental_win_pnl,
+        "incremental_loss_pnl": -total_cost,
     }
     weighted_score = sum(signals[key] * RULE_SIGNAL_WEIGHTS[key] for key in RULE_SIGNAL_WEIGHTS)
     return {
