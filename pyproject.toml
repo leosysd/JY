@@ -19,6 +19,7 @@ dependencies = [
 jy = "polymarket_copy.cli:main"
 jy-cli = "polymarket_copy.cli:main"
 polymarket-copy-bot = "polymarket_copy.bot:main"
+jy-codex-telegram = "polymarket_copy.codex_telegram:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
