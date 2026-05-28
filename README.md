@@ -241,7 +241,14 @@ jy service restart
 ```bash
 jy quant-data summary
 jy quant-data tail --lines 10
+jy quant-data trades --limit 80
+jy quant-data hourly
+jy quant-data review --limit 80
 ```
+
+新版本会在 `quant_signals.jsonl` 里额外记录 `time_window` 和 `shadow_strategies`：
+- `time_window`：标记当前距离结算的窗口，例如 T-60/T-30/T-20/T-10/T-5/T-2。
+- `shadow_strategies`：只做纸面比较，记录方向跟随、概率跟随、纯双边套利检测的真实盘口成本，不会改变实盘下单。
 
 量化数据默认写入：
 

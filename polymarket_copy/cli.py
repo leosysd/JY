@@ -10,7 +10,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -967,6 +967,9 @@ def summarize_quant_data(config_path: Path) -> None:
     latest: Optional[Dict[str, object]] = None
     latest_bankroll: Optional[Dict[str, object]] = None
     latest_position: Optional[Dict[str, object]] = None
+    window_counts: Counter[str] = Counter()
+    shadow_direction_counts: Counter[str] = Counter()
+    shadow_pair_counts: Counter[str] = Counter()
     invalid_lines = 0
 
     for line in data_file.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -1000,6 +1003,20 @@ def summarize_quant_data(config_path: Path) -> None:
         position = record.get("position_after")
         if isinstance(position, dict):
             latest_position = position
+        time_window = record.get("time_window")
+        if isinstance(time_window, dict):
+            window_counts[str(time_window.get("bucket") or "unknown")] += 1
+        shadow = record.get("shadow_strategies")
+        if isinstance(shadow, dict):
+            direction_follow = shadow.get("direction_follow")
+            if isinstance(direction_follow, dict) and direction_follow.get("executable"):
+                shadow_direction_counts[str(direction_follow.get("outcome") or "unknown")] += 1
+            pure_pair = shadow.get("pure_pair")
+            if isinstance(pure_pair, dict):
+                pair_key = "executable" if pure_pair.get("executable") else str(
+                    pure_pair.get("skip_reason") or "not_executable"
+                )
+                shadow_pair_counts[pair_key] += 1
 
     total = sum(action_counts.values())
     print(f"总记录: {total}")
@@ -1018,6 +1035,18 @@ def summarize_quant_data(config_path: Path) -> None:
         print("选择方向:")
         for outcome, count in outcome_counts.most_common():
             print(f"  {outcome}: {count}")
+    if window_counts:
+        print("Shadow window records:")
+        for bucket, count in window_counts.most_common():
+            print(f"  {bucket}: {count}")
+    if shadow_direction_counts:
+        print("Shadow direction-follow executable:")
+        for outcome, count in shadow_direction_counts.most_common():
+            print(f"  {outcome}: {count}")
+    if shadow_pair_counts:
+        print("Shadow pure-pair checks:")
+        for key, count in shadow_pair_counts.most_common():
+            print(f"  {key}: {count}")
     if latest_bankroll:
         print("当前模拟资金:")
         print(f"  已结算盈亏 realized_pnl={latest_bankroll.get('realized_pnl')}")
@@ -1061,6 +1090,242 @@ def summarize_quant_data(config_path: Path) -> None:
                 f"{selected.get('outcome')} edge={selected.get('edge')} "
                 f"price={selected.get('best_ask')}"
             )
+
+
+def _load_quant_state(config_path: Path) -> Dict[str, Any]:
+    state_file = configured_quant_state_file(config_path)
+    if not state_file.exists():
+        print(f"[INFO] quant state not found: {state_file}")
+        return {}
+    try:
+        data = json.loads(state_file.read_text(encoding="utf-8", errors="replace"))
+    except json.JSONDecodeError as exc:
+        print(f"[ERROR] invalid quant state JSON: {state_file} {exc}")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _lock_markets_from_state(config_path: Path) -> Dict[str, Dict[str, Any]]:
+    data = _load_quant_state(config_path)
+    markets = data.get("lock_markets")
+    if not isinstance(markets, dict):
+        return {}
+    return {str(slug): entry for slug, entry in markets.items() if isinstance(entry, dict)}
+
+
+def _position_from_state_trades(trades: List[Any]) -> Dict[str, float]:
+    up_size = down_size = up_cost = down_cost = 0.0
+    up_fee = down_fee = 0.0
+    trade_count = 0
+    for trade in trades:
+        if not isinstance(trade, dict):
+            continue
+        outcome = str(trade.get("outcome") or "")
+        size = _num(trade.get("size")) or 0.0
+        cost = _num(trade.get("total_cost"))
+        if cost is None:
+            cost = _num(trade.get("cost"))
+        if cost is None:
+            price = _num(trade.get("effective_price")) or _num(trade.get("limit_price")) or 0.0
+            cost = size * price
+        fee = _num(trade.get("fee")) or 0.0
+        if size <= 0 or cost <= 0:
+            continue
+        trade_count += 1
+        if outcome == "Up":
+            up_size += size
+            up_cost += cost
+            up_fee += fee
+        elif outcome == "Down":
+            down_size += size
+            down_cost += cost
+            down_fee += fee
+    total_cost = up_cost + down_cost
+    up_pnl = up_size - total_cost
+    down_pnl = down_size - total_cost
+    return {
+        "up_size": up_size,
+        "down_size": down_size,
+        "up_cost": up_cost,
+        "down_cost": down_cost,
+        "total_cost": total_cost,
+        "up_fee": up_fee,
+        "down_fee": down_fee,
+        "total_fee": up_fee + down_fee,
+        "up_pnl": up_pnl,
+        "down_pnl": down_pnl,
+        "worst_pnl": min(up_pnl, down_pnl),
+        "best_pnl": max(up_pnl, down_pnl),
+        "trade_count": trade_count,
+    }
+
+
+def _entry_winner(entry: Dict[str, Any]) -> str:
+    return str(entry.get("winning_outcome") or "")
+
+
+def _entry_realized_pnl(entry: Dict[str, Any], position: Dict[str, float]) -> Optional[float]:
+    winner = _entry_winner(entry)
+    if winner == "Up":
+        return position["up_pnl"]
+    if winner == "Down":
+        return position["down_pnl"]
+    value = _num(entry.get("realized_pnl"))
+    return value
+
+
+def print_quant_trades_table(config_path: Path, limit: int = 80) -> None:
+    markets = _lock_markets_from_state(config_path)
+    rows: List[Dict[str, Any]] = []
+    for slug, entry in markets.items():
+        trades = entry.get("trades")
+        if not isinstance(trades, list):
+            continue
+        for trade in trades:
+            if not isinstance(trade, dict):
+                continue
+            rows.append(
+                {
+                    "ts": int(_num(trade.get("ts")) or 0),
+                    "slug": slug,
+                    "outcome": str(trade.get("outcome") or ""),
+                    "size": _num(trade.get("size")),
+                    "best_ask": _num(trade.get("best_ask")),
+                    "effective": _num(trade.get("effective_price")),
+                    "fee": _num(trade.get("fee")),
+                    "cost": _num(trade.get("total_cost")) or _num(trade.get("cost")),
+                    "seconds_left": _num(trade.get("seconds_left")),
+                    "reason": str(trade.get("reason") or ""),
+                    "status": str(trade.get("status") or ""),
+                    "mode": str(trade.get("mode") or ""),
+                }
+            )
+    rows.sort(key=lambda item: item["ts"])
+    if limit > 0:
+        rows = rows[-limit:]
+    print(f"[DATA] quant trades: {sum(len(e.get('trades') or []) for e in markets.values())}")
+    header = (
+        f"{'#':>3} {'time_utc':<14} {'market':<28} {'mode':<7} {'status':<8} "
+        f"{'dir':<5} {'size':>8} {'best':>7} {'eff':>7} {'fee':>8} {'cost':>9} {'left':>5} reason"
+    )
+    print(header)
+    print("-" * len(header))
+    for idx, row in enumerate(rows, 1):
+        time_text = "-"
+        if row["ts"]:
+            time_text = datetime.fromtimestamp(row["ts"], tz=timezone.utc).strftime("%m-%d %H:%M:%S")
+        print(
+            f"{idx:>3} {time_text:<14} {row['slug'][-28:]:<28} {row['mode']:<7} {row['status']:<8} "
+            f"{row['outcome']:<5} {_fmt_size(row['size']):>8} {_fmt_price(row['best_ask']):>7} "
+            f"{_fmt_price(row['effective']):>7} {_fmt_usd(row['fee']):>8} {_fmt_usd(row['cost']):>9} "
+            f"{_fmt_size(row['seconds_left']):>5} {row['reason'][:64]}"
+        )
+
+
+def print_quant_hourly_pnl(config_path: Path) -> None:
+    markets = _lock_markets_from_state(config_path)
+    hourly: Dict[str, Dict[str, float]] = defaultdict(
+        lambda: {
+            "markets": 0.0,
+            "settled": 0.0,
+            "trades": 0.0,
+            "cost": 0.0,
+            "fee": 0.0,
+            "pnl": 0.0,
+            "worst_unsettled": 0.0,
+        }
+    )
+    for entry in markets.values():
+        trades = entry.get("trades")
+        if not isinstance(trades, list) or not trades:
+            continue
+        start_ts = int(_num(entry.get("start_ts")) or 0)
+        hour = datetime.fromtimestamp(start_ts or int(_num(trades[0].get("ts")) or 0), tz=timezone.utc).strftime(
+            "%m-%d %H:00"
+        )
+        position = _position_from_state_trades(trades)
+        bucket = hourly[hour]
+        bucket["markets"] += 1
+        bucket["trades"] += position["trade_count"]
+        bucket["cost"] += position["total_cost"]
+        bucket["fee"] += position["total_fee"]
+        pnl = _entry_realized_pnl(entry, position)
+        if pnl is None:
+            bucket["worst_unsettled"] += position["worst_pnl"]
+        else:
+            bucket["settled"] += 1
+            bucket["pnl"] += pnl
+    print("[DATA] hourly quant PnL by market start time (UTC)")
+    header = f"{'hour':<14} {'markets':>7} {'settled':>7} {'trades':>7} {'cost':>10} {'fee':>9} {'pnl':>10} {'unsettled_worst':>16}"
+    print(header)
+    print("-" * len(header))
+    for hour in sorted(hourly):
+        row = hourly[hour]
+        print(
+            f"{hour:<14} {int(row['markets']):>7} {int(row['settled']):>7} {int(row['trades']):>7} "
+            f"{row['cost']:>10.4f} {row['fee']:>9.4f} {row['pnl']:>10.4f} {row['worst_unsettled']:>16.4f}"
+        )
+
+
+def print_quant_review_table(config_path: Path, limit: int = 80) -> None:
+    markets = _lock_markets_from_state(config_path)
+    rows: List[Dict[str, Any]] = []
+    for slug, entry in markets.items():
+        trades = entry.get("trades")
+        if not isinstance(trades, list) or not trades:
+            continue
+        position = _position_from_state_trades(trades)
+        winner = _entry_winner(entry)
+        realized = _entry_realized_pnl(entry, position)
+        first_reason = ""
+        last_reason = ""
+        if isinstance(trades[0], dict):
+            first_reason = str(trades[0].get("reason") or "")
+        if isinstance(trades[-1], dict):
+            last_reason = str(trades[-1].get("reason") or "")
+        rows.append(
+            {
+                "start_ts": int(_num(entry.get("start_ts")) or 0),
+                "end_ts": int(_num(entry.get("end_ts")) or 0),
+                "slug": slug,
+                "trade_count": position["trade_count"],
+                "up_size": position["up_size"],
+                "down_size": position["down_size"],
+                "total_cost": position["total_cost"],
+                "fee": position["total_fee"],
+                "up_pnl": position["up_pnl"],
+                "down_pnl": position["down_pnl"],
+                "worst_pnl": position["worst_pnl"],
+                "winner": winner or "open",
+                "realized": realized,
+                "first_reason": first_reason,
+                "last_reason": last_reason,
+            }
+        )
+    rows.sort(key=lambda item: item["start_ts"])
+    if limit > 0:
+        rows = rows[-limit:]
+    print("[DATA] quant market review")
+    header = (
+        f"{'#':>3} {'market_utc':<17} {'trades':>6} {'up':>9} {'down':>9} {'cost':>10} "
+        f"{'fee':>9} {'winner':<6} {'realized':>10} {'up_pnl':>10} {'down_pnl':>10} {'worst':>10} reason"
+    )
+    print(header)
+    print("-" * len(header))
+    for idx, row in enumerate(rows, 1):
+        market_time = "-"
+        if row["start_ts"]:
+            start = datetime.fromtimestamp(row["start_ts"], tz=timezone.utc)
+            end_ts = int(row.get("end_ts") or 0) or (row["start_ts"] + 300)
+            end = datetime.fromtimestamp(end_ts, tz=timezone.utc)
+            market_time = f"{start:%m-%d %H:%M}-{end:%H:%M}"
+        print(
+            f"{idx:>3} {market_time:<17} {int(row['trade_count']):>6} "
+            f"{row['up_size']:>9.2f} {row['down_size']:>9.2f} {row['total_cost']:>10.4f} "
+            f"{row['fee']:>9.4f} {row['winner']:<6} {_fmt_usd(row['realized']):>10} "
+            f"{_fmt_usd(row['up_pnl']):>10} {_fmt_usd(row['down_pnl']):>10} {_fmt_usd(row['worst_pnl']):>10} "
+            f"{row['last_reason'][:48] or row['first_reason'][:48]}"
+        )
 
 
 def _num(value: object) -> Optional[float]:
@@ -1554,6 +1819,9 @@ def local_interactive_menu(config_path: Path = Path(".env")) -> None:
         print("24. 应用 JetFadil 风格量化预设")
         print("25. 查看盘口走势表")
         print("26. 查看目标真实历史成交")
+        print("27. 查看 AI量化每笔模拟买入")
+        print("28. 查看 AI量化每小时盈亏")
+        print("29. 查看 AI量化每场复盘")
         print("0. 退出")
         choice = input("请选择: ").strip()
         try:
@@ -1626,6 +1894,12 @@ def local_interactive_menu(config_path: Path = Path(".env")) -> None:
                 print_quant_trace_table(config_path)
             elif choice == "26":
                 print_target_history_table(config_path)
+            elif choice == "27":
+                print_quant_trades_table(config_path)
+            elif choice == "28":
+                print_quant_hourly_pnl(config_path)
+            elif choice == "29":
+                print_quant_review_table(config_path)
             elif choice == "0":
                 return
             else:
@@ -1741,7 +2015,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_app_logs.add_argument("--no-follow", action="store_true", help="tail 时只打印末尾日志，不持续跟随")
 
     p_quant_data = sub.add_parser("quant-data", help="查看或清空 AI量化结构化数据")
-    p_quant_data.add_argument("action", choices=["summary", "tail", "clear", "path", "table"])
+    p_quant_data.add_argument(
+        "action",
+        choices=["summary", "tail", "clear", "path", "table", "trades", "hourly", "review"],
+    )
     p_quant_data.add_argument("--config", default=".env")
     p_quant_data.add_argument("--lines", type=int, default=20)
     p_quant_data.add_argument("--entry-minute", type=int, default=1)
@@ -2047,6 +2324,12 @@ def main(argv: Optional[List[str]] = None) -> None:
             print(configured_quant_signal_file(config_path))
         elif args.action == "table":
             print_quant_trace_table(config_path, entry_minute=args.entry_minute, limit=args.limit)
+        elif args.action == "trades":
+            print_quant_trades_table(config_path, limit=args.limit)
+        elif args.action == "hourly":
+            print_quant_hourly_pnl(config_path)
+        elif args.action == "review":
+            print_quant_review_table(config_path, limit=args.limit)
     elif args.command == "target-history":
         print_target_history_table(Path(args.config), limit=args.limit)
     elif args.command == "install":

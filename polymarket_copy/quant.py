@@ -56,6 +56,8 @@ RULE_SIGNAL_WEIGHTS: Dict[str, Decimal] = {
     "momentum_bonus": Decimal("-1.2"),
     "price_impact_penalty": Decimal("-1.2"),
 }
+SHADOW_WINDOWS_SEC: Tuple[int, ...] = (60, 30, 20, 10, 5, 2)
+SHADOW_WINDOW_CAPTURE_TOLERANCE_SEC = 3
 
 
 @dataclass(frozen=True)
@@ -803,6 +805,7 @@ class PolymarketQuantBot:
         self.last_log_ts = 0.0
         self.started_at_ts = int(time.time())
         self.first_allowed_market_start_ts = next_market_boundary(self.started_at_ts)
+        self.shadow_window_seen: set[str] = set()
 
     def run_forever(self) -> None:
         errors, warnings = validate_config(self.config, require_private_key=not self.config.dry_run)
@@ -1474,6 +1477,163 @@ class PolymarketQuantBot:
             elif total_cost >= guaranteed_payout:
                 asks["pair_skip_reason"] = "ask_plus_fee_not_profitable"
         return asks
+
+    def time_window_payload(self, market: QuantMarket) -> Dict[str, Any]:
+        seconds_left = market.seconds_left
+        elapsed_sec = max(0, int(time.time()) - market.start_ts)
+        nearest_window = min(SHADOW_WINDOWS_SEC, key=lambda window: abs(seconds_left - window))
+        in_capture_window = abs(seconds_left - nearest_window) <= SHADOW_WINDOW_CAPTURE_TOLERANCE_SEC
+        return {
+            "elapsed_sec": elapsed_sec,
+            "seconds_left": seconds_left,
+            "nearest_window_sec": nearest_window,
+            "bucket": f"T-{nearest_window}s" if in_capture_window else "live",
+            "in_capture_window": in_capture_window,
+            "scheduled_windows_sec": list(SHADOW_WINDOWS_SEC),
+        }
+
+    def should_force_shadow_window_record(self, market: QuantMarket) -> bool:
+        seconds_left = market.seconds_left
+        for window in SHADOW_WINDOWS_SEC:
+            if 0 <= window - seconds_left <= SHADOW_WINDOW_CAPTURE_TOLERANCE_SEC:
+                key = f"{market.slug}:T-{window}s"
+                if key not in self.shadow_window_seen:
+                    self.shadow_window_seen.add(key)
+                    return True
+        return False
+
+    def shadow_strategy_payload(
+        self,
+        market: QuantMarket,
+        snapshot: BtcSnapshot,
+        position_before: Dict[str, Decimal],
+        market_snapshot: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        up_probability = min(max(snapshot.up_probability, Decimal("0")), Decimal("1"))
+        direction_current = snapshot.direction_current or snapshot.current
+        direction_start = snapshot.direction_start_price or snapshot.start_price
+        if direction_current > direction_start:
+            direction_outcome = "Up"
+        elif direction_current < direction_start:
+            direction_outcome = "Down"
+        else:
+            direction_outcome = "Up" if up_probability >= Decimal("0.5") else "Down"
+        probability_outcome = "Up" if up_probability >= Decimal("0.5") else "Down"
+
+        up_entry = self.shadow_single_entry("Up", up_probability, position_before, market_snapshot)
+        down_entry = self.shadow_single_entry("Down", Decimal("1") - up_probability, position_before, market_snapshot)
+        single_entries = [entry for entry in (up_entry, down_entry) if entry]
+        by_outcome = {str(entry["outcome"]): entry for entry in single_entries}
+        return {
+            "mode": "shadow_only",
+            "description": "paper comparison only; does not change live orders",
+            "direction_source": snapshot.direction_source or snapshot.source,
+            "direction_outcome": direction_outcome,
+            "probability_outcome": probability_outcome,
+            "direction_follow": by_outcome.get(direction_outcome),
+            "probability_follow": by_outcome.get(probability_outcome),
+            "single_candidates": single_entries,
+            "pure_pair": self.shadow_pair_entry(market_snapshot),
+        }
+
+    def shadow_single_entry(
+        self,
+        outcome: str,
+        probability: Decimal,
+        position_before: Dict[str, Decimal],
+        market_snapshot: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        prefix = "up" if outcome == "Up" else "down"
+        fill = market_snapshot.get(f"{prefix}_ask_fill")
+        if not isinstance(fill, dict):
+            return {
+                "strategy": f"single_{outcome.lower()}",
+                "outcome": outcome,
+                "probability": probability,
+                "executable": False,
+                "skip_reason": "missing_fill",
+            }
+        filled_size = state_decimal(fill.get("filled_size"))
+        total_cost = state_decimal(fill.get("total_cost"))
+        effective_price = state_decimal(fill.get("effective_price"))
+        complete = bool(fill.get("complete"))
+        executable = complete and filled_size > 0 and total_cost > 0
+        position_after = position_before
+        if executable:
+            position_after = lock_position_after_trade(
+                position_before,
+                outcome,
+                filled_size,
+                state_decimal(fill.get("limit_price")),
+                state_decimal(fill.get("notional")),
+                state_decimal(fill.get("fee")),
+                total_cost,
+            )
+        return {
+            "strategy": f"single_{outcome.lower()}",
+            "outcome": outcome,
+            "probability": probability,
+            "ask_price": state_decimal(market_snapshot.get(f"{prefix}_ask")),
+            "effective_price": effective_price,
+            "break_even_probability": effective_price,
+            "probability_advantage": probability - effective_price,
+            "filled_size": filled_size,
+            "requested_size": state_decimal(fill.get("requested_size")),
+            "depth_available": state_decimal(fill.get("depth_available")),
+            "fee": state_decimal(fill.get("fee")),
+            "total_cost": total_cost,
+            "win_pnl": filled_size - total_cost,
+            "loss_pnl": -total_cost,
+            "executable": executable,
+            "skip_reason": "" if executable else "insufficient_depth",
+            "position_after": lock_position_payload(position_after),
+        }
+
+    def shadow_pair_entry(self, market_snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        up_fill = market_snapshot.get("up_ask_fill")
+        down_fill = market_snapshot.get("down_ask_fill")
+        if not isinstance(up_fill, dict) or not isinstance(down_fill, dict):
+            return {"strategy": "pure_pair", "executable": False, "skip_reason": "missing_fill"}
+
+        up_size = state_decimal(up_fill.get("filled_size"))
+        down_size = state_decimal(down_fill.get("filled_size"))
+        paired_size = min(up_size, down_size)
+        if paired_size <= 0:
+            return {"strategy": "pure_pair", "executable": False, "skip_reason": "insufficient_depth"}
+
+        up_cost, up_fee = scale_fill_cost(up_fill, paired_size)
+        down_cost, down_fee = scale_fill_cost(down_fill, paired_size)
+        total_cost = quantize_money(up_cost + down_cost)
+        guaranteed_payout = paired_size
+        locked_profit = quantize_money(guaranteed_payout - total_cost)
+        complete = bool(up_fill.get("complete")) and bool(down_fill.get("complete"))
+        if not complete:
+            skip_reason = "insufficient_depth"
+        elif locked_profit <= 0:
+            skip_reason = "ask_plus_fee_not_profitable"
+        else:
+            skip_reason = ""
+        return {
+            "strategy": "pure_pair",
+            "up_ask_price": state_decimal(market_snapshot.get("up_ask")),
+            "down_ask_price": state_decimal(market_snapshot.get("down_ask")),
+            "up_effective_price": state_decimal(up_fill.get("effective_price")),
+            "down_effective_price": state_decimal(down_fill.get("effective_price")),
+            "sum_effective_price": (
+                state_decimal(up_fill.get("effective_price"))
+                + state_decimal(down_fill.get("effective_price"))
+            ),
+            "up_fee": up_fee,
+            "down_fee": down_fee,
+            "up_depth": state_decimal(up_fill.get("depth_available")),
+            "down_depth": state_decimal(down_fill.get("depth_available")),
+            "paired_size": paired_size,
+            "total_cost": total_cost,
+            "guaranteed_payout": guaranteed_payout,
+            "locked_profit": locked_profit,
+            "executable": complete and locked_profit > 0,
+            "skip_reason": skip_reason,
+        }
 
     def make_lock_decision(
         self,
@@ -3226,6 +3386,7 @@ class PolymarketQuantBot:
         now = datetime.now(timezone.utc)
         if market_snapshot is None:
             market_snapshot = self.lock_loop_snapshot(market, position_before)
+        force = force or self.should_force_shadow_window_record(market)
         record: Dict[str, Any] = {
             "ts": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
             "unix_ts": int(now.timestamp()),
@@ -3276,7 +3437,14 @@ class PolymarketQuantBot:
             "position_after": lock_position_payload(position_after),
             "bankroll_before": lock_bankroll_payload(bankroll_before),
             "bankroll_after": lock_bankroll_payload(bankroll_after),
+            "time_window": self.time_window_payload(market),
             "market_snapshot": market_snapshot,
+            "shadow_strategies": self.shadow_strategy_payload(
+                market,
+                snapshot,
+                position_before,
+                market_snapshot,
+            ),
             "config": {
                 "size_mode": self.config.quant_size_mode,
                 "order_usdc": self.config.quant_order_usdc,
@@ -3312,6 +3480,9 @@ class PolymarketQuantBot:
         force: bool = False,
     ) -> None:
         now = datetime.now(timezone.utc)
+        base_position = base_lock_position()
+        market_snapshot = self.lock_loop_snapshot(market, base_position)
+        force = force or self.should_force_shadow_window_record(market)
         record: Dict[str, Any] = {
             "ts": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
             "unix_ts": int(now.timestamp()),
@@ -3357,7 +3528,14 @@ class PolymarketQuantBot:
                     "ret_3m": snapshot.direction_ret_3m or snapshot.ret_3m,
                 },
             },
-            "market_snapshot": self.lock_loop_snapshot(market, base_lock_position()),
+            "time_window": self.time_window_payload(market),
+            "market_snapshot": market_snapshot,
+            "shadow_strategies": self.shadow_strategy_payload(
+                market,
+                snapshot,
+                base_position,
+                market_snapshot,
+            ),
             "config": {
                 "strategy": self.config.quant_strategy,
                 "size_mode": self.config.quant_size_mode,
@@ -3639,6 +3817,16 @@ def fill_payload(fill: BookFill) -> Dict[str, Any]:
         "price_source": "orderbook_asks",
         "complete": fill.complete,
     }
+
+
+def scale_fill_cost(fill: Dict[str, Any], size: Decimal) -> Tuple[Decimal, Decimal]:
+    filled_size = state_decimal(fill.get("filled_size"))
+    if filled_size <= 0 or size <= 0:
+        return Decimal("0"), Decimal("0")
+    ratio = size / filled_size
+    total_cost = quantize_money(state_decimal(fill.get("total_cost")) * ratio)
+    fee = quantize_money(state_decimal(fill.get("fee")) * ratio)
+    return total_cost, fee
 
 
 def estimate_taker_fee(size: Decimal, price: Decimal) -> Decimal:
