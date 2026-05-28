@@ -50,6 +50,12 @@ BTC_FLOW_INITIAL_SCORE = Decimal("2.4")
 BTC_FLOW_INITIAL_FALLBACK_SCORE = Decimal("1.1")
 BTC_FLOW_LADDER_SCORE = Decimal("2.6")
 BTC_FLOW_UNCONFIRMED_LADDER_SCORE = Decimal("0.9")
+JET_MATRIX_REBALANCE_SCORE = Decimal("3.4")
+JET_MATRIX_TAIL_REPAIR_SCORE = Decimal("2.7")
+JET_DIRECTIONAL_BIAS_SCORE = Decimal("1.5")
+JET_DIRECTIONAL_OVER_SKEW_SCORE = Decimal("0")
+JET_DIRECTIONAL_SKEW_BASE_ORDERS = Decimal("1.5")
+JET_DIRECTIONAL_SKEW_CONF_ORDERS = Decimal("3.0")
 MATRIX_REBALANCE_MIN_PROBABILITY = Decimal("0.50")
 REBALANCE_MIN_EDGE = Decimal("0")
 MOMENTUM_MAX_NEGATIVE_EDGE = Decimal("-0.18")
@@ -3156,6 +3162,23 @@ class PolymarketQuantBot:
         flow_confirms_side = flow_supports_side and flow_confidence >= BTC_FLOW_MIN_CONFIDENCE
         target_style_follow = is_favorite or model_confirms_side or flow_confirms_side
         market_hot_fallback = market_consensus_side and not flow_contrary_side
+        directional_outcome = str((btc_flow or {}).get("outcome") or "")
+        if directional_outcome not in {"Up", "Down"}:
+            directional_outcome = favorite_outcome
+        directional_opposite = opposite_outcome(directional_outcome)
+        directional_pnl_before = pnl_for_outcome(position_before, directional_outcome)
+        directional_pnl_after = pnl_for_outcome(position_after, directional_outcome)
+        opposite_pnl_before = pnl_for_outcome(position_before, directional_opposite)
+        opposite_pnl_after = pnl_for_outcome(position_after, directional_opposite)
+        directional_skew_before = directional_pnl_before - opposite_pnl_before
+        directional_skew_after = directional_pnl_after - opposite_pnl_after
+        allowed_directional_skew = max(
+            decision.size
+            * (JET_DIRECTIONAL_SKEW_BASE_ORDERS + flow_confidence * JET_DIRECTIONAL_SKEW_CONF_ORDERS),
+            decision.size,
+        )
+        same_as_directional_signal = decision.outcome == directional_outcome
+        directional_skew_over_after = directional_skew_after > allowed_directional_skew
         tail_probability_overfit = (
             effective_price < TAIL_VALUE_MIN_PRICE
             and decision.probability < TAIL_VALUE_MIN_PROBABILITY
@@ -3221,6 +3244,42 @@ class PolymarketQuantBot:
                         expected_after,
                         gap_improvement,
                         -pnl_gap,
+                        -position_after["total_cost"],
+                    ),
+                )
+            if gap_improvement > 0 and position_after["best_pnl"] > 0 and not negative_near_lock:
+                reason = (
+                    "matrix_risk_reduction"
+                    if expected_gain >= 0 and decision.probability >= MATRIX_REBALANCE_MIN_PROBABILITY
+                    else "jet_matrix_rebalance"
+                )
+                return (
+                    reason,
+                    (
+                        JET_MATRIX_REBALANCE_SCORE,
+                        improvement,
+                        gap_improvement,
+                        position_after["worst_pnl"],
+                        position_after["best_pnl"],
+                        expected_gain,
+                        -pnl_gap,
+                        -abs(directional_skew_after),
+                        decision.edge,
+                        -position_after["total_cost"],
+                    ),
+                )
+            if improvement > 0 and position_after["best_pnl"] > 0 and not negative_near_lock:
+                return (
+                    "jet_tail_repair",
+                    (
+                        JET_MATRIX_TAIL_REPAIR_SCORE,
+                        improvement,
+                        gap_improvement,
+                        position_after["worst_pnl"],
+                        position_after["best_pnl"],
+                        expected_gain,
+                        -pnl_gap,
+                        decision.edge,
                         -position_after["total_cost"],
                     ),
                 )
@@ -3460,6 +3519,24 @@ class PolymarketQuantBot:
             )
         if momentum_too_expensive:
             if flow_supports_side:
+                if (
+                    position_before["trade_count"] > 0
+                    and same_as_directional_signal
+                    and not is_rebalance
+                    and directional_skew_over_after
+                ):
+                    return (
+                        "directional_bias_over_skew",
+                        (
+                            JET_DIRECTIONAL_OVER_SKEW_SCORE,
+                            allowed_directional_skew,
+                            directional_skew_before,
+                            directional_skew_after,
+                            position_after["worst_pnl"],
+                            decision.edge,
+                            -position_after["total_cost"],
+                        ),
+                    )
                 return (
                     "target_btc_flow_overpriced_probe",
                     (
@@ -3489,10 +3566,33 @@ class PolymarketQuantBot:
             or decision.edge >= Decimal("-0.20")
         ):
             if flow_supports_side:
+                if (
+                    position_before["trade_count"] > 0
+                    and same_as_directional_signal
+                    and not is_rebalance
+                    and directional_skew_over_after
+                ):
+                    return (
+                        "directional_bias_over_skew",
+                        (
+                            JET_DIRECTIONAL_OVER_SKEW_SCORE,
+                            allowed_directional_skew,
+                            directional_skew_before,
+                            directional_skew_after,
+                            position_after["worst_pnl"],
+                            decision.edge,
+                            -position_after["total_cost"],
+                        ),
+                    )
+                directional_score = (
+                    JET_DIRECTIONAL_BIAS_SCORE
+                    if position_before["trade_count"] > 0
+                    else BTC_FLOW_LADDER_SCORE
+                )
                 return (
                     "target_btc_flow_ladder",
                     (
-                        BTC_FLOW_LADDER_SCORE,
+                        directional_score,
                         flow_confidence,
                         decision.best_ask,
                         expected_after,
@@ -4598,6 +4698,10 @@ def btc_flow_alignment(outcome: str, btc_flow: Optional[Dict[str, Any]]) -> Deci
     if flow_outcome in {"Up", "Down"}:
         return Decimal("-1")
     return Decimal("0")
+
+
+def opposite_outcome(outcome: str) -> str:
+    return "Down" if outcome == "Up" else "Up"
 
 
 def json_safe(value: Any) -> Any:
