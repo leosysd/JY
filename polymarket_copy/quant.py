@@ -50,6 +50,20 @@ BTC_FLOW_INITIAL_SCORE = Decimal("1.6")
 BTC_FLOW_INITIAL_FALLBACK_SCORE = Decimal("0.6")
 BTC_FLOW_LADDER_SCORE = Decimal("0.8")
 BTC_FLOW_UNCONFIRMED_LADDER_SCORE = Decimal("0.25")
+INITIAL_ENTRY_OBSERVE_SEC = 12
+INITIAL_ENTRY_CONFIRM_SEC = 25
+INITIAL_ENTRY_DEADLINE_SEC = 45
+INITIAL_ENTRY_HIGH_PRICE_DEADLINE_SEC = 75
+INITIAL_ENTRY_EARLY_MAX_EFFECTIVE = Decimal("0.62")
+INITIAL_ENTRY_HIGH_EFFECTIVE = Decimal("0.65")
+INITIAL_ENTRY_VERY_HIGH_EFFECTIVE = Decimal("0.75")
+INITIAL_ENTRY_STRONG_FLOW_CONFIDENCE = Decimal("0.22")
+INITIAL_ENTRY_MIN_FLOW_CONFIDENCE = Decimal("0.12")
+INITIAL_ENTRY_MIN_RET_FROM_START = Decimal("0.00025")
+INITIAL_ENTRY_MIN_IMBALANCE = Decimal("0.18")
+INITIAL_ENTRY_MODEL_PROBABILITY = Decimal("0.56")
+INITIAL_ENTRY_MIN_VALUE_EDGE = Decimal("0.03")
+INITIAL_ENTRY_DEADLINE_SCORE = Decimal("0.95")
 JET_MATRIX_REBALANCE_SCORE = Decimal("4.2")
 JET_MATRIX_TAIL_REPAIR_SCORE = Decimal("3.2")
 JET_DIRECTIONAL_BIAS_SCORE = Decimal("0.5")
@@ -62,6 +76,9 @@ MOMENTUM_MAX_NEGATIVE_EDGE = Decimal("-0.18")
 VALUE_MODEL_FOLLOW_SCORE = Decimal("0.45")
 MATRIX_WIDENING_MAX_WORST_LOSS_ORDERS = Decimal("1.0")
 MATRIX_WIDENING_MAX_GAP_ORDERS = Decimal("1.5")
+EARLY_MATRIX_REPAIR_SCORE = Decimal("3.6")
+EARLY_MATRIX_REPAIR_MAX_LOCKED_LOSS_ORDERS = Decimal("0.10")
+EARLY_MATRIX_REPAIR_MIN_IMPROVEMENT_ORDERS = Decimal("0.25")
 TAIL_VALUE_MIN_PRICE = Decimal("0.25")
 TAIL_VALUE_MIN_PROBABILITY = Decimal("0.48")
 RULE_SIGNAL_WEIGHTS: Dict[str, Decimal] = {
@@ -3208,6 +3225,14 @@ class PolymarketQuantBot:
             and near_equal_size
             and gap_improvement > 0
         )
+        shallow_first_repair_lock_loss = (
+            would_balance_into_locked_loss
+            and position_before["trade_count"] == 1
+            and improvement >= decision.size * EARLY_MATRIX_REPAIR_MIN_IMPROVEMENT_ORDERS
+            and position_after["worst_pnl"] >= -(
+                decision.size * EARLY_MATRIX_REPAIR_MAX_LOCKED_LOSS_ORDERS
+            )
+        )
         if matrix_widening_after_entry and matrix_widening_too_large:
             return (
                 "matrix_would_widen_loss",
@@ -3221,7 +3246,7 @@ class PolymarketQuantBot:
                     -position_after["total_cost"],
                 ),
             )
-        if position_before["trade_count"] > 0 and would_balance_into_locked_loss:
+        if position_before["trade_count"] > 0 and would_balance_into_locked_loss and not shallow_first_repair_lock_loss:
             return (
                 "rebalance_would_lock_loss",
                 (
@@ -3269,6 +3294,20 @@ class PolymarketQuantBot:
                         improvement,
                         expected_after,
                         gap_improvement,
+                        -pnl_gap,
+                        -position_after["total_cost"],
+                    ),
+                )
+            if shallow_first_repair_lock_loss:
+                return (
+                    "early_matrix_repair",
+                    (
+                        EARLY_MATRIX_REPAIR_SCORE,
+                        improvement,
+                        gap_improvement,
+                        position_after["worst_pnl"],
+                        expected_gain,
+                        decision.edge,
                         -pnl_gap,
                         -position_after["total_cost"],
                     ),
@@ -3448,13 +3487,111 @@ class PolymarketQuantBot:
                 ),
             )
         if position_before["trade_count"] == 0:
-            if flow_supports_side:
+            elapsed_sec = max(0, int(time.time()) - decision.market.start_ts)
+            abs_ret_from_start = abs(state_decimal((btc_flow or {}).get("ret_from_start")))
+            abs_imbalance_from_start = abs(state_decimal((btc_flow or {}).get("taker_imbalance_from_start")))
+            strong_flow_entry = (
+                flow_supports_side
+                and flow_confidence >= INITIAL_ENTRY_STRONG_FLOW_CONFIDENCE
+                and (
+                    abs_ret_from_start >= INITIAL_ENTRY_MIN_RET_FROM_START
+                    or abs_imbalance_from_start >= INITIAL_ENTRY_MIN_IMBALANCE
+                    or decision.edge >= INITIAL_ENTRY_MIN_VALUE_EDGE
+                )
+            )
+            early_confirmed_entry = (
+                strong_flow_entry
+                and effective_price <= INITIAL_ENTRY_EARLY_MAX_EFFECTIVE
+                and decision.edge >= Decimal("-0.08")
+            )
+            model_value_entry = (
+                decision.edge >= INITIAL_ENTRY_MIN_VALUE_EDGE
+                or (
+                    is_favorite
+                    and decision.probability >= INITIAL_ENTRY_MODEL_PROBABILITY
+                    and not flow_contrary_side
+                )
+            )
+            cheap_value_entry = effective_price <= Decimal("0.45") and decision.edge >= Decimal("0")
+            confirmed_entry = (
+                early_confirmed_entry
+                or (flow_supports_side and flow_confidence >= INITIAL_ENTRY_MIN_FLOW_CONFIDENCE)
+                or model_value_entry
+                or cheap_value_entry
+            )
+            deadline_entry = elapsed_sec >= INITIAL_ENTRY_DEADLINE_SEC
+            high_price_wait = (
+                effective_price >= INITIAL_ENTRY_HIGH_EFFECTIVE
+                and elapsed_sec < INITIAL_ENTRY_DEADLINE_SEC
+                and not (early_confirmed_entry and decision.edge >= Decimal("0"))
+            )
+            very_high_price_wait = (
+                effective_price >= INITIAL_ENTRY_VERY_HIGH_EFFECTIVE
+                and elapsed_sec < INITIAL_ENTRY_HIGH_PRICE_DEADLINE_SEC
+                and decision.edge < Decimal("0")
+            )
+            if elapsed_sec < INITIAL_ENTRY_OBSERVE_SEC and not early_confirmed_entry:
                 return (
-                    "initial_btc_flow_probe",
+                    "initial_observation_wait",
                     (
-                        BTC_FLOW_INITIAL_SCORE,
+                        Decimal("0"),
+                        Decimal(elapsed_sec),
                         flow_confidence,
                         decision.edge,
+                        effective_price,
+                        -position_after["total_cost"],
+                    ),
+                )
+            if high_price_wait or very_high_price_wait:
+                return (
+                    "initial_high_price_wait",
+                    (
+                        Decimal("0"),
+                        Decimal(elapsed_sec),
+                        effective_price,
+                        decision.edge,
+                        flow_confidence,
+                        decision.probability,
+                        -position_after["total_cost"],
+                    ),
+                )
+            if elapsed_sec < INITIAL_ENTRY_CONFIRM_SEC and not early_confirmed_entry:
+                return (
+                    "initial_confirmation_wait",
+                    (
+                        Decimal("0"),
+                        Decimal(elapsed_sec),
+                        flow_alignment,
+                        flow_confidence,
+                        decision.edge,
+                        effective_price,
+                        -position_after["total_cost"],
+                    ),
+                )
+            if not deadline_entry and not confirmed_entry:
+                return (
+                    "initial_signal_wait",
+                    (
+                        Decimal("0"),
+                        Decimal(elapsed_sec),
+                        flow_alignment,
+                        flow_confidence,
+                        decision.edge,
+                        decision.probability,
+                        effective_price,
+                        -position_after["total_cost"],
+                    ),
+                )
+            if flow_supports_side:
+                reason = "initial_confirmed_btc_flow_probe" if confirmed_entry else "initial_btc_flow_probe"
+                return (
+                    reason,
+                    (
+                        BTC_FLOW_INITIAL_SCORE,
+                        Decimal(elapsed_sec),
+                        flow_confidence,
+                        decision.edge,
+                        -effective_price,
                         expected_after,
                         decision.probability,
                         -pnl_gap,
@@ -3462,13 +3599,43 @@ class PolymarketQuantBot:
                     ),
                 )
             if flow_contrary_side and not target_style_follow and decision.edge < Decimal("0"):
+                if not deadline_entry:
+                    return (
+                        "initial_against_flow_wait",
+                        (
+                            Decimal("0"),
+                            Decimal(elapsed_sec),
+                            decision.edge,
+                            flow_confidence,
+                            decision.probability,
+                            effective_price,
+                            -position_after["total_cost"],
+                        ),
+                    )
                 return (
                     "initial_against_btc_flow_fallback",
                     (
                         BTC_FLOW_INITIAL_FALLBACK_SCORE,
+                        Decimal(elapsed_sec),
                         decision.edge,
                         expected_after,
                         decision.probability,
+                        -pnl_gap,
+                        -position_after["total_cost"],
+                    ),
+                )
+            if deadline_entry:
+                return (
+                    "initial_timed_entry_probe",
+                    (
+                        INITIAL_ENTRY_DEADLINE_SCORE,
+                        Decimal(elapsed_sec),
+                        flow_alignment,
+                        flow_confidence,
+                        Decimal("1") if is_favorite else Decimal("0"),
+                        decision.edge,
+                        decision.probability,
+                        -effective_price,
                         -pnl_gap,
                         -position_after["total_cost"],
                     ),
@@ -3477,6 +3644,7 @@ class PolymarketQuantBot:
                 "initial_target_probe",
                 (
                     Decimal("2"),
+                    Decimal(elapsed_sec),
                     flow_alignment,
                     flow_confidence,
                     Decimal("1") if market_consensus_side else Decimal("0"),
